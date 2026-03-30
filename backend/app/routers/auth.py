@@ -38,11 +38,11 @@ def parse_permisos(usuario: Usuario) -> list[str]:
 def serialize_usuario(usuario: Usuario) -> UsuarioOut:
     return UsuarioOut(
         id=usuario.id,
-        email=usuario.email,
-        nombre_completo=usuario.nombre_completo,
-        rol=usuario.rol,
+        email=(usuario.email or "").strip(),
+        nombre_completo=(usuario.nombre_completo or usuario.email or "Sin nombre").strip(),
+        rol=(usuario.rol or "USUARIO").strip(),
         permisos=parse_permisos(usuario),
-        activo=usuario.activo,
+        activo=bool(usuario.activo),
         creado_en=usuario.creado_en,
         ultimo_acceso=usuario.ultimo_acceso,
     )

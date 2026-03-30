@@ -33,12 +33,12 @@ class UsuarioCreate(BaseModel):
 
 class UsuarioOut(BaseModel):
     id: int
-    email: EmailStr
+    email: str
     nombre_completo: str
     rol: str
     permisos: List[str] = []
     activo: bool
-    creado_en: datetime
+    creado_en: Optional[datetime] = None
     ultimo_acceso: Optional[datetime] = None
     class Config:
         from_attributes = True
