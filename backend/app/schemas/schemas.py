@@ -3,9 +3,10 @@ HESAKA Web — Schemas Pydantic
 Modelos de request/response para la API REST.
 Separados de los modelos SQLAlchemy para mejor control.
 """
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional, List
 from datetime import date, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 # ──────────────────────────────────────────────
@@ -33,12 +34,12 @@ class UsuarioCreate(BaseModel):
 
 class UsuarioOut(BaseModel):
     id: int
-    email: str
+    email: EmailStr
     nombre_completo: str
     rol: str
     permisos: List[str] = []
     activo: bool
-    creado_en: Optional[datetime] = None
+    creado_en: datetime
     ultimo_acceso: Optional[datetime] = None
     class Config:
         from_attributes = True
@@ -67,6 +68,7 @@ class ConfiguracionGeneralUpdate(BaseModel):
     telefono: Optional[str] = None
     email: Optional[EmailStr] = None
     logo_path: Optional[str] = None
+    business_timezone: Optional[str] = "America/Asuncion"
 
     @field_validator("nombre")
     @classmethod
@@ -81,6 +83,16 @@ class ConfiguracionGeneralUpdate(BaseModel):
     def limpiar_texto_configuracion(cls, value: Optional[str]) -> Optional[str]:
         return value.strip() if value else None
 
+    @field_validator("business_timezone")
+    @classmethod
+    def validar_timezone(cls, value: Optional[str]) -> str:
+        tz = (value or "").strip() or "America/Asuncion"
+        try:
+            ZoneInfo(tz)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("Zona horaria inválida. Usa formato IANA, por ejemplo America/Asuncion.") from exc
+        return tz
+
 
 class ConfiguracionGeneralOut(BaseModel):
     id: int
@@ -90,6 +102,7 @@ class ConfiguracionGeneralOut(BaseModel):
     telefono: Optional[str] = None
     email: Optional[EmailStr] = None
     logo_path: Optional[str] = None
+    business_timezone: str = "America/Asuncion"
     canal_principal_nombre: Optional[str] = None
     configuracion_completa: bool = False
 
@@ -131,6 +144,34 @@ class BackupRestoreIn(BaseModel):
 class BackupRestoreOut(BaseModel):
     message: str
     backup: BackupItemOut
+
+
+class PlantillaWhatsappOut(BaseModel):
+    id: int
+    codigo: str
+    nombre: str
+    descripcion: Optional[str] = None
+    plantilla: str
+    activo: bool = True
+    editable: bool = True
+
+    class Config:
+        from_attributes = True
+
+
+class PlantillaWhatsappUpdate(BaseModel):
+    plantilla: str
+    activo: Optional[bool] = None
+
+    @field_validator("plantilla")
+    @classmethod
+    def validar_plantilla(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("La plantilla no puede quedar vacia.")
+        if len(value) > 4000:
+            raise ValueError("La plantilla es demasiado larga.")
+        return value
 
 
 # ──────────────────────────────────────────────
@@ -317,6 +358,7 @@ class ClienteOut(BaseModel):
     telefono: Optional[str]
     email: Optional[str]
     direccion: Optional[str]
+    fecha_nacimiento: Optional[date] = None
     fecha_registro: Optional[datetime]
     notas: Optional[str]
     referidor_id: Optional[int]
@@ -332,6 +374,7 @@ class ClienteListItemOut(BaseModel):
     telefono: Optional[str] = None
     email: Optional[str] = None
     direccion: Optional[str] = None
+    fecha_nacimiento: Optional[date] = None
     fecha_registro: Optional[datetime] = None
     notas: Optional[str] = None
     referidor_id: Optional[int] = None
@@ -352,8 +395,25 @@ class ClienteCreate(BaseModel):
     telefono: Optional[str] = None
     email: Optional[str] = None
     direccion: Optional[str] = None
+    fecha_nacimiento: Optional[date] = None
     notas: Optional[str] = None
     referidor_id: Optional[int] = None
+
+
+class ClienteCumpleanosOut(BaseModel):
+    id: int
+    nombre: str
+    ci: Optional[str] = None
+    telefono: Optional[str] = None
+    email: Optional[str] = None
+    fecha_nacimiento: date
+    edad: Optional[int] = None
+    referidor_nombre: Optional[str] = None
+
+
+class ClienteCumpleanosResumenOut(BaseModel):
+    total: int = 0
+    preview: List[ClienteCumpleanosOut] = []
 
 
 # ──────────────────────────────────────────────
@@ -591,7 +651,7 @@ class PresupuestoCreate(BaseModel):
     no_requiere_proximo_control: bool = False
     consulta_clinica_id: Optional[int] = None
     consulta_clinica_tipo: Optional[str] = None
-    vendedor_id: Optional[int] = None
+    vendedor_id: int
     canal_venta_id: Optional[int] = None
     referidor_id: Optional[int] = None
     comision_monto: float = 0.0
@@ -629,6 +689,11 @@ class PresupuestoOut(BaseModel):
     items: List[PresupuestoItemOut] = []
     class Config:
         from_attributes = True
+
+
+class PresupuestoFechaUpdate(BaseModel):
+    fecha: datetime
+    actualizar_venta_relacionada: bool = False
 
 
 # ──────────────────────────────────────────────
@@ -679,7 +744,7 @@ class VentaCreate(BaseModel):
     cliente_id: int
     presupuesto_id: Optional[int] = None
     total: float
-    vendedor_id: Optional[int] = None
+    vendedor_id: int
     canal_venta_id: Optional[int] = None
     referidor_id: Optional[int] = None
     comision_monto: float = 0.0
@@ -708,6 +773,11 @@ class VentaOut(BaseModel):
     pagos: List[PagoOut] = []
     class Config:
         from_attributes = True
+
+
+class VentaFechaUpdate(BaseModel):
+    fecha: datetime
+    actualizar_presupuesto_relacionado: bool = False
 
 
 # ──────────────────────────────────────────────
@@ -774,7 +844,7 @@ class PresupuestoListResponseOut(BaseModel):
 
 
 class PresupuestoAsignacionComercialIn(BaseModel):
-    vendedor_id: Optional[int] = None
+    vendedor_id: int
     canal_venta_id: Optional[int] = None
 
 
@@ -872,7 +942,7 @@ class VentasPdfMultipleRequest(BaseModel):
 class CompraCreate(BaseModel):
     proveedor_id: Optional[int] = None
     tipo_documento: str  # FACTURA, ORDEN_SERVICIO
-    nro_factura: Optional[str] = None
+    nro_factura: str
     total: float
     condicion_pago: str = "CONTADO"
     fecha_vencimiento: Optional[datetime] = None
@@ -881,6 +951,14 @@ class CompraCreate(BaseModel):
     tipo_compra: str = "ORIGINAL"
     ventas_ids: List[int] = []
     items: List[CompraDetalleCreate]
+
+    @field_validator("nro_factura")
+    @classmethod
+    def nro_factura_obligatorio(cls, v: str) -> str:
+        s = (v or "").strip()
+        if not s:
+            raise ValueError("Debe indicar el número de documento de la compra.")
+        return s
 
 class CompraOut(BaseModel):
     id: int
@@ -1141,6 +1219,302 @@ class MovimientoBancoOut(BaseModel):
         from_attributes = True
 
 
+class JornadaResumenOut(BaseModel):
+    ingresos: float = 0.0
+    egresos: float = 0.0
+    neto: float = 0.0
+    movimientos_caja: int = 0
+    movimientos_banco: int = 0
+    movimientos_total: int = 0
+
+
+class JornadaCuentasCobrarOut(BaseModel):
+    total_pendiente: float = 0.0
+    cantidad_ventas: int = 0
+    total_ventas: float = 0.0
+    total_cobrado: float = 0.0
+
+
+class JornadaEstadoOut(BaseModel):
+    jornada_id: Optional[int] = None
+    fecha: date
+    estado: str
+    abierta: bool
+    fecha_hora_apertura: Optional[datetime] = None
+    usuario_apertura_id: Optional[int] = None
+    usuario_apertura_nombre: Optional[str] = None
+    observacion_apertura: Optional[str] = None
+    resumen: JornadaResumenOut
+    ultimo_corte: Optional["CorteJornadaOut"] = None
+    ultima_rendicion: Optional["RendicionJornadaOut"] = None
+    pendiente_rendicion: Optional["PendienteRendicionOut"] = None
+    cuentas_por_cobrar_dia: Optional["JornadaCuentasCobrarOut"] = None
+    movimientos_detalle: List[dict] = Field(default_factory=list)
+    ventas_detalle: dict = Field(default_factory=dict)
+    alerta_movimientos_posteriores: Optional["MovimientosPosterioresUltimoCorteResumenOut"] = None
+
+
+class JornadaDetalleOperativoOut(BaseModel):
+    cuentas_por_cobrar_dia: Optional["JornadaCuentasCobrarOut"] = None
+    movimientos_detalle: List[dict] = Field(default_factory=list)
+    ventas_detalle: dict = Field(default_factory=dict)
+
+
+class JornadaAperturaCreate(BaseModel):
+    observacion: Optional[str] = None
+
+    @field_validator("observacion")
+    @classmethod
+    def normalizar_observacion_jornada(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip() if value else value
+
+
+class CorteJornadaOut(BaseModel):
+    id: int
+    jornada_id: int
+    fecha: date
+    fecha_hora_corte: datetime
+    usuario_id: Optional[int] = None
+    usuario_nombre: Optional[str] = None
+    ingresos: float = 0.0
+    egresos: float = 0.0
+    neto: float = 0.0
+    movimientos_caja: int = 0
+    movimientos_banco: int = 0
+    movimientos_total: int = 0
+    saldo_actual_caja: float = 0.0
+    saldo_actual_bancos: float = 0.0
+    saldo_final_total: float = 0.0
+    desglose_medios: List[dict] = Field(default_factory=list)
+    es_ultimo: bool = False
+
+
+class JornadaPanelInicialOut(BaseModel):
+    """Respuesta agregada para la pantalla Jornada (una sola pasada de movimientos en servidor)."""
+
+    estado: JornadaEstadoOut
+    cortes: List[CorteJornadaOut] = Field(default_factory=list)
+
+
+class PendienteRendicionOut(BaseModel):
+    monto_sugerido: float = 0.0
+    cantidad_movimientos: int = 0
+    ingresos: float = 0.0
+    egresos: float = 0.0
+    fecha_desde: Optional[datetime] = None
+    desglose_medios: List[dict] = Field(default_factory=list)
+    movimientos: List[dict] = Field(default_factory=list)
+    ventas_pendientes: List[dict] = Field(default_factory=list)
+
+
+class DestinatarioRendicionCreate(BaseModel):
+    nombre: str
+
+    @field_validator("nombre")
+    @classmethod
+    def normalizar_nombre_destinatario(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("El nombre es obligatorio")
+        if len(value) > 150:
+            raise ValueError("El nombre no puede superar 150 caracteres")
+        return value
+
+
+class DestinatarioRendicionUpdate(BaseModel):
+    nombre: Optional[str] = None
+    activo: Optional[bool] = None
+
+    @field_validator("nombre")
+    @classmethod
+    def normalizar_nombre_destinatario_update(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("El nombre no puede quedar vacio")
+        if len(value) > 150:
+            raise ValueError("El nombre no puede superar 150 caracteres")
+        return value
+
+
+class DestinatarioRendicionOut(BaseModel):
+    id: int
+    nombre: str
+    activo: bool
+
+    class Config:
+        from_attributes = True
+
+
+class RendicionJornadaCreate(BaseModel):
+    destinatario_id: int
+    monto_rendido: float
+    observacion: Optional[str] = None
+
+    @field_validator("destinatario_id")
+    @classmethod
+    def validar_destinatario_id(cls, value: int) -> int:
+        if value is None or int(value) <= 0:
+            raise ValueError("Debe elegir un destinatario valido")
+        return int(value)
+
+    @field_validator("monto_rendido")
+    @classmethod
+    def validar_monto_rendido(cls, value: float) -> float:
+        if value is None:
+            raise ValueError("El monto rendido es obligatorio")
+        return float(value)
+
+    @field_validator("observacion")
+    @classmethod
+    def normalizar_observacion_rendicion(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip() if value else value
+
+
+class RendicionJornadaUpdate(BaseModel):
+    fecha_hora_rendicion: datetime
+    destinatario_id: int
+    monto_rendido: float
+    observacion: Optional[str] = None
+    motivo_ajuste: str
+
+    @field_validator("destinatario_id")
+    @classmethod
+    def validar_destinatario_id_update(cls, value: int) -> int:
+        if value is None or int(value) <= 0:
+            raise ValueError("Debe elegir un destinatario valido")
+        return int(value)
+
+    @field_validator("motivo_ajuste")
+    @classmethod
+    def normalizar_motivo_rendicion(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("Este campo es obligatorio")
+        return value
+
+    @field_validator("monto_rendido")
+    @classmethod
+    def validar_monto_actualizado_rendicion(cls, value: float) -> float:
+        if value is None:
+            raise ValueError("El monto rendido es obligatorio")
+        return float(value)
+
+    @field_validator("observacion")
+    @classmethod
+    def normalizar_observacion_actualizada_rendicion(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip() if value else value
+
+
+class RendicionJornadaOut(BaseModel):
+    id: int
+    jornada_id: int
+    fecha: date
+    fecha_hora_rendicion: datetime
+    usuario_id: Optional[int] = None
+    usuario_nombre: Optional[str] = None
+    destinatario_id: Optional[int] = None
+    rendido_a: str
+    monto_sugerido: float = 0.0
+    monto_rendido: float = 0.0
+    diferencia: float = 0.0
+    observacion: Optional[str] = None
+    estado: str
+    desglose_medios: List[dict] = Field(default_factory=list)
+    es_ultima_vigente: bool = False
+    editada: bool = False
+    fecha_hora_original: Optional[datetime] = None
+    rendido_a_original: Optional[str] = None
+    monto_rendido_original: Optional[float] = None
+    observacion_original: Optional[str] = None
+    fecha_hora_ultima_edicion: Optional[datetime] = None
+    usuario_ultima_edicion_nombre: Optional[str] = None
+    motivo_ajuste: Optional[str] = None
+
+
+class JornadaHistorialOut(BaseModel):
+    jornada_id: int
+    fecha: date
+    estado: str
+    fecha_hora_apertura: Optional[datetime] = None
+    usuario_apertura_nombre: Optional[str] = None
+    ingresos: float = 0.0
+    egresos: float = 0.0
+    neto: float = 0.0
+    total_rendido: float = 0.0
+    pendiente_rendicion: float = 0.0
+    cantidad_movimientos_pendientes: int = 0
+    cantidad_cortes: int = 0
+    cantidad_rendiciones: int = 0
+    cuentas_por_cobrar_dia: float = 0.0
+    cantidad_ventas_cobrar_dia: int = 0
+
+
+class RendicionHistorialOut(RendicionJornadaOut):
+    jornada_fecha: date
+
+
+class RendicionHistorialListItemOut(BaseModel):
+    id: int
+    jornada_id: int
+    jornada_fecha: date
+    fecha_hora_rendicion: datetime
+    usuario_id: Optional[int] = None
+    usuario_nombre: Optional[str] = None
+    destinatario_id: Optional[int] = None
+    rendido_a: str
+    monto_sugerido: float = 0.0
+    monto_rendido: float = 0.0
+    diferencia: float = 0.0
+    observacion: Optional[str] = None
+    estado: str
+    editada: bool = False
+    fecha_hora_ultima_edicion: Optional[datetime] = None
+    usuario_ultima_edicion_nombre: Optional[str] = None
+    motivo_ajuste: Optional[str] = None
+
+
+class RendicionHistorialListResponseOut(BaseModel):
+    items: List[RendicionHistorialListItemOut]
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
+class MovimientosPosterioresUltimoCorteResumenOut(BaseModel):
+    fecha_ultimo_corte: datetime
+    usuario_ultimo_corte_nombre: Optional[str] = None
+    cantidad_movimientos: int = 0
+    ingresos: float = 0.0
+    egresos: float = 0.0
+
+
+class MovimientoFinancieroHistorialOut(BaseModel):
+    fecha: datetime
+    origen: str
+    categoria: str
+    concepto: str
+    monto: float
+    tipo: str
+    referencia: str
+    banco_nombre: Optional[str] = None
+    ruta_origen: Optional[str] = None
+
+
+class MovimientosPosterioresUltimoCorteOut(BaseModel):
+    fecha_ultimo_corte: datetime
+    usuario_ultimo_corte_nombre: Optional[str] = None
+    cantidad_movimientos: int = 0
+    ingresos: float = 0.0
+    egresos: float = 0.0
+    movimientos: List[MovimientoFinancieroHistorialOut] = []
+
+
+JornadaEstadoOut.model_rebuild()
+
+
 class TransferenciaInternaCreate(BaseModel):
     origen_tipo: str
     destino_tipo: str
@@ -1193,6 +1567,7 @@ class TransferenciaInternaHistorialOut(BaseModel):
 class ComisionOut(BaseModel):
     id: int
     fecha: datetime
+    fecha_pago: Optional[datetime] = None
     referidor_id: int
     referidor_nombre: Optional[str] = None
     venta_id: Optional[int] = None
@@ -1209,6 +1584,7 @@ class ComisionPagoCreate(BaseModel):
     metodo_pago: str = "EFECTIVO"
     banco_id: Optional[int] = None
     numero_referencia: Optional[str] = None
+    fecha_pago: Optional[date] = None
 
     @field_validator("metodo_pago")
     @classmethod
@@ -1635,6 +2011,7 @@ class ClinicaLugarSimpleOut(BaseModel):
 class ClinicaTurnoIn(BaseModel):
     paciente_id: Optional[int] = None
     paciente_nombre_libre: Optional[str] = None
+    paciente_telefono_libre: Optional[str] = None
     doctor_id: Optional[int] = None
     lugar_atencion_id: Optional[int] = None
     fecha_hora: datetime
@@ -1650,6 +2027,7 @@ class ClinicaTurnoOut(BaseModel):
     paciente_nombre_libre: Optional[str] = None
     paciente_ci: Optional[str] = None
     paciente_telefono: Optional[str] = None
+    paciente_telefono_libre: Optional[str] = None
     doctor_id: Optional[int] = None
     doctor_nombre: Optional[str] = None
     lugar_atencion_id: Optional[int] = None
@@ -1674,8 +2052,17 @@ class ClinicaTurnosListOut(BaseModel):
 
 class ClinicaAgendaRecordatoriosOut(BaseModel):
     hoy: List[ClinicaTurnoOut] = []
+    tres_dias: List[ClinicaTurnoOut] = []
     ocho_dias: List[ClinicaTurnoOut] = []
     quince_dias: List[ClinicaTurnoOut] = []
+
+
+class ClinicaAgendaRecordatoriosResumenOut(BaseModel):
+    total: int = 0
+    hoy_count: int = 0
+    tres_dias_count: int = 0
+    hoy_preview: List[ClinicaTurnoOut] = []
+    tres_dias_preview: List[ClinicaTurnoOut] = []
 
 
 class ClinicaLugarIn(BaseModel):
@@ -1739,6 +2126,14 @@ class ClinicaCuestionarioIn(BaseModel):
     antecedentes_familiares: Optional[str] = None
     usa_anteojos: bool = False
     proposito_anteojos: Optional[str] = None
+    graduacion_anterior_od_esfera: Optional[str] = None
+    graduacion_anterior_od_cilindro: Optional[str] = None
+    graduacion_anterior_od_eje: Optional[str] = None
+    graduacion_anterior_od_adicion: Optional[str] = None
+    graduacion_anterior_oi_esfera: Optional[str] = None
+    graduacion_anterior_oi_cilindro: Optional[str] = None
+    graduacion_anterior_oi_eje: Optional[str] = None
+    graduacion_anterior_oi_adicion: Optional[str] = None
     usa_lentes_contacto: bool = False
     tipo_lentes_contacto: Optional[str] = None
     horas_uso_lc: Optional[str] = None
@@ -1776,6 +2171,14 @@ class ClinicaCuestionarioOut(BaseModel):
     antecedentes_familiares: Optional[str] = None
     usa_anteojos: bool = False
     proposito_anteojos: Optional[str] = None
+    graduacion_anterior_od_esfera: Optional[str] = None
+    graduacion_anterior_od_cilindro: Optional[str] = None
+    graduacion_anterior_od_eje: Optional[str] = None
+    graduacion_anterior_od_adicion: Optional[str] = None
+    graduacion_anterior_oi_esfera: Optional[str] = None
+    graduacion_anterior_oi_cilindro: Optional[str] = None
+    graduacion_anterior_oi_eje: Optional[str] = None
+    graduacion_anterior_oi_adicion: Optional[str] = None
     usa_lentes_contacto: bool = False
     tipo_lentes_contacto: Optional[str] = None
     horas_uso_lc: Optional[str] = None

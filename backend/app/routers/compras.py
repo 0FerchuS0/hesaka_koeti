@@ -48,8 +48,11 @@ from app.schemas.schemas import (
 )
 from app.utils.auth import get_current_user
 from app.utils.excel_historial_pagos_proveedor import generar_excel_historial_pagos_proveedor
+from app.utils.filename_utils import sanitize_filename_component
+from app.utils.jornada import normalizar_fecha_negocio, require_jornada_abierta, require_jornada_abierta_para_fecha
 from app.utils.pdf_compra import generar_pdf_compra
 from app.utils.pdf_pago_proveedor import generar_pdf_pago_proveedor
+from app.utils.timezone import ahora_negocio
 
 router = APIRouter(prefix="/api/compras", tags=["Compras"])
 
@@ -151,18 +154,18 @@ def _obtener_clientes_y_ventas(compra: Compra) -> tuple[list[str], list[str]]:
     return sorted(set(clientes)), ventas_codigos
 
 
-def _estado_vencimiento_compra(compra: Compra) -> str:
+def _estado_vencimiento_compra(session, compra: Compra) -> str:
     if (compra.condicion_pago or "CONTADO") != "CREDITO":
         return "CONTADO"
     if not compra.fecha_vencimiento:
         return "SIN_VENCIMIENTO"
-    if compra.fecha_vencimiento < datetime.now():
+    if compra.fecha_vencimiento < normalizar_fecha_negocio(session):
         return "VENCIDO"
     return "AL_DIA"
 
 
-def _prioridad_cxp(compra: Compra) -> tuple[int, datetime, datetime]:
-    estado_vencimiento = _estado_vencimiento_compra(compra)
+def _prioridad_cxp(session, compra: Compra) -> tuple[int, datetime, datetime]:
+    estado_vencimiento = _estado_vencimiento_compra(session, compra)
     prioridad = {
         "VENCIDO": 0,
         "AL_DIA": 1,
@@ -174,7 +177,7 @@ def _prioridad_cxp(compra: Compra) -> tuple[int, datetime, datetime]:
     return prioridad, fecha_vencimiento, fecha_compra
 
 
-def _serializar_documento_cxp(compra: Compra) -> CuentaPorPagarDocumentoOut:
+def _serializar_documento_cxp(session, compra: Compra) -> CuentaPorPagarDocumentoOut:
     clientes, ventas_codigos = _obtener_clientes_y_ventas(compra)
     return CuentaPorPagarDocumentoOut(
         compra_id=compra.id,
@@ -190,7 +193,7 @@ def _serializar_documento_cxp(compra: Compra) -> CuentaPorPagarDocumentoOut:
         saldo=float(compra.saldo or 0),
         estado=compra.estado,
         fecha_vencimiento=compra.fecha_vencimiento,
-        estado_vencimiento=_estado_vencimiento_compra(compra),
+        estado_vencimiento=_estado_vencimiento_compra(session, compra),
         tipo_compra=compra.tipo_compra or "ORIGINAL",
         estado_entrega=compra.estado_entrega or "RECIBIDO",
         clientes_nombres=clientes,
@@ -199,7 +202,7 @@ def _serializar_documento_cxp(compra: Compra) -> CuentaPorPagarDocumentoOut:
 
 
 def _generar_numero_generico_pago(session, proveedor_id: int) -> str:
-    hoy = datetime.now().strftime("%Y%m%d")
+    hoy = normalizar_fecha_negocio(session).strftime("%Y%m%d")
     prefijo = f"SG-{proveedor_id}-{hoy}-"
     existentes = (
         session.query(Compra.nro_factura)
@@ -237,12 +240,12 @@ def _normalizar_metodo_pago(metodo_pago: Optional[str]) -> str:
     return metodo
 
 
-def _recalcular_estado_compra(compra: Compra):
+def _recalcular_estado_compra(session, compra: Compra):
     saldo = float(compra.saldo or 0)
     if saldo <= 0:
         compra.saldo = 0.0
         compra.estado = "PAGADO"
-    elif compra.fecha_vencimiento and compra.fecha_vencimiento < datetime.now():
+    elif compra.fecha_vencimiento and compra.fecha_vencimiento < normalizar_fecha_negocio(session):
         compra.estado = "VENCIDO"
     else:
         compra.estado = "PENDIENTE"
@@ -342,6 +345,7 @@ def _revertir_pago_compra(session, pago: PagoCompra):
 
 
 def _registrar_movimiento_pago_compra(session, compra: Compra, pago: PagoCompra, monto: float, metodo_pago: str, banco: Optional[Banco], fecha_pago: datetime):
+    jornada = require_jornada_abierta_para_fecha(session, fecha_pago, accion="registrar un pago")
     concepto = f"Pago proveedor {compra.proveedor_rel.nombre if compra.proveedor_rel else 'SIN PROVEEDOR'}"
     if compra.nro_factura:
         concepto += f" - {compra.nro_factura}"
@@ -365,6 +369,7 @@ def _registrar_movimiento_pago_compra(session, compra: Compra, pago: PagoCompra,
             saldo_anterior=saldo_anterior,
             saldo_nuevo=caja.saldo_actual,
             pago_compra_id=pago.id,
+            jornada_id=jornada.id,
         ))
         return
 
@@ -382,6 +387,7 @@ def _registrar_movimiento_pago_compra(session, compra: Compra, pago: PagoCompra,
         saldo_anterior=saldo_anterior,
         saldo_nuevo=banco.saldo_actual,
         pago_compra_id=pago.id,
+        jornada_id=jornada.id,
     ))
 
 
@@ -389,11 +395,12 @@ def _anular_pago_compra(session, pago: PagoCompra):
     if pago.estado == "ANULADO":
         return
 
+    require_jornada_abierta(session)
     _revertir_pago_compra(session, pago)
     compra = pago.compra_rel
     if compra:
         compra.saldo = min(float(compra.total or 0), float(compra.saldo or 0) + float(pago.monto or 0))
-        _recalcular_estado_compra(compra)
+        _recalcular_estado_compra(session, compra)
     pago.estado = "ANULADO"
 
     movimientos_caja = session.query(MovimientoCaja).filter(MovimientoCaja.pago_compra_id == pago.id).all()
@@ -485,8 +492,8 @@ def _aplicar_pago_proveedor(session, proveedor_id: int, data: PagoProveedorCreat
     if total_a_pagar > total_abierto:
         raise HTTPException(status_code=422, detail="El monto total a pagar no puede superar la deuda abierta del proveedor.")
 
-    compras_ordenadas = sorted(compras_abiertas, key=_prioridad_cxp)
-    fecha_pago = data.fecha or datetime.now()
+    compras_ordenadas = sorted(compras_abiertas, key=lambda compra: _prioridad_cxp(session, compra))
+    fecha_pago = normalizar_fecha_negocio(session, data.fecha)
     lote_pago_id = lote_pago_id_forzado or (str(uuid4()) if len(data.metodos_pago) > 1 else None)
     aplicaciones = []
 
@@ -550,7 +557,7 @@ def _aplicar_pago_proveedor(session, proveedor_id: int, data: PagoProveedorCreat
             _registrar_movimiento_pago_compra(session, compra, pago, monto_aplicado, metodo_pago, banco, fecha_pago)
 
             compra.saldo = max(0.0, saldo_compra - monto_aplicado)
-            _recalcular_estado_compra(compra)
+            _recalcular_estado_compra(session, compra)
 
             documento = compra.nro_factura or compra.nro_documento_original or f"COMPRA #{compra.id}"
             aplicaciones.append(PagoProveedorAplicacionOut(
@@ -710,7 +717,7 @@ def obtener_resumen_cuentas_por_pagar(
             resumen["cantidad_documentos"] += 1
             resumen["total_deuda"] += saldo
 
-            estado_vencimiento = _estado_vencimiento_compra(compra)
+            estado_vencimiento = _estado_vencimiento_compra(session, compra)
             if estado_vencimiento == "VENCIDO":
                 resumen["vencidas"] += 1
                 resumen["total_vencido"] += saldo
@@ -746,7 +753,7 @@ def obtener_contados_pendientes(
             .order_by(Compra.fecha.desc())
             .all()
         )
-        return [_serializar_documento_cxp(compra) for compra in compras]
+        return [_serializar_documento_cxp(session, compra) for compra in compras]
     finally:
         session.close()
 
@@ -781,7 +788,7 @@ def obtener_detalle_cuentas_por_pagar_proveedor(
             Compra.fecha_vencimiento.asc(),
             Compra.fecha.asc(),
         ).all()
-        return [_serializar_documento_cxp(compra) for compra in compras]
+        return [_serializar_documento_cxp(session, compra) for compra in compras]
     finally:
         session.close()
 
@@ -924,7 +931,9 @@ def descargar_pago_proveedor_pdf(
 
         config = session.query(ConfiguracionEmpresa).first()
         pdf_buffer = generar_pdf_pago_proveedor(grupo, config)
-        filename = f"pago_proveedor_{grupo_id}.pdf"
+        proveedor_slug = sanitize_filename_component(grupo.get("proveedor_nombre"), "proveedor")
+        documento_slug = sanitize_filename_component("_".join(sorted(grupo.get("documentos") or []))[:80], "pago")
+        filename = f"{proveedor_slug}_{documento_slug}_pago.pdf"
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",
@@ -1356,6 +1365,7 @@ def crear_compra(
             raise HTTPException(status_code=422, detail="Debes seleccionar un proveedor para compras asociadas a ventas.")
 
         compra = Compra(
+            fecha=ahora_negocio(session),
             proveedor_id=data.proveedor_id,
             tipo_documento=data.tipo_documento,
             nro_factura=data.nro_factura,
@@ -1383,7 +1393,7 @@ def crear_compra(
 
         session.flush()
         _actualizar_ventas_y_costos(session, ventas_asociadas, costos_reales)
-        _recalcular_estado_compra(compra)
+        _recalcular_estado_compra(session, compra)
 
         session.commit()
         compra = _query_compra_detallada(session, compra.id)
@@ -1466,7 +1476,7 @@ def editar_compra(
         _actualizar_ventas_y_costos(session, list(ventas_a_actualizar.values()), costos_reales)
 
         compra.saldo = max(0.0, float(compra.total or 0) - pagos_total)
-        _recalcular_estado_compra(compra)
+        _recalcular_estado_compra(session, compra)
 
         session.commit()
         compra = _query_compra_detallada(session, compra.id)
@@ -1568,7 +1578,8 @@ def registrar_pago_compra(
             if not banco:
                 raise HTTPException(status_code=404, detail="Banco no encontrado.")
 
-        fecha_pago = data.fecha or datetime.now()
+        fecha_pago = normalizar_fecha_negocio(session, data.fecha)
+        jornada = require_jornada_abierta_para_fecha(session, fecha_pago, accion="registrar un pago")
         pago = PagoCompra(
             compra_id=compra_id,
             fecha=fecha_pago,
@@ -1603,6 +1614,7 @@ def registrar_pago_compra(
                 saldo_anterior=saldo_anterior,
                 saldo_nuevo=caja.saldo_actual,
                 pago_compra_id=pago.id,
+                jornada_id=jornada.id,
             ))
         else:
             saldo_anterior = banco.saldo_actual or 0.0
@@ -1616,10 +1628,11 @@ def registrar_pago_compra(
                 saldo_anterior=saldo_anterior,
                 saldo_nuevo=banco.saldo_actual,
                 pago_compra_id=pago.id,
+                jornada_id=jornada.id,
             ))
 
         compra.saldo = max(0.0, float(compra.saldo or 0) - monto)
-        _recalcular_estado_compra(compra)
+        _recalcular_estado_compra(session, compra)
 
         session.commit()
         session.refresh(pago)
@@ -1655,7 +1668,7 @@ def eliminar_pago_compra(
 
         _revertir_pago_compra(session, pago)
         compra.saldo = min(float(compra.total or 0), float(compra.saldo or 0) + float(pago.monto or 0))
-        _recalcular_estado_compra(compra)
+        _recalcular_estado_compra(session, compra)
 
         session.delete(pago)
         session.commit()
@@ -1707,7 +1720,9 @@ def descargar_compra_pdf(
 
         config = session.query(ConfiguracionEmpresa).first()
         pdf_buffer = generar_pdf_compra(compra, config)
-        filename = f"compra_{compra.id}.pdf"
+        proveedor_slug = sanitize_filename_component(compra.proveedor_rel.nombre if compra.proveedor_rel else None, "proveedor")
+        documento_slug = sanitize_filename_component(compra.nro_factura or compra.nro_documento_original or f"compra_{compra.id}", "compra")
+        filename = f"{proveedor_slug}_{documento_slug}_compra.pdf"
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",

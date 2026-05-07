@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { BarChart3, CalendarRange, ChartColumnBig, CircleDollarSign, Gem, Percent, TrendingUp } from 'lucide-react'
 
+import LoadingButton from '../components/LoadingButton'
 import { api } from '../context/AuthContext'
 import { formatCurrency } from '../utils/formatters'
 
@@ -253,9 +254,9 @@ export default function ReporteComparativoMensualPage() {
                     </div>
 
                     <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
-                        <button className="btn btn-primary" onClick={() => setFiltrosAplicados({ ...filtros })} disabled={loading}>
-                            {loading ? 'Generando...' : 'Generar reporte'}
-                        </button>
+                        <LoadingButton className="btn btn-primary" onClick={() => setFiltrosAplicados({ ...filtros })} loading={loading} loadingText="Generando reporte...">
+                            Generar reporte
+                        </LoadingButton>
                     </div>
                 </div>
             </div>

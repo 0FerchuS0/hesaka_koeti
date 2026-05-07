@@ -3,16 +3,43 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, useAuth } from '../context/AuthContext'
 import Modal from '../components/Modal'
+import FinancialJornadaNotice from '../components/FinancialJornadaNotice'
 import { TrendingUp, Plus, Search, CreditCard, DollarSign, AlertCircle, X, Ban, Settings, CheckCircle, Clock, Trash2, Box, Printer, Download, Eye, MessageCircle, RotateCcw } from 'lucide-react'
 import { hasActionAccess } from '../utils/roles'
 import usePendingNavigationGuard from '../utils/usePendingNavigationGuard'
+import { requestAndOpenPdf } from '../utils/fileDownloads'
+import { invalidateJornadaLiveData, useFinancialJornadaStatus } from '../hooks/useFinancialJornada'
+import { getWhatsappTemplateByCode, useActualizarWhatsappTemplate, useWhatsappTemplatesCatalog } from '../hooks/useWhatsappTemplates'
+import { parseBackendDateTime, toDateTimeLocalValue as toBusinessDateTimeLocalValue } from '../utils/formatters'
+import { formatGsAmount, normalizeGsInput, parseGsInput } from '../utils/currencyInputs'
 
 const fmt = v => new Intl.NumberFormat('es-PY').format(v ?? 0)
-const fmtDate = d => d ? new Date(d).toLocaleDateString('es-PY') : '—'
-const fmtDateTime = d => d ? new Date(d).toLocaleString('es-PY', { dateStyle: 'short', timeStyle: 'short' }) : '—'
+const fmtDate = d => {
+    const date = parseBackendDateTime(d)
+    return date ? date.toLocaleDateString('es-PY') : '-'
+}
+const fmtDateTime = d => {
+    const date = parseBackendDateTime(d)
+    return date ? date.toLocaleString('es-PY', { dateStyle: 'short', timeStyle: 'short' }) : '-'
+}
+const toDateTimeLocalValue = toBusinessDateTimeLocalValue
 const gs = v => `Gs. ${new Intl.NumberFormat('es-PY').format(v ?? 0)}`
+const formatDateTimeLocalValue = value => {
+    if (!value) return ''
+    const date = parseBackendDateTime(value)
+    if (!date) return ''
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    return `${year}-${month}-${day}`
+}
+const buildDatePatchValue = value => (value ? `${value}T12:00:00` : null)
 const RETIRO_WHATSAPP_TEMPLATE_KEY = 'hesaka-retiro-whatsapp-template'
 const DEFAULT_RETIRO_WHATSAPP_TEMPLATE = 'Hola {cliente}, te escribimos de {empresa}. Tu trabajo{venta} ya esta disponible para retiro. Cuando gustes, puedes pasar por la optica. Quedamos atentos.'
+const COMPROBANTE_WHATSAPP_TEMPLATE_KEY = 'hesaka-comprobante-whatsapp-template'
+const DEFAULT_COMPROBANTE_WHATSAPP_TEMPLATE = 'Hola {cliente}, te compartimos el comprobante de tu venta {venta} de {empresa}. En este chat puedes responder cualquier consulta.'
+const RETIRO_TEMPLATE_CODE = 'venta_aviso_retiro'
+const COMPROBANTE_TEMPLATE_CODE = 'venta_comprobante'
 const getErrorText = (err, fallback) => {
     const detail = err?.response?.data?.detail
     if (typeof detail === 'string' && detail.trim()) return detail
@@ -52,28 +79,84 @@ function getRetiroWhatsappTemplate() {
     return localStorage.getItem(RETIRO_WHATSAPP_TEMPLATE_KEY) || DEFAULT_RETIRO_WHATSAPP_TEMPLATE
 }
 
-function buildRetiroWhatsappMessage(context, template = DEFAULT_RETIRO_WHATSAPP_TEMPLATE) {
-    const ventaTexto = context?.venta_codigo ? ` correspondiente a la venta ${context.venta_codigo}` : ''
-    return (template || DEFAULT_RETIRO_WHATSAPP_TEMPLATE)
-        .replaceAll('{cliente}', context?.cliente_nombre || '')
-        .replaceAll('{venta}', ventaTexto)
-        .replaceAll('{empresa}', 'HESAKA')
+function applyWhatsappTemplate(template, replacements) {
+    return Object.entries(replacements).reduce(
+        (result, [placeholder, value]) => result.replaceAll(placeholder, value ?? ''),
+        template || '',
+    )
 }
 
-function buildRetiroWhatsappLink(context, message = '') {
+function buildRetiroWhatsappMessage(context, template = DEFAULT_RETIRO_WHATSAPP_TEMPLATE, empresa = 'HESAKA') {
+    const ventaTexto = context?.venta_codigo ? ` correspondiente a la venta ${context.venta_codigo}` : ''
+    return applyWhatsappTemplate(template || DEFAULT_RETIRO_WHATSAPP_TEMPLATE, {
+        '{cliente}': context?.cliente_nombre || '',
+        '{venta}': ventaTexto,
+        '{empresa}': empresa,
+    })
+}
+
+function buildRetiroTemplateFromMessage(message, context, empresa = 'HESAKA') {
+    let template = message || ''
+    const replacements = [
+        [context?.cliente_nombre || '', '{cliente}'],
+        [context?.venta_codigo ? ` correspondiente a la venta ${context.venta_codigo}` : '', '{venta}'],
+        [empresa || '', '{empresa}'],
+    ]
+    replacements.forEach(([value, placeholder]) => {
+        if (!value) return
+        template = template.replaceAll(value, placeholder)
+    })
+    return template
+}
+
+function buildRetiroWhatsappLink(context, message = '', empresa = 'HESAKA') {
     const telefono = normalizarTelefonoWhatsapp(context?.cliente_telefono)
     if (!telefono) return ''
-    const finalMessage = message || buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate())
+    const finalMessage = buildRetiroWhatsappMessage(context, message || getRetiroWhatsappTemplate(), empresa)
     return `https://wa.me/${telefono}?text=${encodeURIComponent(finalMessage)}`
 }
 
-function WhatsappRetiroModal({ context, onClose }) {
-    const [message, setMessage] = useState(() => buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate()))
-    const whatsappLink = buildRetiroWhatsappLink(context, message)
+function getComprobanteWhatsappTemplate() {
+    if (typeof window === 'undefined') return DEFAULT_COMPROBANTE_WHATSAPP_TEMPLATE
+    return localStorage.getItem(COMPROBANTE_WHATSAPP_TEMPLATE_KEY) || DEFAULT_COMPROBANTE_WHATSAPP_TEMPLATE
+}
+
+function buildComprobanteWhatsappMessage(context, template = DEFAULT_COMPROBANTE_WHATSAPP_TEMPLATE, empresa = 'HESAKA') {
+    return applyWhatsappTemplate(template || DEFAULT_COMPROBANTE_WHATSAPP_TEMPLATE, {
+        '{cliente}': context?.cliente_nombre || '',
+        '{venta}': context?.venta_codigo || '',
+        '{empresa}': empresa,
+    })
+}
+
+function buildComprobanteTemplateFromMessage(message, context, empresa = 'HESAKA') {
+    let template = message || ''
+    const replacements = [
+        [context?.cliente_nombre || '', '{cliente}'],
+        [context?.venta_codigo || '', '{venta}'],
+        [empresa || '', '{empresa}'],
+    ]
+    replacements.forEach(([value, placeholder]) => {
+        if (!value) return
+        template = template.replaceAll(value, placeholder)
+    })
+    return template
+}
+
+function buildComprobanteWhatsappLink(context, message = '', empresa = 'HESAKA') {
+    const telefono = normalizarTelefonoWhatsapp(context?.cliente_telefono)
+    if (!telefono) return ''
+    const finalMessage = buildComprobanteWhatsappMessage(context, message || getComprobanteWhatsappTemplate(), empresa)
+    return `https://wa.me/${telefono}?text=${encodeURIComponent(finalMessage)}`
+}
+
+function WhatsappRetiroModal({ context, onClose, empresaNombre = 'HESAKA', onGuardarPlantilla = null, guardandoPlantilla = false }) {
+    const [message, setMessage] = useState(() => buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate(), empresaNombre))
+    const whatsappLink = buildRetiroWhatsappLink(context, message, empresaNombre)
 
     useEffect(() => {
-        setMessage(buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate()))
-    }, [context])
+        setMessage(buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate(), empresaNombre))
+    }, [context, empresaNombre])
 
     return (
         <div style={{ display: 'grid', gap: 16 }}>
@@ -99,16 +182,116 @@ function WhatsappRetiroModal({ context, onClose }) {
 
             <div className="flex gap-12" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
                 <div className="flex gap-12" style={{ flexWrap: 'wrap' }}>
-                    <button type="button" className="btn btn-secondary" onClick={() => setMessage(buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate()))}>
+                    <button type="button" className="btn btn-secondary" onClick={() => setMessage(buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate(), empresaNombre))}>
                         <RotateCcw size={15} /> Restaurar sugerido
                     </button>
-                    <button type="button" className="btn btn-secondary" onClick={() => { localStorage.setItem(RETIRO_WHATSAPP_TEMPLATE_KEY, message); window.alert('Plantilla de retiro guardada.') }}>
+                    <button
+                        type="button"
+                        className="btn btn-secondary"
+                        onClick={async () => {
+                            const plantilla = buildRetiroTemplateFromMessage(message, context, empresaNombre)
+                            if (onGuardarPlantilla) {
+                                const ok = await onGuardarPlantilla(plantilla)
+                                if (!ok) return
+                            }
+                            localStorage.setItem(RETIRO_WHATSAPP_TEMPLATE_KEY, plantilla)
+                            window.alert('Plantilla de retiro guardada.')
+                        }}
+                        disabled={guardandoPlantilla}
+                    >
                         Guardar plantilla
                     </button>
                 </div>
                 <div className="flex gap-12" style={{ flexWrap: 'wrap' }}>
                     <button type="button" className="btn btn-secondary" onClick={onClose}>Cerrar</button>
                     <button type="button" className="btn btn-primary" disabled={!whatsappLink} onClick={() => window.open(whatsappLink, '_blank', 'noopener,noreferrer')}>
+                        <MessageCircle size={15} /> Abrir WhatsApp
+                    </button>
+                </div>
+            </div>
+        </div>
+    )
+}
+
+function WhatsappComprobanteModal({ context, onClose, empresaNombre = 'HESAKA', onGuardarPlantilla = null, guardandoPlantilla = false }) {
+    const [message, setMessage] = useState(() => buildComprobanteWhatsappMessage(context, getComprobanteWhatsappTemplate(), empresaNombre))
+    const [pdfOpening, setPdfOpening] = useState(false)
+    const whatsappLink = buildComprobanteWhatsappLink(context, message, empresaNombre)
+
+    useEffect(() => {
+        setMessage(buildComprobanteWhatsappMessage(context, getComprobanteWhatsappTemplate(), empresaNombre))
+    }, [context, empresaNombre])
+
+    const abrirComprobante = async () => {
+        if (!context?.pdf_url || pdfOpening) return
+        setPdfOpening(true)
+        try {
+            await requestAndOpenPdf(
+                () => api.get(context.pdf_url, { responseType: 'blob' }),
+                context?.pdf_filename || 'comprobante_venta.pdf',
+            )
+        } catch (error) {
+            window.alert(getErrorText(error, 'No se pudo abrir el comprobante.'))
+        } finally {
+            setPdfOpening(false)
+        }
+    }
+
+    return (
+        <div style={{ display: 'grid', gap: 16 }}>
+            <div className="card" style={{ marginBottom: 0, padding: '14px 16px' }}>
+                <div style={{ display: 'grid', gap: 6 }}>
+                    <div style={{ fontWeight: 700 }}>{context?.cliente_nombre || 'Sin cliente'}</div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem' }}>Telefono: {context?.cliente_telefono || 'No disponible'}</div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem' }}>Venta: {context?.venta_codigo || '-'}</div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem' }}>Archivo sugerido: {context?.pdf_filename || 'comprobante_venta.pdf'}</div>
+                </div>
+            </div>
+
+            <div className="form-group" style={{ marginBottom: 0 }}>
+                <label className="form-label">Mensaje de WhatsApp</label>
+                <textarea className="form-input" rows={6} value={message} onChange={e => setMessage(e.target.value)} style={{ resize: 'vertical' }} />
+                <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: '0.78rem' }}>Variables utiles: {'{cliente}'}, {'{venta}'}, {'{empresa}'}</div>
+            </div>
+
+            {!whatsappLink && (
+                <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, padding: '10px 14px', fontSize: '0.82rem', color: '#f87171', display: 'flex', gap: 8 }}>
+                    <AlertCircle size={16} /> No se pudo convertir el telefono del cliente a un formato valido para WhatsApp.
+                </div>
+            )}
+
+            <div style={{ background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.18)', borderRadius: 8, padding: '10px 14px', color: 'var(--text-secondary)', fontSize: '0.82rem', lineHeight: 1.5 }}>
+                Flujo sugerido: primero abre el comprobante, luego abre WhatsApp y adjunta el PDF desde la vista previa o desde la descarga.
+            </div>
+
+            <div className="flex gap-12" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
+                <div className="flex gap-12" style={{ flexWrap: 'wrap' }}>
+                    <button type="button" className="btn btn-secondary" onClick={() => setMessage(buildComprobanteWhatsappMessage(context, getComprobanteWhatsappTemplate(), empresaNombre))} disabled={pdfOpening}>
+                        <RotateCcw size={15} /> Restaurar sugerido
+                    </button>
+                    <button
+                        type="button"
+                        className="btn btn-secondary"
+                        onClick={async () => {
+                            const plantilla = buildComprobanteTemplateFromMessage(message, context, empresaNombre)
+                            if (onGuardarPlantilla) {
+                                const ok = await onGuardarPlantilla(plantilla)
+                                if (!ok) return
+                            }
+                            localStorage.setItem(COMPROBANTE_WHATSAPP_TEMPLATE_KEY, plantilla)
+                            window.alert('Plantilla de comprobante guardada.')
+                        }}
+                        disabled={pdfOpening || guardandoPlantilla}
+                    >
+                        Guardar plantilla
+                    </button>
+                </div>
+                <div className="flex gap-12" style={{ flexWrap: 'wrap' }}>
+                    <button type="button" className="btn btn-secondary" onClick={onClose} disabled={pdfOpening}>Cerrar</button>
+                    <button type="button" className="btn btn-secondary" onClick={abrirComprobante} disabled={pdfOpening}>
+                        <Printer size={15} /> {pdfOpening ? 'Generando PDF...' : 'Abrir comprobante'}
+                    </button>
+                    <button type="button" className="btn btn-primary" disabled={!whatsappLink || pdfOpening} onClick={() => window.open(whatsappLink, '_blank', 'noopener,noreferrer')}>
                         <MessageCircle size={15} /> Abrir WhatsApp
                     </button>
                 </div>
@@ -324,6 +507,118 @@ const downloadPDFPost = async (url, data) => {
     }
 }
 
+function CorregirFechaVentaModal({ venta, onClose, onBusyChange }) {
+    const qc = useQueryClient()
+    const [fecha, setFecha] = useState(() => formatDateTimeLocalValue(venta?.fecha))
+    const [actualizarPresupuesto, setActualizarPresupuesto] = useState(false)
+
+    const mutation = useMutation({
+        mutationFn: payload => api.patch(`/ventas/${venta.id}/fecha`, payload),
+        onSuccess: async () => {
+            await Promise.all([
+                qc.invalidateQueries(['ventas']),
+                qc.invalidateQueries(['ventas-optimizado']),
+                qc.invalidateQueries(['presupuestos']),
+            ])
+            onClose()
+        },
+    })
+
+    useEffect(() => {
+        onBusyChange?.(mutation.isPending)
+        return () => onBusyChange?.(false)
+    }, [mutation.isPending, onBusyChange])
+
+    const handleSubmit = event => {
+        event.preventDefault()
+        if (!fecha) {
+            window.alert('Debes seleccionar una fecha valida.')
+            return
+        }
+        mutation.mutate({
+            fecha: buildDatePatchValue(fecha),
+            actualizar_presupuesto_relacionado: actualizarPresupuesto,
+        })
+    }
+
+    return (
+        <form onSubmit={handleSubmit}>
+            <div className="card" style={{ marginBottom: 16, padding: '14px 16px' }}>
+                <div style={{ fontWeight: 700, marginBottom: 6 }}>{venta.codigo}</div>
+                <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem', lineHeight: 1.45 }}>
+                    Cliente: {venta.cliente_nombre || '—'}<br />
+                    Fecha actual: {fmtDate(venta.fecha)}<br />
+                    Total: {gs(venta.total)}
+                </div>
+            </div>
+
+            <div className="form-group">
+                <label className="form-label">Nueva fecha de la venta</label>
+                <input
+                    type="date"
+                    className="form-input"
+                    value={fecha}
+                    onChange={event => setFecha(event.target.value)}
+                    required
+                    disabled={mutation.isPending}
+                />
+            </div>
+
+            {venta.presupuesto_id && (
+                <label style={{ display: 'flex', gap: 10, alignItems: 'flex-start', marginBottom: 16, cursor: mutation.isPending ? 'not-allowed' : 'pointer', opacity: mutation.isPending ? 0.7 : 1 }}>
+                    <input
+                        type="checkbox"
+                        checked={actualizarPresupuesto}
+                        onChange={event => setActualizarPresupuesto(event.target.checked)}
+                        disabled={mutation.isPending}
+                        style={{ accentColor: 'var(--primary)', width: 16, height: 16, marginTop: 2 }}
+                    />
+                    <span style={{ color: 'var(--text-secondary)', fontSize: '0.84rem', lineHeight: 1.45 }}>
+                        Cambiar tambien la fecha del presupuesto vinculado para que ambos queden alineados.
+                    </span>
+                </label>
+            )}
+
+            {mutation.isError && (
+                <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: '0.82rem', color: '#f87171', display: 'flex', gap: 8 }}>
+                    <AlertCircle size={16} /> {getErrorText(mutation.error, 'No se pudo corregir la fecha de la venta.')}
+                </div>
+            )}
+
+            <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
+                <button type="button" className="btn btn-secondary" onClick={onClose} disabled={mutation.isPending}>Cancelar</button>
+                <button type="submit" className="btn btn-primary" disabled={mutation.isPending}>
+                    <Clock size={15} /> {mutation.isPending ? 'Guardando fecha...' : 'Guardar fecha'}
+                </button>
+            </div>
+        </form>
+    )
+}
+
+const openPdfDocument = async (url, fallbackFilename = 'documento.pdf') => {
+    try {
+        await requestAndOpenPdf(
+            () => api.get(url, { responseType: 'blob' }),
+            fallbackFilename,
+        )
+    } catch (error) {
+        console.error("Error al abrir PDF:", error)
+        alert("No se pudo cargar el PDF.")
+    }
+}
+
+const openPdfDocumentPost = async (url, data, fallbackFilename = 'documento.pdf') => {
+    try {
+        await requestAndOpenPdf(
+            () => api.post(url, data, { responseType: 'blob' }),
+            fallbackFilename,
+        )
+    } catch (error) {
+        console.error("Error al abrir PDF:", error)
+        alert(error?.response?.data?.detail || "No se pudo cargar el PDF.")
+    }
+}
+
 const METODOS_PAGO = [
     { value: 'EFECTIVO', label: '💵 Efectivo' },
     { value: 'TARJETA', label: '💳 Tarjeta' },
@@ -347,9 +642,12 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
     const [metodo, setMetodo] = useState('EFECTIVO')
     const [bancoId, setBancoId] = useState('')
     const [nota, setNota] = useState('')
-    const [fecha, setFecha] = useState(new Date().toISOString().slice(0, 16))
+    const [fecha, setFecha] = useState(() => toDateTimeLocalValue(new Date()))
     const [pdfOpeningPagoId, setPdfOpeningPagoId] = useState(null)
     const [deletingPagoId, setDeletingPagoId] = useState(null)
+    const [montoEditado, setMontoEditado] = useState(false)
+    const { data: jornadaEstado } = useFinancialJornadaStatus()
+    const jornadaAbierta = Boolean(jornadaEstado?.abierta)
 
     const { data: venta, isLoading } = useQuery({
         queryKey: ['venta', ventaId],
@@ -357,6 +655,8 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
     })
 
     const { data: bancos = [] } = useQuery({ queryKey: ['bancos'], queryFn: () => api.get('/bancos/').then(r => r.data) })
+    const saldoPendiente = Math.max(0, Math.trunc(Number(venta?.saldo || 0)))
+    const montoCobrado = parseGsInput(monto)
 
     const actualizarVentaEnCache = updater => {
         qc.setQueryData(['venta', ventaId], current => {
@@ -388,17 +688,20 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
         void qc.invalidateQueries({ queryKey: ['ventas-optimizado'], refetchType: 'active' })
         void qc.invalidateQueries({ queryKey: ['ventas'], refetchType: 'active' })
         void qc.invalidateQueries({ queryKey: ['saldo-caja'], refetchType: 'active' })
+        invalidateJornadaLiveData(qc)
     }
 
     const cobrar = useMutation({
         mutationFn: d => api.post(`/ventas/${ventaId}/pagos`, d),
         onSuccess: response => {
             const nuevoPago = response?.data
+            let siguienteMontoSugerido = ''
             if (nuevoPago) {
                 actualizarVentaEnCache(current => {
                     const saldoActual = Number(current.saldo || 0)
                     const montoPago = Number(nuevoPago.monto || 0)
                     const nuevoSaldo = Math.max(0, saldoActual - montoPago)
+                    siguienteMontoSugerido = formatGsAmount(nuevoSaldo)
                     return {
                         ...current,
                         saldo: nuevoSaldo,
@@ -407,7 +710,8 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
                     }
                 })
             }
-            setMonto('')
+            setMonto(siguienteMontoSugerido)
+            setMontoEditado(false)
             setNota('')
             refrescarEnSegundoPlano()
         }
@@ -426,13 +730,20 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
                 estado: saldoRestante > 0 ? 'PENDIENTE' : 'PAGADO',
                 pagos: (current.pagos || []).filter(pago => pago.id !== pagoId),
             }))
+            setMonto(formatGsAmount(saldoRestante))
+            setMontoEditado(false)
             refrescarEnSegundoPlano()
         },
         onSettled: () => {
             setDeletingPagoId(null)
         }
     })
-    const confirmNavigation = usePendingNavigationGuard(Boolean(cobrar.isPending || deletingPagoId || pdfOpeningPagoId), 'La gestion de pagos aun se esta procesando. ¿Seguro que desea salir de esta vista?')
+    const confirmNavigation = usePendingNavigationGuard(
+        Boolean(cobrar.isPending || deletingPagoId || pdfOpeningPagoId || monto || nota),
+        cobrar.isPending || deletingPagoId || pdfOpeningPagoId
+            ? 'La gestion de pagos aun se esta procesando. ¿Seguro que desea salir de esta vista?'
+            : 'Hay datos de cobro sin confirmar. Si sales ahora, puedes perder lo cargado. ¿Deseas continuar?'
+    )
 
     useEffect(() => {
         const busy = Boolean(cobrar.isPending || deletingPagoId || pdfOpeningPagoId)
@@ -440,17 +751,30 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
         return () => onBusyChange?.(false)
     }, [cobrar.isPending, deletingPagoId, onBusyChange, pdfOpeningPagoId])
 
+    useEffect(() => {
+        if (!venta?.saldo || montoEditado) return
+        setMonto(formatGsAmount(venta.saldo))
+    }, [montoEditado, venta?.saldo])
+
     if (isLoading || !venta) return <div className="flex-center p-20"><div className="spinner"></div></div>
 
     const handleSubmit = e => {
         e.preventDefault()
-        if (cobrar.isPending) return
+        if (cobrar.isPending || !jornadaAbierta) return
+        if (montoCobrado <= 0) {
+            window.alert('Debes indicar un monto mayor a cero.')
+            return
+        }
+        if (montoCobrado > saldoPendiente) {
+            window.alert('El monto cobrado no puede superar el saldo pendiente de la venta.')
+            return
+        }
         cobrar.mutate({
-            monto: parseFloat(monto),
+            monto: montoCobrado,
             metodo_pago: metodo,
             banco_id: bancoId ? parseInt(bancoId) : null,
             nota: nota || null,
-            fecha: new Date(fecha).toISOString()
+            fecha: fecha || null
         })
     }
 
@@ -458,7 +782,7 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
         if (pdfOpeningPagoId === pagoId) return
         setPdfOpeningPagoId(pagoId)
         try {
-            await downloadPDF(`/ventas/${ventaId}/pagos/${pagoId}/pdf`)
+            await openPdfDocument(`/ventas/${ventaId}/pagos/${pagoId}/pdf`, `pago_${pagoId}.pdf`)
         } finally {
             setPdfOpeningPagoId(null)
         }
@@ -466,6 +790,7 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            <FinancialJornadaNotice compact />
             {/* Info Resumen */}
             <div style={{ background: 'rgba(26,86,219,0.06)', border: '1px solid rgba(26,86,219,0.15)', borderRadius: 10, padding: '12px 16px', display: 'flex', justifyContent: 'space-between' }}>
                 <div>
@@ -510,7 +835,7 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
                                             </button>
                                             <button className="btn-icon" style={{ color: 'var(--danger)' }} title="Eliminar/Revertir pago"
                                                 onClick={() => { if (confirm('¿Eliminar cobro? Se revertirá en caja/bancos.')) eliminar.mutate(p.id) }}
-                                                disabled={deletingPagoId === p.id || cobrar.isPending}>
+                                                disabled={deletingPagoId === p.id || cobrar.isPending || !jornadaAbierta}>
                                                 <Trash2 size={14} />
                                             </button>
                                         </div>
@@ -529,11 +854,27 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
                     <div className="grid-2 mb-12">
                         <div className="form-group">
                             <label className="form-label">Monto (Gs.)</label>
-                            <input className="form-input" type="number" value={monto} onChange={e => setMonto(e.target.value)} required placeholder="0" max={venta.saldo} min={0} step="any" disabled={cobrar.isPending} />
+                            <input
+                                className="form-input"
+                                type="text"
+                                inputMode="numeric"
+                                value={monto}
+                                onChange={e => {
+                                    setMontoEditado(true)
+                                    setMonto(normalizeGsInput(e.target.value).formatted)
+                                }}
+                                onFocus={e => e.target.select()}
+                                required
+                                placeholder="0"
+                                disabled={cobrar.isPending || !jornadaAbierta}
+                            />
+                            <div style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: '0.76rem' }}>
+                                Sugerido: Gs. {fmt(saldoPendiente)}. No se permite cobrar más que el saldo pendiente.
+                            </div>
                         </div>
                         <div className="form-group">
                             <label className="form-label">Método</label>
-                            <select className="form-select" value={metodo} onChange={e => setMetodo(e.target.value)} disabled={cobrar.isPending}>
+                            <select className="form-select" value={metodo} onChange={e => setMetodo(e.target.value)} disabled={cobrar.isPending || !jornadaAbierta}>
                                 {METODOS_PAGO.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
                             </select>
                         </div>
@@ -541,7 +882,7 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
                     {['TARJETA', 'TRANSFERENCIA'].includes(metodo) && (
                         <div className="form-group mb-12">
                             <label className="form-label">Banco Destino *</label>
-                            <select className="form-select" value={bancoId} onChange={e => setBancoId(e.target.value)} required disabled={cobrar.isPending}>
+                            <select className="form-select" value={bancoId} onChange={e => setBancoId(e.target.value)} required disabled={cobrar.isPending || !jornadaAbierta}>
                                 <option value="">Seleccionar banco...</option>
                                 {bancos.map(b => <option key={b.id} value={b.id}>{b.nombre_banco} — {b.numero_cuenta}</option>)}
                             </select>
@@ -553,11 +894,11 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
                     <div className="grid-2 mb-16">
                         <div className="form-group">
                             <label className="form-label">Fecha del Pago</label>
-                            <input className="form-input" type="datetime-local" value={fecha} onChange={e => setFecha(e.target.value)} required disabled={cobrar.isPending} />
+                            <input className="form-input" type="datetime-local" value={fecha} onChange={e => setFecha(e.target.value)} required disabled={cobrar.isPending || !jornadaAbierta} />
                         </div>
                         <div className="form-group">
                             <label className="form-label">Nota (opcional)</label>
-                            <input className="form-input" value={nota} onChange={e => setNota(e.target.value)} placeholder="Ej: Pago parcial..." disabled={cobrar.isPending} />
+                            <input className="form-input" value={nota} onChange={e => setNota(e.target.value)} placeholder="Ej: Pago parcial..." disabled={cobrar.isPending || !jornadaAbierta} />
                         </div>
                     </div>
                     {cobrar.isError && (
@@ -566,7 +907,7 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
                         </div>
                     )}
                     <div className="flex gap-8" style={{ justifyContent: 'flex-end' }}>
-                        <button type="submit" className="btn btn-primary" disabled={cobrar.isPending}>
+                        <button type="submit" className="btn btn-primary" disabled={cobrar.isPending || !jornadaAbierta}>
                             {cobrar.isPending ? 'Aplicando cobro...' : 'Aplicar Cobro'}
                         </button>
                     </div>
@@ -729,7 +1070,7 @@ function ClienteFichaModal({ clienteId, onClose }) {
 }
 
 // ─── Componente Menú de Acciones ───────────────────────────────────────────────
-function VentasRowActions({ venta, onPagar, onVerFicha, onAjustar, onAnular, onWhatsappRetiro, qc, anularMutation, user, anularBusyId, whatsappBusyId }) {
+function VentasRowActions({ venta, onPagar, onVerFicha, onAjustar, onCorregirFecha, onAnular, onWhatsappRetiro, onWhatsappComprobante, qc, anularMutation, user, anularBusyId, whatsappBusyId }) {
     const [open, setOpen] = useState(false)
     const [exporting, setExporting] = useState(false)
     const [menuPosition, setMenuPosition] = useState(null)
@@ -752,13 +1093,18 @@ function VentasRowActions({ venta, onPagar, onVerFicha, onAjustar, onAnular, onW
     const whatsappBusy = whatsappBusyId === venta.id
     const actionBusy = exporting || toggleEntrega.isPending || anularBusy || whatsappBusy
 
-    const handleAction = (cb) => { setOpen(false); cb() }
+    const handleAction = (cb) => {
+        setOpen(false)
+        window.setTimeout(() => {
+            cb()
+        }, 0)
+    }
     const handleExport = async () => {
         if (exporting) return
         setOpen(false)
         setExporting(true)
         try {
-            await downloadPDF(`/ventas/${venta.id}/pdf`)
+            await openPdfDocument(`/ventas/${venta.id}/pdf`, `venta_${venta.codigo || venta.id}.pdf`)
         } finally {
             setExporting(false)
         }
@@ -814,6 +1160,14 @@ function VentasRowActions({ venta, onPagar, onVerFicha, onAjustar, onAnular, onW
                                 <Printer size={14} style={{ marginRight: 8 }} /> {exporting ? 'Abriendo PDF...' : 'Imprimir Detalles Venta'}
                             </button>
                         )}
+                        <button className="dropdown-item" onClick={() => handleAction(() => onCorregirFecha(venta))} disabled={actionBusy}>
+                            <Clock size={14} style={{ marginRight: 8 }} /> Corregir fecha
+                        </button>
+                        {puedeExportar && venta.estado !== 'ANULADA' && (
+                            <button className="dropdown-item" onClick={() => handleAction(() => onWhatsappComprobante(venta))} disabled={actionBusy}>
+                                <MessageCircle size={14} style={{ marginRight: 8 }} /> {whatsappBusy ? 'Preparando...' : 'Enviar comprobante por WhatsApp'}
+                            </button>
+                        )}
                         {venta.estado !== 'ANULADA' && venta.estado_entrega === 'RECIBIDO' && (
                             <button className="dropdown-item" onClick={() => handleAction(() => onWhatsappRetiro(venta))} disabled={actionBusy}>
                                 <MessageCircle size={14} style={{ marginRight: 8 }} /> {whatsappBusy ? 'Preparando...' : 'Avisar retiro por WhatsApp'}
@@ -860,6 +1214,8 @@ export default function VentasPage() {
     const [buscar, setBuscar] = useState('')
     const [buscarDebounced, setBuscarDebounced] = useState('')
     const [estadoFiltro, setEstadoFiltro] = useState('')
+    const [fechaDesdeFiltro, setFechaDesdeFiltro] = useState('')
+    const [fechaHastaFiltro, setFechaHastaFiltro] = useState('')
     const [entregaFiltro, setEntregaFiltro] = useState('')
     const [vendedorFiltro, setVendedorFiltro] = useState('')
     const [canalFiltro, setCanalFiltro] = useState('')
@@ -869,14 +1225,32 @@ export default function VentasPage() {
     const [clienteFichaId, setClienteFichaId] = useState(null)
     const [ventaPagosModalBusy, setVentaPagosModalBusy] = useState(false)
     const [ventaAjusteModalBusy, setVentaAjusteModalBusy] = useState(false)
+    const [ventaFecha, setVentaFecha] = useState(null)
+    const [ventaFechaModalBusy, setVentaFechaModalBusy] = useState(false)
     const [seleccionadas, setSeleccionadas] = useState([])
     const [page, setPage] = useState(1)
     const [pageSize, setPageSize] = useState(25)
     const [pdfConjuntoBusy, setPdfConjuntoBusy] = useState(false)
     const [anularBusyId, setAnularBusyId] = useState(null)
     const [whatsappRetiro, setWhatsappRetiro] = useState(null)
+    const [whatsappComprobante, setWhatsappComprobante] = useState(null)
     const [whatsappBusyId, setWhatsappBusyId] = useState(null)
+    const { data: configPublica } = useQuery({
+        queryKey: ['configuracion-general-publica'],
+        queryFn: () => api.get('/configuracion-general/publica').then(response => response.data),
+        retry: false,
+    })
+    const empresaNombre = (configPublica?.nombre || '').trim() || 'HESAKA'
+    const { data: whatsappTemplates = [] } = useWhatsappTemplatesCatalog()
+    const actualizarWhatsappTemplate = useActualizarWhatsappTemplate()
     const confirmPageNavigation = usePendingNavigationGuard(Boolean(pdfConjuntoBusy || anularBusyId), 'Hay una accion de venta aun en proceso. ¿Seguro que desea salir de esta vista?')
+
+    useEffect(() => {
+        const retiroTemplate = getWhatsappTemplateByCode(whatsappTemplates, RETIRO_TEMPLATE_CODE, DEFAULT_RETIRO_WHATSAPP_TEMPLATE)
+        const comprobanteTemplate = getWhatsappTemplateByCode(whatsappTemplates, COMPROBANTE_TEMPLATE_CODE, DEFAULT_COMPROBANTE_WHATSAPP_TEMPLATE)
+        localStorage.setItem(RETIRO_WHATSAPP_TEMPLATE_KEY, retiroTemplate)
+        localStorage.setItem(COMPROBANTE_WHATSAPP_TEMPLATE_KEY, comprobanteTemplate)
+    }, [whatsappTemplates])
 
     useEffect(() => {
         const timer = setTimeout(() => setBuscarDebounced(buscar.trim()), 350)
@@ -885,11 +1259,11 @@ export default function VentasPage() {
 
     useEffect(() => {
         setPage(1)
-    }, [buscarDebounced, estadoFiltro, entregaFiltro, vendedorFiltro, canalFiltro, soloPendientes, pageSize])
+    }, [buscarDebounced, estadoFiltro, fechaDesdeFiltro, fechaHastaFiltro, entregaFiltro, vendedorFiltro, canalFiltro, soloPendientes, pageSize])
 
     useEffect(() => {
         setSeleccionadas([])
-    }, [page, buscarDebounced, estadoFiltro, entregaFiltro, vendedorFiltro, canalFiltro, soloPendientes, pageSize])
+    }, [page, buscarDebounced, estadoFiltro, fechaDesdeFiltro, fechaHastaFiltro, entregaFiltro, vendedorFiltro, canalFiltro, soloPendientes, pageSize])
 
     const { data: vendedoresFiltro = [] } = useQuery({
         queryKey: ['ventas-vendedores-filtro'],
@@ -904,12 +1278,14 @@ export default function VentasPage() {
     })
 
     const { data, isLoading } = useQuery({
-        queryKey: ['ventas-optimizado', buscarDebounced, estadoFiltro, entregaFiltro, vendedorFiltro, canalFiltro, soloPendientes, page, pageSize],
+        queryKey: ['ventas-optimizado', buscarDebounced, estadoFiltro, fechaDesdeFiltro, fechaHastaFiltro, entregaFiltro, vendedorFiltro, canalFiltro, soloPendientes, page, pageSize],
         queryFn: () => {
             const params = new URLSearchParams()
             params.append('page', String(page))
             params.append('page_size', String(pageSize))
             if (estadoFiltro) params.append('estado', estadoFiltro)
+            if (fechaDesdeFiltro) params.append('fecha_desde', fechaDesdeFiltro)
+            if (fechaHastaFiltro) params.append('fecha_hasta', fechaHastaFiltro)
             if (entregaFiltro) params.append('estado_entrega', entregaFiltro)
             if (vendedorFiltro) params.append('vendedor_id', vendedorFiltro)
             if (canalFiltro) params.append('canal_venta_id', canalFiltro)
@@ -932,6 +1308,7 @@ export default function VentasPage() {
                 qc.invalidateQueries(['ventas-optimizado']),
                 qc.invalidateQueries(['saldo-caja'])
             ])
+            invalidateJornadaLiveData(qc)
         }
         ,
         onSettled: () => setAnularBusyId(null)
@@ -969,7 +1346,7 @@ export default function VentasPage() {
         }
         setPdfConjuntoBusy(true)
         try {
-            await downloadPDFPost('/ventas/pdf-multiple', { venta_ids: seleccionadasVisibles })
+            await openPdfDocumentPost('/ventas/pdf-multiple', { venta_ids: seleccionadasVisibles }, 'ventas_seleccionadas.pdf')
         } finally {
             setPdfConjuntoBusy(false)
         }
@@ -997,6 +1374,30 @@ export default function VentasPage() {
             })
         } catch (error) {
             alert(getErrorText(error, 'No se pudo preparar el mensaje de WhatsApp.'))
+        } finally {
+            setWhatsappBusyId(null)
+        }
+    }
+
+    const abrirWhatsappComprobante = async (venta) => {
+        if (!venta?.cliente_id) {
+            alert('Esta venta no tiene un cliente vinculado.')
+            return
+        }
+        try {
+            setWhatsappBusyId(venta.id)
+            const { data: cliente } = await api.get(`/clientes/${venta.cliente_id}`)
+            setWhatsappComprobante({
+                venta_id: venta.id,
+                venta_codigo: venta.codigo,
+                cliente_id: venta.cliente_id,
+                cliente_nombre: venta.cliente_nombre,
+                cliente_telefono: cliente?.telefono || '',
+                pdf_url: `/ventas/${venta.id}/pdf`,
+                pdf_filename: `${venta.cliente_nombre || 'Cliente'}_${venta.codigo || `venta_${venta.id}`}_comprobante.pdf`,
+            })
+        } catch (error) {
+            alert(getErrorText(error, 'No se pudo preparar el comprobante para WhatsApp.'))
         } finally {
             setWhatsappBusyId(null)
         }
@@ -1044,6 +1445,14 @@ export default function VentasPage() {
                     <option value="PAGADO">PAGADO</option>
                     <option value="ANULADA">ANULADO</option>
                 </select>
+                <div className="form-group" style={{ marginBottom: 0 }}>
+                    <label className="form-label" style={{ marginBottom: 4 }}>Desde</label>
+                    <input className="form-input" style={{ width: 150 }} type="date" value={fechaDesdeFiltro} onChange={e => setFechaDesdeFiltro(e.target.value)} />
+                </div>
+                <div className="form-group" style={{ marginBottom: 0 }}>
+                    <label className="form-label" style={{ marginBottom: 4 }}>Hasta</label>
+                    <input className="form-input" style={{ width: 150 }} type="date" value={fechaHastaFiltro} onChange={e => setFechaHastaFiltro(e.target.value)} />
+                </div>
                 <select className="form-select" style={{ width: 170 }} value={entregaFiltro} onChange={e => setEntregaFiltro(e.target.value)}>
                     <option value="">Filtro Laboratorio</option>
                     <option value="EN_LABORATORIO">EN LABORATORIO</option>
@@ -1075,6 +1484,22 @@ export default function VentasPage() {
                     <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                         {seleccionadasVisibles.length} seleccionada{seleccionadasVisibles.length === 1 ? '' : 's'}
                     </span>
+                    <button
+                        className="btn btn-secondary btn-sm"
+                        type="button"
+                        onClick={() => {
+                            setEstadoFiltro('')
+                            setFechaDesdeFiltro('')
+                            setFechaHastaFiltro('')
+                            setEntregaFiltro('')
+                            setVendedorFiltro('')
+                            setCanalFiltro('')
+                            setSoloPendientes(false)
+                            setBuscar('')
+                        }}
+                    >
+                        Limpiar filtros
+                    </button>
                     {hasActionAccess(user, 'ventas.exportar', 'ventas') && (
                         <button
                             className="btn btn-secondary btn-sm"
@@ -1141,7 +1566,9 @@ export default function VentasPage() {
                                                 venta={v}
                                                 onPagar={setVentaPagos}
                                                 onAjustar={setVentaAjuste}
+                                                onCorregirFecha={setVentaFecha}
                                                 onWhatsappRetiro={abrirWhatsappRetiro}
+                                                onWhatsappComprobante={abrirWhatsappComprobante}
                                                 onVerFicha={(venta) => setClienteFichaId(venta.cliente_id)}
                                                 onAnular={(ventaId) => {
                                                     setAnularBusyId(ventaId)
@@ -1203,6 +1630,17 @@ export default function VentasPage() {
                     />
                 </Modal>
             )}
+            {ventaFecha && (
+                <Modal
+                    title={`Corregir fecha: ${ventaFecha.codigo}`}
+                    onClose={() => setVentaFecha(null)}
+                    maxWidth="520px"
+                    closeDisabled={ventaFechaModalBusy}
+                    onCloseAttempt={() => window.alert('La fecha de la venta aun se esta guardando. Espera a que termine antes de cerrar.')}
+                >
+                    <CorregirFechaVentaModal venta={ventaFecha} onClose={() => setVentaFecha(null)} onBusyChange={setVentaFechaModalBusy} />
+                </Modal>
+            )}
             {clienteFichaId && (
                 <Modal title="Ficha de Cliente" onClose={() => setClienteFichaId(null)} maxWidth="980px">
                     <ClienteFichaModal clienteId={clienteFichaId} onClose={() => setClienteFichaId(null)} />
@@ -1210,9 +1648,49 @@ export default function VentasPage() {
             )}
             {whatsappRetiro && (
                 <Modal title="Aviso de retiro por WhatsApp" onClose={() => setWhatsappRetiro(null)} maxWidth="680px">
-                    <WhatsappRetiroModal context={whatsappRetiro} onClose={() => setWhatsappRetiro(null)} />
+                    <WhatsappRetiroModal
+                        context={whatsappRetiro}
+                        onClose={() => setWhatsappRetiro(null)}
+                        empresaNombre={empresaNombre}
+                        guardandoPlantilla={actualizarWhatsappTemplate.isPending}
+                        onGuardarPlantilla={async plantilla => {
+                            try {
+                                await actualizarWhatsappTemplate.mutateAsync({
+                                    codigo: RETIRO_TEMPLATE_CODE,
+                                    payload: { plantilla, activo: true },
+                                })
+                                return true
+                            } catch {
+                                window.alert('No se pudo guardar la plantilla en el catálogo. Verifica permisos de administrador.')
+                                return false
+                            }
+                        }}
+                    />
+                </Modal>
+            )}
+            {whatsappComprobante && (
+                <Modal title="Enviar comprobante por WhatsApp" onClose={() => setWhatsappComprobante(null)} maxWidth="720px">
+                    <WhatsappComprobanteModal
+                        context={whatsappComprobante}
+                        onClose={() => setWhatsappComprobante(null)}
+                        empresaNombre={empresaNombre}
+                        guardandoPlantilla={actualizarWhatsappTemplate.isPending}
+                        onGuardarPlantilla={async plantilla => {
+                            try {
+                                await actualizarWhatsappTemplate.mutateAsync({
+                                    codigo: COMPROBANTE_TEMPLATE_CODE,
+                                    payload: { plantilla, activo: true },
+                                })
+                                return true
+                            } catch {
+                                window.alert('No se pudo guardar la plantilla en el catálogo. Verifica permisos de administrador.')
+                                return false
+                            }
+                        }}
+                    />
                 </Modal>
             )}
         </div>
     )
 }
+

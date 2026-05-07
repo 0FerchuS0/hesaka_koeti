@@ -23,11 +23,6 @@ PROTECTED_HESAKA_ADMIN = {
 }
 
 
-def _normalize_upper_code(value: str, fallback: str) -> str:
-    cleaned = "".join(ch for ch in (value or "").upper() if ch.isalnum())
-    return (cleaned[:4] or fallback).ljust(min(4, max(1, len(cleaned[:4] or fallback))), "")[:4]
-
-
 def _seed_categoria(
     session: Session,
     nombre: str,
@@ -93,6 +88,7 @@ def _seed_default_catalogs(tenant_slug: str, tenant_name: str, tenant_email: str
                 nombre=tenant_name,
                 email=tenant_email,
                 telefono=tenant_phone or None,
+                business_timezone=(settings.BUSINESS_TIMEZONE or "America/Asuncion"),
             )
             tenant_session.add(config)
         else:
@@ -102,6 +98,8 @@ def _seed_default_catalogs(tenant_slug: str, tenant_name: str, tenant_email: str
                 config.email = tenant_email
             if tenant_phone and not config.telefono:
                 config.telefono = tenant_phone
+            if not (config.business_timezone or "").strip():
+                config.business_timezone = (settings.BUSINESS_TIMEZONE or "America/Asuncion")
 
         atributo_uso = tenant_session.query(Atributo).filter(Atributo.nombre == "Uso").first()
         if not atributo_uso:

@@ -2,11 +2,12 @@
 from datetime import date, datetime
 from math import ceil
 from typing import List, Optional
+from zoneinfo import ZoneInfo, available_timezones
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 
 from app.database import get_session_for_tenant
@@ -17,6 +18,7 @@ from app.models.models import (
     Cliente,
     Compra,
     ConfiguracionEmpresa,
+    PlantillaWhatsapp,
     Pago,
     PagoCompra,
     Presupuesto,
@@ -38,11 +40,15 @@ from app.schemas.schemas import (
     ConfiguracionGeneralOut,
     ConfiguracionGeneralPublicaOut,
     ConfiguracionGeneralUpdate,
+    PlantillaWhatsappOut,
+    PlantillaWhatsappUpdate,
     CanalVentaCreate,
     CanalVentaListItemOut,
     CanalVentaListResponseOut,
     CanalVentaOut,
     ClienteCreate,
+    ClienteCumpleanosOut,
+    ClienteCumpleanosResumenOut,
     ClienteListItemOut,
     ClienteListResponseOut,
     ClienteOut,
@@ -61,6 +67,7 @@ from app.schemas.schemas import (
 )
 from app.utils.backup_restore import create_backup, list_backups, restore_backup, restore_uploaded_backup
 from app.utils.auth import get_current_user, require_admin
+from app.config import settings
 from app.utils.configuracion_general import (
     configuracion_general_completa,
     obtener_canal_principal,
@@ -69,8 +76,10 @@ from app.utils.configuracion_general import (
 )
 from app.utils.media_storage import save_logo_for_tenant
 from app.utils.excel_reporte_clientes import generar_excel_reporte_clientes
+from app.utils.filename_utils import sanitize_filename_component
 from app.utils.pdf_fichas import generar_pdf_ficha_cliente, generar_pdf_ficha_proveedor
 from app.utils.pdf_reporte_clientes import generar_pdf_reporte_clientes
+from app.utils.timezone import ahora_negocio, fecha_actual_negocio
 
 router = APIRouter(prefix="/api/clientes", tags=["Clientes"])
 prov_router = APIRouter(prefix="/api/proveedores", tags=["Proveedores"])
@@ -78,6 +87,76 @@ ref_router = APIRouter(prefix="/api/referidores", tags=["Referidores"])
 vend_router = APIRouter(prefix="/api/vendedores", tags=["Vendedores"])
 canal_router = APIRouter(prefix="/api/canales-venta", tags=["Canales Venta"])
 config_router = APIRouter(prefix="/api/configuracion-general", tags=["Configuracion General"])
+
+
+WHATSAPP_TEMPLATE_DEFAULTS = [
+    {
+        "codigo": "venta_aviso_retiro",
+        "nombre": "Venta - Aviso de retiro",
+        "descripcion": "Mensaje para avisar que el trabajo de una venta ya esta listo para retiro.",
+        "plantilla": "Hola {cliente}, te escribimos de {empresa}. Tu trabajo{venta} ya esta disponible para retiro. Cuando gustes, puedes pasar por la optica. Quedamos atentos.",
+    },
+    {
+        "codigo": "venta_comprobante",
+        "nombre": "Venta - Envio de comprobante",
+        "descripcion": "Mensaje de acompanamiento para compartir comprobante de venta por WhatsApp.",
+        "plantilla": "Hola {cliente}, te compartimos el comprobante de tu venta {venta} de {empresa}. En este chat puedes responder cualquier consulta.",
+    },
+    {
+        "codigo": "clinica_recordatorio_turno",
+        "nombre": "Clinica - Recordatorio de turno",
+        "descripcion": "Recordatorio de turno/control para pacientes de clinica.",
+        "plantilla": "Hola {paciente}, te escribimos de {empresa}. Te recordamos tu turno para el {proxima_consulta} a las {hora_turno}. Te esperamos. Si no podras asistir, por favor avisanos para reprogramar.",
+    },
+    {
+        "codigo": "cumpleanos_cliente",
+        "nombre": "Clientes - Feliz cumpleanos",
+        "descripcion": "Mensaje de saludo para clientes en su cumpleanos.",
+        "plantilla": "Hola {cliente}, te escribimos de {empresa}. Queremos desearte un muy feliz cumpleaños. Que tengas un excelente dia.",
+    },
+    {
+        "codigo": "dashboard_recordatorio",
+        "nombre": "Dashboard - Recordatorio rapido",
+        "descripcion": "Mensaje rapido desde dashboard para recordar proximas consultas.",
+        "plantilla": "Hola {paciente}, te escribimos de {empresa}. Tu ultima consulta fue el {ultima_consulta} y tu proximo control esta previsto para el {proxima_consulta} a las {hora_turno}. Quedamos atentos para ayudarte a confirmar tu cita.",
+    },
+]
+
+
+def _asegurar_catalogo_plantillas_whatsapp(session):
+    existentes = {row.codigo: row for row in session.query(PlantillaWhatsapp).all()}
+    cambios = False
+    for item in WHATSAPP_TEMPLATE_DEFAULTS:
+        row = existentes.get(item["codigo"])
+        if not row:
+            session.add(PlantillaWhatsapp(
+                codigo=item["codigo"],
+                nombre=item["nombre"],
+                descripcion=item["descripcion"],
+                plantilla=item["plantilla"],
+                activo=True,
+                editable=True,
+            ))
+            cambios = True
+            continue
+        # Si cambia metadata por version, se refresca sin tocar texto editable del usuario.
+        if row.nombre != item["nombre"]:
+            row.nombre = item["nombre"]
+            cambios = True
+        if row.descripcion != item["descripcion"]:
+            row.descripcion = item["descripcion"]
+            cambios = True
+        if not row.plantilla:
+            row.plantilla = item["plantilla"]
+            cambios = True
+        if row.activo is None:
+            row.activo = True
+            cambios = True
+        if row.editable is None:
+            row.editable = True
+            cambios = True
+    if cambios:
+        session.commit()
 
 
 class MovimientoFichaOut(BaseModel):
@@ -177,6 +256,70 @@ def _construir_query_clientes(session, buscar: Optional[str], referidor_id: Opti
     return query
 
 
+def _calcular_edad(fecha_nacimiento: date | None, fecha_referencia: date | None = None) -> int | None:
+    if not fecha_nacimiento:
+        return None
+    referencia = fecha_referencia or fecha_actual_negocio()
+    return referencia.year - fecha_nacimiento.year - (
+        (referencia.month, referencia.day) < (fecha_nacimiento.month, fecha_nacimiento.day)
+    )
+
+
+def _listar_cumpleanos_en_fecha(session, fecha_objetivo: date) -> list[ClienteCumpleanosOut]:
+    resultados: list[ClienteCumpleanosOut] = []
+    cliente_ids_cubiertos: set[int] = set()
+
+    pacientes = (
+        session.query(ClinicaPaciente)
+        .filter(
+            ClinicaPaciente.fecha_nacimiento.isnot(None),
+            func.extract("month", ClinicaPaciente.fecha_nacimiento) == fecha_objetivo.month,
+            func.extract("day", ClinicaPaciente.fecha_nacimiento) == fecha_objetivo.day,
+        )
+        .all()
+    )
+    for paciente in pacientes:
+        resultados.append(ClienteCumpleanosOut(
+            id=paciente.id,
+            nombre=paciente.nombre_completo,
+            ci=paciente.ci_pasaporte,
+            telefono=paciente.telefono or (paciente.cliente_rel.telefono if paciente.cliente_rel else None),
+            email=paciente.cliente_rel.email if paciente.cliente_rel else None,
+            fecha_nacimiento=paciente.fecha_nacimiento,
+            edad=_calcular_edad(paciente.fecha_nacimiento, fecha_objetivo),
+            referidor_nombre=paciente.referidor_rel.nombre if paciente.referidor_rel else None,
+        ))
+        if paciente.cliente_id:
+            cliente_ids_cubiertos.add(paciente.cliente_id)
+
+    clientes = (
+        session.query(Cliente)
+        .filter(
+            Cliente.fecha_nacimiento.isnot(None),
+            func.extract("month", Cliente.fecha_nacimiento) == fecha_objetivo.month,
+            func.extract("day", Cliente.fecha_nacimiento) == fecha_objetivo.day,
+        )
+        .all()
+    )
+    for cliente in clientes:
+        if cliente.id in cliente_ids_cubiertos:
+            continue
+        # Se usa id negativo para evitar colision de keys con ids de pacientes en frontend.
+        resultados.append(ClienteCumpleanosOut(
+            id=-cliente.id,
+            nombre=cliente.nombre,
+            ci=cliente.ci,
+            telefono=cliente.telefono,
+            email=cliente.email,
+            fecha_nacimiento=cliente.fecha_nacimiento,
+            edad=_calcular_edad(cliente.fecha_nacimiento, fecha_objetivo),
+            referidor_nombre=cliente.referidor_rel.nombre if cliente.referidor_rel else None,
+        ))
+
+    resultados.sort(key=lambda item: (item.nombre or "").lower())
+    return resultados
+
+
 def _construir_query_proveedores(session, buscar: Optional[str]):
     query = session.query(Proveedor)
     if buscar and buscar.strip():
@@ -212,6 +355,7 @@ def _serializar_configuracion_general(session, config: ConfiguracionEmpresa) -> 
         telefono=config.telefono,
         email=config.email,
         logo_path=config.logo_path,
+        business_timezone=(config.business_timezone or settings.BUSINESS_TIMEZONE or "America/Asuncion"),
         canal_principal_nombre=canal_principal.nombre if canal_principal else None,
         configuracion_completa=configuracion_general_completa(config),
     )
@@ -276,6 +420,79 @@ def obtener_estado_configuracion_general(
         session.close()
 
 
+@config_router.get("/timezones", response_model=List[dict])
+def listar_zonas_horarias_configuracion_general(
+    current_user=Depends(get_current_user),
+):
+    ahora_utc = datetime.now(ZoneInfo("UTC"))
+    items = []
+    for tz_name in sorted(available_timezones()):
+        tz = ZoneInfo(tz_name)
+        offset = ahora_utc.astimezone(tz).utcoffset()
+        total_min = int((offset.total_seconds() if offset else 0) // 60)
+        sign = "+" if total_min >= 0 else "-"
+        abs_min = abs(total_min)
+        hh = abs_min // 60
+        mm = abs_min % 60
+        offset_label = f"UTC{sign}{hh:02d}:{mm:02d}"
+        items.append(
+            {
+                "id": tz_name,
+                "label": f"{tz_name} ({offset_label})",
+                "offset_minutes": total_min,
+                "offset_label": offset_label,
+            }
+        )
+    items.sort(key=lambda item: (item["offset_minutes"], item["id"]))
+    return items
+
+
+@config_router.get("/whatsapp-templates", response_model=List[PlantillaWhatsappOut])
+def listar_plantillas_whatsapp_configuracion_general(
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        _asegurar_catalogo_plantillas_whatsapp(session)
+        return (
+            session.query(PlantillaWhatsapp)
+            .order_by(PlantillaWhatsapp.nombre.asc())
+            .all()
+        )
+    finally:
+        session.close()
+
+
+@config_router.put("/whatsapp-templates/{codigo}", response_model=PlantillaWhatsappOut)
+def actualizar_plantilla_whatsapp_configuracion_general(
+    codigo: str,
+    data: PlantillaWhatsappUpdate,
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(require_admin),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        _asegurar_catalogo_plantillas_whatsapp(session)
+        plantilla = (
+            session.query(PlantillaWhatsapp)
+            .filter(PlantillaWhatsapp.codigo == codigo)
+            .first()
+        )
+        if not plantilla:
+            raise HTTPException(status_code=404, detail="Plantilla de WhatsApp no encontrada.")
+        if not plantilla.editable:
+            raise HTTPException(status_code=403, detail="Esta plantilla no se puede editar.")
+        plantilla.plantilla = data.plantilla
+        if data.activo is not None:
+            plantilla.activo = bool(data.activo)
+        session.commit()
+        session.refresh(plantilla)
+        return plantilla
+    finally:
+        session.close()
+
+
 @config_router.put("/", response_model=ConfiguracionGeneralOut)
 def actualizar_configuracion_general(
     data: ConfiguracionGeneralUpdate,
@@ -293,6 +510,7 @@ def actualizar_configuracion_general(
         config.telefono = data.telefono
         config.email = data.email
         config.logo_path = data.logo_path
+        config.business_timezone = data.business_timezone or (settings.BUSINESS_TIMEZONE or "America/Asuncion")
 
         sincronizar_canal_principal(session, config, nombre_anterior)
         session.commit()
@@ -640,7 +858,7 @@ def _build_cliente_ficha(session, cliente: Cliente):
 
         historial_armazones.append(
             ArmazonHistorialItemOut(
-                fecha=presupuesto.fecha if presupuesto else cliente.fecha_registro or datetime.now(),
+                fecha=presupuesto.fecha if presupuesto else cliente.fecha_registro or ahora_negocio(session),
                 producto=item.producto_rel.nombre if item.producto_rel else (item.descripcion or "-"),
                 codigo_producto=item.producto_rel.codigo if item.producto_rel else None,
                 codigo_armazon=item.codigo_armazon or "-",
@@ -800,6 +1018,7 @@ def listar_clientes_optimizado(
                 telefono=cliente.telefono,
                 email=cliente.email,
                 direccion=cliente.direccion,
+                fecha_nacimiento=cliente.fecha_nacimiento,
                 fecha_registro=cliente.fecha_registro,
                 notas=cliente.notas,
                 referidor_id=cliente.referidor_id,
@@ -840,7 +1059,7 @@ def exportar_clientes_pdf(
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": 'inline; filename="reporte_clientes.pdf"'},
+            headers={"Content-Disposition": f'inline; filename="reporte_clientes_{sanitize_filename_component(referidor.nombre if referidor else buscar, "general")}.pdf"'},
         )
     finally:
         session.close()
@@ -869,6 +1088,83 @@ def exportar_clientes_excel(
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": 'inline; filename="reporte_clientes.xlsx"'},
         )
+    finally:
+        session.close()
+
+
+@router.get("/cumpleanos", response_model=List[ClienteCumpleanosOut])
+def listar_cumpleanos_clientes(
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+    fecha: date | None = Query(default=None),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        fecha_objetivo = fecha or fecha_actual_negocio(session)
+        return _listar_cumpleanos_en_fecha(session, fecha_objetivo)
+    finally:
+        session.close()
+
+
+@router.get("/cumpleanos/resumen", response_model=ClienteCumpleanosResumenOut)
+def resumen_cumpleanos_clientes(
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+    fecha: date | None = Query(default=None),
+    limit: int = Query(default=3, ge=1, le=10),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        fecha_objetivo = fecha or fecha_actual_negocio(session)
+        resultados = _listar_cumpleanos_en_fecha(session, fecha_objetivo)
+        return ClienteCumpleanosResumenOut(
+            total=len(resultados),
+            preview=resultados[:limit],
+        )
+    finally:
+        session.close()
+
+
+@router.post("/cumpleanos/sincronizar-desde-pacientes")
+def sincronizar_cumpleanos_clientes_desde_pacientes(
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(require_admin),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        pacientes = (
+            session.query(ClinicaPaciente)
+            .filter(
+                ClinicaPaciente.cliente_id.isnot(None),
+                ClinicaPaciente.fecha_nacimiento.isnot(None),
+            )
+            .all()
+        )
+
+        actualizados = 0
+        sin_cambios = 0
+        cliente_no_encontrado = 0
+
+        for paciente in pacientes:
+            cliente = session.query(Cliente).filter(Cliente.id == paciente.cliente_id).first()
+            if not cliente:
+                cliente_no_encontrado += 1
+                continue
+            if cliente.fecha_nacimiento:
+                sin_cambios += 1
+                continue
+            cliente.fecha_nacimiento = paciente.fecha_nacimiento
+            actualizados += 1
+
+        session.commit()
+        return {
+            "ok": True,
+            "mensaje": "Sincronizacion de cumpleanos completada.",
+            "pacientes_revisados": len(pacientes),
+            "clientes_actualizados": actualizados,
+            "clientes_sin_cambios": sin_cambios,
+            "cliente_no_encontrado": cliente_no_encontrado,
+        }
     finally:
         session.close()
 
@@ -924,7 +1220,7 @@ def exportar_ficha_cliente_pdf(
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'inline; filename="ficha_cliente_{cliente_id}.pdf"'},
+            headers={"Content-Disposition": f'inline; filename="ficha_cliente_{sanitize_filename_component(cliente.nombre, "cliente")}.pdf"'},
         )
     finally:
         session.close()
@@ -1068,7 +1364,7 @@ def exportar_ficha_proveedor_pdf(
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'inline; filename="ficha_proveedor_{prov_id}.pdf"'},
+            headers={"Content-Disposition": f'inline; filename="ficha_proveedor_{sanitize_filename_component(proveedor.nombre, "proveedor")}.pdf"'},
         )
     finally:
         session.close()

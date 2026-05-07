@@ -1,11 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../context/AuthContext'
+import { parseBackendDateTime } from '../utils/formatters'
+import LoadingButton from '../components/LoadingButton'
 import Modal from '../components/Modal'
 import RemoteSearchSelect from '../components/RemoteSearchSelect'
 import { Landmark, ReceiptText, Trash2, Wallet } from 'lucide-react'
 
 const fmt = value => new Intl.NumberFormat('es-PY').format(value ?? 0)
-const fmtDate = value => value ? new Date(value).toLocaleDateString('es-PY') : '—'
+const fmtDate = value => {
+    const date = parseBackendDateTime(value)
+    return date ? date.toLocaleDateString('es-PY') : '?'
+}
+
+const getDisplayDate = item => (item.estado === 'PAGADO' ? (item.fecha_pago || item.fecha) : item.fecha)
 
 function estadoBadge(estado) {
     const map = {
@@ -16,11 +23,27 @@ function estadoBadge(estado) {
 }
 
 function PagoComisionModal({ comision, onClose, onSaved }) {
+    const fechaLocal = useMemo(() => {
+        const d = new Date()
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+    }, [])
+
     const [form, setForm] = useState({
         metodo_pago: 'EFECTIVO',
         banco_id: '',
         numero_referencia: '',
+        fecha_pago: fechaLocal,
     })
+
+    useEffect(() => {
+        api.get('/configuracion-general/estado').then(res => {
+            const tz = res.data?.business_timezone
+            if (tz) {
+                const fechaNegocio = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
+                setForm(prev => ({ ...prev, fecha_pago: fechaNegocio }))
+            }
+        }).catch(() => {})
+    }, [])
     const [error, setError] = useState('')
     const [saving, setSaving] = useState(false)
 
@@ -48,6 +71,7 @@ function PagoComisionModal({ comision, onClose, onSaved }) {
                 metodo_pago: form.metodo_pago,
                 banco_id: requiereBanco ? parseInt(form.banco_id, 10) : null,
                 numero_referencia: requiereBanco ? form.numero_referencia : null,
+                fecha_pago: form.fecha_pago || null,
             })
             onSaved()
         } catch (err) {
@@ -62,13 +86,24 @@ function PagoComisionModal({ comision, onClose, onSaved }) {
             <div className="card" style={{ marginBottom: 16, padding: '14px 16px' }}>
                 <div style={{ fontWeight: 700, marginBottom: 6 }}>{comision.referidor_nombre || 'Referidor'}</div>
                 <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem', lineHeight: 1.45 }}>
-                    Fecha: {fmtDate(comision.fecha)}<br />
+                    Fecha: {fmtDate(getDisplayDate(comision))}<br />
                     Cliente: {comision.cliente_nombre || '—'}<br />
                     Venta: {comision.venta_codigo || '—'}
                 </div>
                 <div style={{ marginTop: 10, fontSize: '1.2rem', fontWeight: 800, color: 'var(--primary-light)' }}>
                     Gs. {fmt(comision.monto)}
                 </div>
+            </div>
+
+            <div className="form-group">
+                <label className="form-label">Fecha de pago</label>
+                <input
+                    className="form-input"
+                    type="date"
+                    value={form.fecha_pago}
+                    onChange={event => setForm(prev => ({ ...prev, fecha_pago: event.target.value }))}
+                    required
+                />
             </div>
 
             <div className="grid-2">
@@ -136,7 +171,9 @@ function ComisionRowActions({ item, onPagar, onPendiente }) {
 
     const handleAction = callback => {
         setOpen(false)
-        callback()
+        window.setTimeout(() => {
+            callback()
+        }, 0)
     }
 
     const toggleMenu = () => {
@@ -354,9 +391,9 @@ export default function ReporteComisionesPage() {
                     </div>
                 </div>
                 <div className="filters-actions" style={{ display: 'flex', gap: 10, marginTop: 15, flexWrap: 'wrap' }}>
-                    <button className="btn btn-primary" onClick={aplicarFiltros}>
+                    <LoadingButton className="btn btn-primary" onClick={aplicarFiltros} loading={loading} loadingText="Aplicando filtros...">
                         Aplicar filtros
-                    </button>
+                    </LoadingButton>
                     <button className="btn btn-secondary" onClick={limpiarFiltros}>
                         Limpiar
                     </button>
@@ -396,7 +433,7 @@ export default function ReporteComisionesPage() {
                                 {data.map(item => (
                                     <tr key={item.id}>
                                         <td style={{ color: 'var(--text-muted)', fontFamily: 'monospace' }}>{item.id}</td>
-                                        <td style={{ whiteSpace: 'nowrap', color: 'var(--text-secondary)' }}>{fmtDate(item.fecha)}</td>
+                                        <td style={{ whiteSpace: 'nowrap', color: 'var(--text-secondary)' }}>{fmtDate(getDisplayDate(item))}</td>
                                         <td style={{ fontWeight: 700, lineHeight: 1.35 }}>{item.referidor_nombre || '—'}</td>
                                         <td style={{ lineHeight: 1.35 }}>{item.cliente_nombre || '—'}</td>
                                         <td style={{ fontFamily: 'monospace', color: 'var(--text-secondary)' }}>{item.venta_codigo || '—'}</td>

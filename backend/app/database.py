@@ -17,6 +17,7 @@ Base = declarative_base()
 
 # Cache de engines por tenant (evita crear uno nuevo en cada request)
 _engines: dict = {}
+_session_factories: dict = {}
 _tenant_schema_checked: set[str] = set()
 _tenant_init_lock = Lock()
 
@@ -47,6 +48,11 @@ TIMESTAMP_FALLBACKS = {
     "categorias_gasto": None,
     "gastos_operativos": "fecha",
     "movimientos_caja": "fecha",
+    "jornadas_financieras": "fecha_hora_apertura",
+    "cortes_jornada_financiera": "fecha_hora_corte",
+    "rendiciones_jornada_financiera": "fecha_hora_rendicion",
+    "destinatarios_rendicion": None,
+    "plantillas_whatsapp": None,
     "configuracion_caja": None,
     "configuracion_empresa": None,
     "usuarios": "creado_en",
@@ -97,6 +103,17 @@ def ensure_tenant_schema(engine, tenant_slug: str):
         with engine.begin() as connection:
             if "permisos_json" not in usuario_columns:
                 connection.execute(text("ALTER TABLE usuarios ADD COLUMN permisos_json TEXT"))
+    if "configuracion_empresa" in table_names:
+        config_columns = {column["name"] for column in inspector.get_columns("configuracion_empresa")}
+        with engine.begin() as connection:
+            if "business_timezone" not in config_columns:
+                connection.execute(text("ALTER TABLE configuracion_empresa ADD COLUMN business_timezone VARCHAR(64)"))
+            connection.execute(text(
+                """
+                UPDATE configuracion_empresa
+                SET business_timezone = COALESCE(NULLIF(TRIM(business_timezone), ''), 'America/Asuncion')
+                """
+            ))
     if "productos" not in table_names:
         _tenant_schema_checked.add(tenant_slug)
         return
@@ -106,10 +123,26 @@ def ensure_tenant_schema(engine, tenant_slug: str):
         tablas_catalogo_comercial.append(models.Vendedor.__table__)
     if "canales_venta" not in table_names:
         tablas_catalogo_comercial.append(models.CanalVenta.__table__)
+    if "jornadas_financieras" not in table_names:
+        tablas_catalogo_comercial.append(models.JornadaFinanciera.__table__)
+    if "cortes_jornada_financiera" not in table_names:
+        tablas_catalogo_comercial.append(models.CorteJornadaFinanciera.__table__)
+    if "destinatarios_rendicion" not in table_names:
+        tablas_catalogo_comercial.append(models.DestinatarioRendicion.__table__)
+    if "plantillas_whatsapp" not in table_names:
+        tablas_catalogo_comercial.append(models.PlantillaWhatsapp.__table__)
+    if "rendiciones_jornada_financiera" not in table_names:
+        tablas_catalogo_comercial.append(models.RendicionJornadaFinanciera.__table__)
     if tablas_catalogo_comercial:
         Base.metadata.create_all(bind=engine, tables=tablas_catalogo_comercial)
         inspector = inspect(engine)
         table_names = inspector.get_table_names()
+
+    if "clientes" in table_names:
+        cliente_columns = {column["name"] for column in inspector.get_columns("clientes")}
+        with engine.begin() as connection:
+            if "fecha_nacimiento" not in cliente_columns:
+                connection.execute(text("ALTER TABLE clientes ADD COLUMN fecha_nacimiento DATE"))
 
     if "presupuestos" in table_names:
         presupuesto_columns = {column["name"] for column in inspector.get_columns("presupuestos")}
@@ -126,6 +159,49 @@ def ensure_tenant_schema(engine, tenant_slug: str):
                 connection.execute(text("ALTER TABLE ventas ADD COLUMN vendedor_id INTEGER REFERENCES vendedores(id)"))
             if "canal_venta_id" not in venta_columns and "canales_venta" in table_names:
                 connection.execute(text("ALTER TABLE ventas ADD COLUMN canal_venta_id INTEGER REFERENCES canales_venta(id)"))
+
+    if "movimientos_caja" in table_names:
+        movimientos_caja_columns = {column["name"] for column in inspector.get_columns("movimientos_caja")}
+        with engine.begin() as connection:
+            if "jornada_id" not in movimientos_caja_columns and "jornadas_financieras" in table_names:
+                connection.execute(text("ALTER TABLE movimientos_caja ADD COLUMN jornada_id INTEGER REFERENCES jornadas_financieras(id)"))
+
+    if "movimientos_banco" in table_names:
+        movimientos_banco_columns = {column["name"] for column in inspector.get_columns("movimientos_banco")}
+        with engine.begin() as connection:
+            if "jornada_id" not in movimientos_banco_columns and "jornadas_financieras" in table_names:
+                connection.execute(text("ALTER TABLE movimientos_banco ADD COLUMN jornada_id INTEGER REFERENCES jornadas_financieras(id)"))
+
+    if "rendiciones_jornada_financiera" in table_names:
+        rendicion_columns = {column["name"] for column in inspector.get_columns("rendiciones_jornada_financiera")}
+        with engine.begin() as connection:
+            if "destinatario_rendicion_id" not in rendicion_columns and "destinatarios_rendicion" in table_names:
+                connection.execute(text(
+                    "ALTER TABLE rendiciones_jornada_financiera "
+                    "ADD COLUMN destinatario_rendicion_id INTEGER REFERENCES destinatarios_rendicion(id)"
+                ))
+                connection.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_rendicion_destinatario ON rendiciones_jornada_financiera (destinatario_rendicion_id)"
+                ))
+        inspector = inspect(engine)
+        rendicion_columns = {column["name"] for column in inspector.get_columns("rendiciones_jornada_financiera")}
+        with engine.begin() as connection:
+            if "fecha_hora_original" not in rendicion_columns:
+                connection.execute(text("ALTER TABLE rendiciones_jornada_financiera ADD COLUMN fecha_hora_original TIMESTAMP"))
+            if "rendido_a_original" not in rendicion_columns:
+                connection.execute(text("ALTER TABLE rendiciones_jornada_financiera ADD COLUMN rendido_a_original VARCHAR(150)"))
+            if "monto_rendido_original" not in rendicion_columns:
+                connection.execute(text("ALTER TABLE rendiciones_jornada_financiera ADD COLUMN monto_rendido_original DOUBLE PRECISION"))
+            if "observacion_original" not in rendicion_columns:
+                connection.execute(text("ALTER TABLE rendiciones_jornada_financiera ADD COLUMN observacion_original TEXT"))
+            if "fecha_hora_ultima_edicion" not in rendicion_columns:
+                connection.execute(text("ALTER TABLE rendiciones_jornada_financiera ADD COLUMN fecha_hora_ultima_edicion TIMESTAMP"))
+            if "usuario_ultima_edicion_id" not in rendicion_columns and "usuarios" in table_names:
+                connection.execute(text("ALTER TABLE rendiciones_jornada_financiera ADD COLUMN usuario_ultima_edicion_id INTEGER REFERENCES usuarios(id)"))
+            if "usuario_ultima_edicion_nombre" not in rendicion_columns:
+                connection.execute(text("ALTER TABLE rendiciones_jornada_financiera ADD COLUMN usuario_ultima_edicion_nombre VARCHAR(100)"))
+            if "motivo_ajuste" not in rendicion_columns:
+                connection.execute(text("ALTER TABLE rendiciones_jornada_financiera ADD COLUMN motivo_ajuste TEXT"))
 
     if "presupuestos" in table_names:
         presupuesto_columns = {column["name"] for column in inspector.get_columns("presupuestos")}
@@ -180,6 +256,14 @@ def ensure_tenant_schema(engine, tenant_slug: str):
             "trauma_ocular": "ALTER TABLE clinica_cuestionarios ADD COLUMN trauma_ocular BOOLEAN DEFAULT FALSE",
             "usa_anteojos": "ALTER TABLE clinica_cuestionarios ADD COLUMN usa_anteojos BOOLEAN DEFAULT FALSE",
             "proposito_anteojos": "ALTER TABLE clinica_cuestionarios ADD COLUMN proposito_anteojos VARCHAR(100)",
+            "graduacion_anterior_od_esfera": "ALTER TABLE clinica_cuestionarios ADD COLUMN graduacion_anterior_od_esfera VARCHAR(50)",
+            "graduacion_anterior_od_cilindro": "ALTER TABLE clinica_cuestionarios ADD COLUMN graduacion_anterior_od_cilindro VARCHAR(50)",
+            "graduacion_anterior_od_eje": "ALTER TABLE clinica_cuestionarios ADD COLUMN graduacion_anterior_od_eje VARCHAR(50)",
+            "graduacion_anterior_od_adicion": "ALTER TABLE clinica_cuestionarios ADD COLUMN graduacion_anterior_od_adicion VARCHAR(50)",
+            "graduacion_anterior_oi_esfera": "ALTER TABLE clinica_cuestionarios ADD COLUMN graduacion_anterior_oi_esfera VARCHAR(50)",
+            "graduacion_anterior_oi_cilindro": "ALTER TABLE clinica_cuestionarios ADD COLUMN graduacion_anterior_oi_cilindro VARCHAR(50)",
+            "graduacion_anterior_oi_eje": "ALTER TABLE clinica_cuestionarios ADD COLUMN graduacion_anterior_oi_eje VARCHAR(50)",
+            "graduacion_anterior_oi_adicion": "ALTER TABLE clinica_cuestionarios ADD COLUMN graduacion_anterior_oi_adicion VARCHAR(50)",
             "usa_lentes_contacto": "ALTER TABLE clinica_cuestionarios ADD COLUMN usa_lentes_contacto BOOLEAN DEFAULT FALSE",
             "tipo_lentes_contacto": "ALTER TABLE clinica_cuestionarios ADD COLUMN tipo_lentes_contacto VARCHAR(50)",
             "horas_uso_lc": "ALTER TABLE clinica_cuestionarios ADD COLUMN horas_uso_lc VARCHAR(50)",
@@ -292,12 +376,12 @@ def ensure_tenant_schema(engine, tenant_slug: str):
         with engine.begin() as connection:
             if "paciente_nombre_libre" not in turno_columns:
                 connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN paciente_nombre_libre VARCHAR(200)"))
+            if "paciente_telefono_libre" not in turno_columns:
+                connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN paciente_telefono_libre VARCHAR(50)"))
             if "es_control" not in turno_columns:
                 connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN es_control BOOLEAN DEFAULT FALSE"))
-            if "recordado_15" not in turno_columns:
-                connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN recordado_15 BOOLEAN DEFAULT FALSE"))
-            if "recordado_8" not in turno_columns:
-                connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN recordado_8 BOOLEAN DEFAULT FALSE"))
+            if "recordado_3" not in turno_columns:
+                connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN recordado_3 BOOLEAN DEFAULT FALSE"))
             if "recordado_hoy" not in turno_columns:
                 connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN recordado_hoy BOOLEAN DEFAULT FALSE"))
             if "consulta_id" not in turno_columns:
@@ -308,8 +392,7 @@ def ensure_tenant_schema(engine, tenant_slug: str):
             connection.execute(text(
                 """
                 UPDATE clinica_turnos
-                SET recordado_15 = COALESCE(recordado_15, FALSE),
-                    recordado_8 = COALESCE(recordado_8, FALSE),
+                SET recordado_3 = COALESCE(recordado_3, FALSE),
                     recordado_hoy = COALESCE(recordado_hoy, FALSE)
                 """
             ))
@@ -402,8 +485,14 @@ def ensure_tenant_schema(engine, tenant_slug: str):
             connection.execute(text("CREATE INDEX IF NOT EXISTS idx_pago_venta_fecha ON pagos (venta_id, fecha)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS idx_pago_grupo_fecha ON pagos (grupo_pago_id, fecha)"))
 
+        if "movimientos_caja" in table_names:
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_mov_caja_jornada_id ON movimientos_caja (jornada_id)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_mov_caja_jornada_fecha ON movimientos_caja (jornada_id, fecha)"))
+
         if "movimientos_banco" in table_names:
             connection.execute(text("CREATE INDEX IF NOT EXISTS idx_mov_banco_banco_fecha ON movimientos_banco (banco_id, fecha)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_mov_banco_jornada_id ON movimientos_banco (jornada_id)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS idx_mov_banco_jornada_fecha ON movimientos_banco (jornada_id, fecha)"))
 
     inspector = inspect(engine)
     table_names = inspector.get_table_names()
@@ -439,14 +528,22 @@ def get_engine_for_tenant(tenant_slug: str):
 def get_session_for_tenant(tenant_slug: str):
     """Crea y devuelve una sesión SQLAlchemy para el tenant dado."""
     engine = get_engine_for_tenant(tenant_slug)
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    return SessionLocal()
+    if tenant_slug not in _session_factories:
+        with _tenant_init_lock:
+            if tenant_slug not in _session_factories:
+                _session_factories[tenant_slug] = sessionmaker(
+                    autocommit=False,
+                    autoflush=False,
+                    bind=engine,
+                )
+    return _session_factories[tenant_slug]()
 
 
 def dispose_tenant_engine(tenant_slug: str):
     engine = _engines.get(tenant_slug)
     if engine is not None:
         engine.dispose()
+    _session_factories.pop(tenant_slug, None)
     _tenant_schema_checked.discard(tenant_slug)
 
 

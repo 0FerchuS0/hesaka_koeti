@@ -1,3 +1,4 @@
+import json
 from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -7,7 +8,7 @@ from typing import Optional, List
 from pydantic import BaseModel, Field
 
 from app.database import get_session_for_tenant
-from app.models.models import Banco, CanalVenta, Cliente, ConfiguracionCaja, ConfiguracionEmpresa, MovimientoBanco, MovimientoCaja, Pago, Vendedor, Venta, Compra, Presupuesto, PresupuestoItem, CompraDetalle
+from app.models.models import Banco, CanalVenta, Categoria, Cliente, ConfiguracionCaja, ConfiguracionEmpresa, DashboardCache, MovimientoBanco, MovimientoCaja, Pago, Vendedor, Venta, Compra, Presupuesto, PresupuestoItem, CompraDetalle, Producto
 from app.utils.auth import get_current_user
 from app.middleware.tenant import get_tenant_slug
 from app.utils.excel_reporte_finanzas import generar_excel_reporte_finanzas
@@ -16,11 +17,20 @@ from app.utils.excel_reporte_ventas import generar_excel_reporte_ventas
 from app.utils.pdf_reporte_finanzas import generar_pdf_reporte_finanzas
 from app.utils.pdf_reporte_compras import generar_pdf_reporte_compras
 from app.utils.excel_reporte_compras import generar_excel_reporte_compras
+from app.utils.excel_reporte_ventas_productos import generar_excel_reporte_ventas_productos
 from app.utils.pdf_estado_cuenta_cliente import generar_pdf_estado_cuenta_cliente
 from app.utils.pdf_reporte_trabajos_lab import generar_pdf_reporte_trabajos_lab
+from app.utils.pdf_reporte_ventas_productos import generar_pdf_reporte_ventas_productos
 from app.utils.configuracion_general import obtener_canal_principal
+from app.utils.filename_utils import build_period_suffix, sanitize_filename_component
+from app.utils.timezone import ahora_negocio, fecha_actual_negocio
 
 router = APIRouter(prefix="/api/reportes", tags=["Reportes"])
+
+
+def _build_report_filename(base: str, fecha_desde=None, fecha_hasta=None, extension: str = "pdf") -> str:
+    periodo = build_period_suffix(fecha_desde, fecha_hasta)
+    return f"{base}_{periodo}.{extension}"
 
 # --- Esquemas de Respuesta ---
 class ReporteVentaOut(BaseModel):
@@ -62,6 +72,32 @@ class ResumenGrupoVentasOut(BaseModel):
     total_costos: float
     utilidad_neta: float
     margen_promedio: float
+
+
+class ReporteVentaProductoOut(BaseModel):
+    producto_id: Optional[int] = None
+    producto_nombre: str
+    producto_codigo: Optional[str] = None
+    categoria_nombre: Optional[str] = None
+    cantidad_vendida: float
+    ingresos_totales: float
+    costos_totales: float
+    utilidad_bruta: float
+    margen_bruto: float
+    total_vendido: float
+    precio_promedio: float
+    ventas_count: int
+
+
+class ResumenReporteVentasPorProductoOut(BaseModel):
+    productos: List[ReporteVentaProductoOut]
+    total_productos: int
+    total_cantidad: float
+    total_ingresos: float
+    total_costos: float
+    utilidad_bruta_total: float
+    margen_bruto_promedio: float
+    total_vendido: float
 
 
 class ReporteCompraOut(BaseModel):
@@ -485,73 +521,32 @@ def _detalle_trabajo_laboratorio(venta: Venta) -> str:
     return " - ".join(detalles) if detalles else "Sin detalles"
 
 
-def _obtener_comparativa_dashboard(session: Session) -> ComparativaVentasDashboardOut:
-    ahora = datetime.now()
-
-    inicio_actual = ahora.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    fin_actual = ahora
-
-    primer_dia_actual = ahora.replace(day=1)
-    ultimo_dia_mes_anterior = primer_dia_actual - timedelta(days=1)
-    inicio_mes_anterior = ultimo_dia_mes_anterior.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-    try:
-        fin_mes_anterior = inicio_mes_anterior.replace(
-            day=ahora.day,
-            hour=23,
-            minute=59,
-            second=59,
-            microsecond=999999,
-        )
-    except ValueError:
-        fin_mes_anterior = ultimo_dia_mes_anterior.replace(
-            hour=23,
-            minute=59,
-            second=59,
-            microsecond=999999,
-        )
-
-    try:
-        inicio_ano_anterior = inicio_actual.replace(year=ahora.year - 1)
-    except ValueError:
-        inicio_ano_anterior = inicio_actual
-
-    try:
-        fin_ano_anterior = fin_actual.replace(
-            year=ahora.year - 1,
-            hour=23,
-            minute=59,
-            second=59,
-            microsecond=999999,
-        )
-    except ValueError:
-        fin_ano_anterior = fin_actual.replace(
-            year=ahora.year - 1,
-            day=28,
-            hour=23,
-            minute=59,
-            second=59,
-            microsecond=999999,
-        )
-
+def _obtener_comparativa_dashboard(session: Session, historical_cache: dict | None = None) -> ComparativaVentasDashboardOut:
+    ahora = ahora_negocio(session)
+    periodos = _calcular_periodos_comparativa(ahora)
+    cache_comp = (historical_cache or {}).get("comparativa", {})
+    cache_mes_anterior = cache_comp.get("mes_anterior", {})
+    cache_ano_anterior = cache_comp.get("ano_anterior", {})
+    total_mes_anterior = cache_mes_anterior.get("total_ventas")
+    total_ano_anterior = cache_ano_anterior.get("total_ventas")
     return ComparativaVentasDashboardOut(
         actual=PeriodoComparativoVentasOut(
             etiqueta="Ventas Este Periodo",
-            fecha_desde=inicio_actual,
-            fecha_hasta=fin_actual,
-            total_ventas=_sumar_ventas_periodo(session, inicio_actual, fin_actual),
+            fecha_desde=periodos["actual"][0],
+            fecha_hasta=periodos["actual"][1],
+            total_ventas=_sumar_ventas_periodo(session, *periodos["actual"]),
         ),
         mes_anterior=PeriodoComparativoVentasOut(
             etiqueta="Vs Mes Anterior (Mismo Periodo)",
-            fecha_desde=inicio_mes_anterior,
-            fecha_hasta=fin_mes_anterior,
-            total_ventas=_sumar_ventas_periodo(session, inicio_mes_anterior, fin_mes_anterior),
+            fecha_desde=_deserializar_datetime_cache(cache_mes_anterior.get("fecha_desde")) or periodos["mes_anterior"][0],
+            fecha_hasta=_deserializar_datetime_cache(cache_mes_anterior.get("fecha_hasta")) or periodos["mes_anterior"][1],
+            total_ventas=float(total_mes_anterior if total_mes_anterior is not None else _sumar_ventas_periodo(session, *periodos["mes_anterior"])),
         ),
         ano_anterior=PeriodoComparativoVentasOut(
             etiqueta="Vs Ano Anterior (Mismo Periodo)",
-            fecha_desde=inicio_ano_anterior,
-            fecha_hasta=fin_ano_anterior,
-            total_ventas=_sumar_ventas_periodo(session, inicio_ano_anterior, fin_ano_anterior),
+            fecha_desde=_deserializar_datetime_cache(cache_ano_anterior.get("fecha_desde")) or periodos["ano_anterior"][0],
+            fecha_hasta=_deserializar_datetime_cache(cache_ano_anterior.get("fecha_hasta")) or periodos["ano_anterior"][1],
+            total_ventas=float(total_ano_anterior if total_ano_anterior is not None else _sumar_ventas_periodo(session, *periodos["ano_anterior"])),
         ),
     )
 
@@ -725,6 +720,197 @@ def _iterar_ultimos_meses(fecha_referencia: datetime, cantidad: int = 7):
     return list(reversed(meses))
 
 
+_DASHBOARD_HISTORICAL_CACHE_KEY = "dashboard_historical_metrics"
+
+
+def _dashboard_cache_reference_datetime(session: Session, business_date: date | None = None) -> datetime:
+    base_date = business_date or fecha_actual_negocio(session)
+    return datetime.combine(base_date, datetime.max.time())
+
+
+def _serializar_datetime_cache(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _deserializar_datetime_cache(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _calcular_periodos_comparativa(fecha_referencia: datetime) -> dict[str, tuple[datetime, datetime]]:
+    inicio_actual = fecha_referencia.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    fin_actual = fecha_referencia.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    primer_dia_actual = fecha_referencia.replace(day=1)
+    ultimo_dia_mes_anterior = primer_dia_actual - timedelta(days=1)
+    inicio_mes_anterior = ultimo_dia_mes_anterior.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    try:
+        fin_mes_anterior = inicio_mes_anterior.replace(
+            day=fecha_referencia.day,
+            hour=23,
+            minute=59,
+            second=59,
+            microsecond=999999,
+        )
+    except ValueError:
+        fin_mes_anterior = ultimo_dia_mes_anterior.replace(
+            hour=23,
+            minute=59,
+            second=59,
+            microsecond=999999,
+        )
+
+    try:
+        inicio_ano_anterior = inicio_actual.replace(year=fecha_referencia.year - 1)
+    except ValueError:
+        inicio_ano_anterior = inicio_actual
+
+    try:
+        fin_ano_anterior = fin_actual.replace(
+            year=fecha_referencia.year - 1,
+            hour=23,
+            minute=59,
+            second=59,
+            microsecond=999999,
+        )
+    except ValueError:
+        fin_ano_anterior = fin_actual.replace(
+            year=fecha_referencia.year - 1,
+            day=28,
+            hour=23,
+            minute=59,
+            second=59,
+            microsecond=999999,
+        )
+
+    return {
+        "actual": (inicio_actual, fin_actual),
+        "mes_anterior": (inicio_mes_anterior, fin_mes_anterior),
+        "ano_anterior": (inicio_ano_anterior, fin_ano_anterior),
+    }
+
+
+def _build_dashboard_historical_cache_payload(session: Session, business_date: date | None = None) -> dict:
+    fecha_referencia = _dashboard_cache_reference_datetime(session, business_date)
+    periodos = _calcular_periodos_comparativa(fecha_referencia)
+    meses_historicos = []
+    nombres_meses = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+
+    for year, month in _iterar_ultimos_meses(fecha_referencia, 7):
+        if year == fecha_referencia.year and month == fecha_referencia.month:
+            continue
+        inicio = datetime(year, month, 1, 0, 0, 0)
+        if month == 12:
+            fin = datetime(year + 1, 1, 1, 0, 0, 0) - timedelta(microseconds=1)
+        else:
+            fin = datetime(year, month + 1, 1, 0, 0, 0) - timedelta(microseconds=1)
+        meses_historicos.append({
+            "year": year,
+            "month": month,
+            "mes": nombres_meses[month - 1],
+            "ventas": float(_sumar_ventas_periodo(session, inicio, fin)),
+        })
+
+    return {
+        "business_date": fecha_referencia.date().isoformat(),
+        "comparativa": {
+            "mes_anterior": {
+                "fecha_desde": _serializar_datetime_cache(periodos["mes_anterior"][0]),
+                "fecha_hasta": _serializar_datetime_cache(periodos["mes_anterior"][1]),
+                "total_ventas": float(_sumar_ventas_periodo(session, *periodos["mes_anterior"])),
+            },
+            "ano_anterior": {
+                "fecha_desde": _serializar_datetime_cache(periodos["ano_anterior"][0]),
+                "fecha_hasta": _serializar_datetime_cache(periodos["ano_anterior"][1]),
+                "total_ventas": float(_sumar_ventas_periodo(session, *periodos["ano_anterior"])),
+            },
+        },
+        "serie_historica": meses_historicos,
+    }
+
+
+def refresh_dashboard_historical_cache(session: Session, business_date: date | None = None) -> dict:
+    target_date = business_date or fecha_actual_negocio(session)
+    payload = _build_dashboard_historical_cache_payload(session, target_date)
+    row = session.query(DashboardCache).filter(DashboardCache.cache_key == _DASHBOARD_HISTORICAL_CACHE_KEY).first()
+    payload_json = json.dumps(payload, ensure_ascii=True)
+    if not row:
+        row = DashboardCache(
+            cache_key=_DASHBOARD_HISTORICAL_CACHE_KEY,
+            business_date=target_date,
+            payload_json=payload_json,
+        )
+        session.add(row)
+    else:
+        row.business_date = target_date
+        row.payload_json = payload_json
+    session.commit()
+    return payload
+
+
+def get_dashboard_historical_cache(session: Session, business_date: date | None = None) -> dict:
+    target_date = business_date or fecha_actual_negocio(session)
+    row = session.query(DashboardCache).filter(DashboardCache.cache_key == _DASHBOARD_HISTORICAL_CACHE_KEY).first()
+    if row and row.business_date == target_date and row.payload_json:
+        try:
+            return json.loads(row.payload_json)
+        except Exception:
+            pass
+    return refresh_dashboard_historical_cache(session, target_date)
+
+
+def ensure_dashboard_historical_cache_for_tenant(tenant_slug: str) -> None:
+    tenant_session = get_session_for_tenant(tenant_slug)
+    try:
+        get_dashboard_historical_cache(tenant_session)
+    finally:
+        tenant_session.close()
+
+
+def refresh_dashboard_historical_cache_for_tenant(tenant_slug: str) -> None:
+    tenant_session = get_session_for_tenant(tenant_slug)
+    try:
+        refresh_dashboard_historical_cache(tenant_session)
+    finally:
+        tenant_session.close()
+
+
+def _build_serie_ventas_dashboard(session: Session, fecha_referencia: datetime, historical_cache: dict | None) -> list[DashboardSerieVentasOut]:
+    nombres_meses = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+    historical_map = {
+        (int(item.get("year")), int(item.get("month"))): float(item.get("ventas") or 0.0)
+        for item in (historical_cache or {}).get("serie_historica", [])
+        if item.get("year") and item.get("month")
+    }
+    serie_ventas: list[DashboardSerieVentasOut] = []
+    for year, month in _iterar_ultimos_meses(fecha_referencia, 7):
+        if year == fecha_referencia.year and month == fecha_referencia.month:
+            inicio = datetime(year, month, 1, 0, 0, 0)
+            fin = fecha_referencia.replace(hour=23, minute=59, second=59, microsecond=999999)
+            total_mes = _sumar_ventas_periodo(session, inicio, fin)
+        else:
+            total_mes = historical_map.get((year, month))
+            if total_mes is None:
+                inicio = datetime(year, month, 1, 0, 0, 0)
+                if month == 12:
+                    fin = datetime(year + 1, 1, 1, 0, 0, 0) - timedelta(microseconds=1)
+                else:
+                    fin = datetime(year, month + 1, 1, 0, 0, 0) - timedelta(microseconds=1)
+                total_mes = _sumar_ventas_periodo(session, inicio, fin)
+        serie_ventas.append(
+            DashboardSerieVentasOut(
+                mes=nombres_meses[month - 1],
+                ventas=float(total_mes or 0.0),
+            )
+        )
+    return serie_ventas
+
+
 def _obtener_resumen_dashboard(session: Session) -> DashboardResumenOut:
     caja = session.query(ConfiguracionCaja).first()
     saldo_caja = caja.saldo_actual if caja else 0.0
@@ -766,32 +952,9 @@ def _obtener_resumen_dashboard(session: Session) -> DashboardResumenOut:
         .all()
     )
 
-    ahora = datetime.now()
-    serie_ventas = []
-    nombres_meses = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
-    for year, month in _iterar_ultimos_meses(ahora, 7):
-        inicio = datetime(year, month, 1, 0, 0, 0)
-        if month == 12:
-            fin = datetime(year + 1, 1, 1, 0, 0, 0) - timedelta(microseconds=1)
-        else:
-            fin = datetime(year, month + 1, 1, 0, 0, 0) - timedelta(microseconds=1)
-
-        total_mes = (
-            session.query(func.sum(Venta.total))
-            .filter(
-                Venta.fecha >= inicio,
-                Venta.fecha <= fin,
-                Venta.estado.notin_(['ANULADO', 'ANULADA'])
-            )
-            .scalar()
-            or 0.0
-        )
-        serie_ventas.append(
-            DashboardSerieVentasOut(
-                mes=nombres_meses[month - 1],
-                ventas=float(total_mes),
-            )
-        )
+    ahora = ahora_negocio(session)
+    historical_cache = get_dashboard_historical_cache(session, ahora.date())
+    serie_ventas = _build_serie_ventas_dashboard(session, ahora, historical_cache)
 
     return DashboardResumenOut(
         saldo_caja=float(saldo_caja or 0.0),
@@ -820,7 +983,7 @@ def _obtener_resumen_dashboard(session: Session) -> DashboardResumenOut:
             for compra in compras_pendientes_db
         ],
         serie_ventas=serie_ventas,
-        comparativa_ventas=_obtener_comparativa_dashboard(session),
+        comparativa_ventas=_obtener_comparativa_dashboard(session, historical_cache=historical_cache),
     )
 
 def _obtener_datos_reporte_ventas(
@@ -1031,6 +1194,132 @@ def _obtener_datos_reporte_ventas(
         ]
 
     return resumen_json, ventas_data, suma_comisiones_referidor, suma_comisiones_bancarias
+
+
+def _obtener_datos_reporte_ventas_por_producto(
+    session: Session,
+    fecha_desde: Optional[date],
+    fecha_hasta: Optional[date],
+    cliente_id: Optional[int] = None,
+    categoria_id: Optional[int] = None,
+    producto_id: Optional[int] = None,
+    producto_ids: Optional[List[int]] = None,
+    vendedor_id: Optional[int] = None,
+    canal_venta_id: Optional[int] = None,
+):
+    fecha_desde_dt = datetime.combine(fecha_desde, datetime.min.time()) if fecha_desde else None
+    fecha_hasta_dt = datetime.combine(fecha_hasta, datetime.max.time()) if fecha_hasta else None
+
+    base_sq = _construir_query_base_ventas(
+        session,
+        fecha_desde=fecha_desde_dt,
+        fecha_hasta=fecha_hasta_dt,
+        cliente_id=cliente_id,
+        vendedor_id=vendedor_id,
+        canal_venta_id=canal_venta_id,
+    ).subquery()
+
+    compra_costos_sq = _build_compra_costos_por_item_sq(session)
+
+    query = (
+        session.query(
+            PresupuestoItem.producto_id.label("producto_id"),
+            func.coalesce(Producto.nombre, PresupuestoItem.descripcion_personalizada, "Producto sin nombre").label("producto_nombre"),
+            Producto.codigo.label("producto_codigo"),
+            Categoria.nombre.label("categoria_nombre"),
+            func.coalesce(func.sum(func.coalesce(PresupuestoItem.cantidad, 0.0)), 0.0).label("cantidad_vendida"),
+            func.coalesce(func.sum(func.coalesce(PresupuestoItem.subtotal, func.coalesce(PresupuestoItem.precio_unitario, 0.0) * func.coalesce(PresupuestoItem.cantidad, 0.0))), 0.0).label("ingresos_totales"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            compra_costos_sq.c.presupuesto_item_id.isnot(None),
+                            compra_costos_sq.c.costo_real_total,
+                        ),
+                        else_=func.coalesce(PresupuestoItem.costo_unitario, 0.0) * func.coalesce(PresupuestoItem.cantidad, 0),
+                    )
+                ),
+                0.0,
+            ).label("costos_totales"),
+            func.count(func.distinct(base_sq.c.venta_id)).label("ventas_count"),
+        )
+        .select_from(base_sq)
+        .join(Presupuesto, Presupuesto.id == base_sq.c.presupuesto_id)
+        .join(PresupuestoItem, PresupuestoItem.presupuesto_id == Presupuesto.id)
+        .outerjoin(Producto, Producto.id == PresupuestoItem.producto_id)
+        .outerjoin(Categoria, Categoria.id == Producto.categoria_id)
+        .outerjoin(compra_costos_sq, compra_costos_sq.c.presupuesto_item_id == PresupuestoItem.id)
+    )
+
+    if categoria_id:
+        query = query.filter(Producto.categoria_id == categoria_id)
+    if producto_ids:
+        query = query.filter(PresupuestoItem.producto_id.in_(producto_ids))
+    elif producto_id:
+        query = query.filter(PresupuestoItem.producto_id == producto_id)
+
+    rows = (
+        query
+        .group_by(
+            PresupuestoItem.producto_id,
+            Producto.nombre,
+            PresupuestoItem.descripcion_personalizada,
+            Producto.codigo,
+            Categoria.nombre,
+        )
+        .order_by(
+            func.coalesce(
+                func.sum(
+                    func.coalesce(
+                        PresupuestoItem.subtotal,
+                        func.coalesce(PresupuestoItem.precio_unitario, 0.0) * func.coalesce(PresupuestoItem.cantidad, 0.0),
+                    )
+                ),
+                0.0,
+            ).desc()
+        )
+        .all()
+    )
+
+    productos = []
+    total_cantidad = 0.0
+    total_ingresos = 0.0
+    total_costos = 0.0
+    for row in rows:
+        cantidad = float(row.cantidad_vendida or 0.0)
+        ingresos = float(row.ingresos_totales or 0.0)
+        costos = float(row.costos_totales or 0.0)
+        utilidad = ingresos - costos
+        margen = (utilidad / ingresos * 100.0) if ingresos > 0 else 0.0
+        total_cantidad += cantidad
+        total_ingresos += ingresos
+        total_costos += costos
+        productos.append(ReporteVentaProductoOut(
+            producto_id=row.producto_id,
+            producto_nombre=row.producto_nombre or "Producto sin nombre",
+            producto_codigo=row.producto_codigo,
+            categoria_nombre=row.categoria_nombre,
+            cantidad_vendida=cantidad,
+            ingresos_totales=ingresos,
+            costos_totales=costos,
+            utilidad_bruta=utilidad,
+            margen_bruto=margen,
+            total_vendido=ingresos,
+            precio_promedio=(ingresos / cantidad) if cantidad > 0 else 0.0,
+            ventas_count=int(row.ventas_count or 0),
+        ))
+
+    utilidad_bruta_total = total_ingresos - total_costos
+    return ResumenReporteVentasPorProductoOut(
+        productos=productos,
+        total_productos=len(productos),
+        total_cantidad=total_cantidad,
+        total_ingresos=total_ingresos,
+        total_costos=total_costos,
+        utilidad_bruta_total=utilidad_bruta_total,
+        margen_bruto_promedio=(utilidad_bruta_total / total_ingresos * 100.0) if total_ingresos > 0 else 0.0,
+        total_vendido=total_ingresos,
+    )
 
 
 def _obtener_datos_reporte_compras(
@@ -1335,8 +1624,8 @@ def _obtener_datos_reporte_financiero(
     )
 
 
-def _inicio_fin_periodo(fecha_desde: Optional[date], fecha_hasta: Optional[date]):
-    hoy = date.today()
+def _inicio_fin_periodo(session: Session, fecha_desde: Optional[date], fecha_hasta: Optional[date]):
+    hoy = fecha_actual_negocio(session)
     fecha_desde = fecha_desde or hoy.replace(day=1)
     fecha_hasta = fecha_hasta or hoy
     inicio = datetime.combine(fecha_desde, datetime.min.time())
@@ -1350,7 +1639,7 @@ def _obtener_datos_saldos_clientes(
     fecha_hasta: Optional[date],
     cliente_id: Optional[int] = None,
 ):
-    fecha_desde, fecha_hasta, inicio, fin = _inicio_fin_periodo(fecha_desde, fecha_hasta)
+    fecha_desde, fecha_hasta, inicio, fin = _inicio_fin_periodo(session, fecha_desde, fecha_hasta)
 
     query = (
         session.query(Venta)
@@ -1421,7 +1710,7 @@ def _obtener_detalle_saldo_cliente(
     fecha_desde: Optional[date],
     fecha_hasta: Optional[date],
 ):
-    fecha_desde, fecha_hasta, inicio, fin = _inicio_fin_periodo(fecha_desde, fecha_hasta)
+    fecha_desde, fecha_hasta, inicio, fin = _inicio_fin_periodo(session, fecha_desde, fecha_hasta)
     cliente = session.query(Cliente).filter(Cliente.id == cliente_id).first()
     if not cliente:
         raise HTTPException(status_code=404, detail="Cliente no encontrado.")
@@ -1550,6 +1839,110 @@ def obtener_reporte_ventas(
         session.close()
 
 
+@router.get("/ventas-por-producto", response_model=ResumenReporteVentasPorProductoOut)
+def obtener_reporte_ventas_por_producto(
+    fecha_desde: Optional[date] = Query(None),
+    fecha_hasta: Optional[date] = Query(None),
+    cliente_id: Optional[int] = Query(None),
+    categoria_id: Optional[int] = Query(None),
+    producto_id: Optional[int] = Query(None),
+    producto_ids: Optional[List[int]] = Query(None),
+    vendedor_id: Optional[int] = Query(None),
+    canal_venta_id: Optional[int] = Query(None),
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        return _obtener_datos_reporte_ventas_por_producto(
+            session,
+            fecha_desde=fecha_desde,
+            fecha_hasta=fecha_hasta,
+            cliente_id=cliente_id,
+            categoria_id=categoria_id,
+            producto_id=producto_id,
+            producto_ids=producto_ids,
+            vendedor_id=vendedor_id,
+            canal_venta_id=canal_venta_id,
+        )
+    finally:
+        session.close()
+
+
+@router.get("/ventas-por-producto/pdf")
+def exportar_reporte_ventas_por_producto_pdf(
+    fecha_desde: Optional[date] = Query(None),
+    fecha_hasta: Optional[date] = Query(None),
+    cliente_id: Optional[int] = Query(None),
+    categoria_id: Optional[int] = Query(None),
+    producto_id: Optional[int] = Query(None),
+    producto_ids: Optional[List[int]] = Query(None),
+    vendedor_id: Optional[int] = Query(None),
+    canal_venta_id: Optional[int] = Query(None),
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        resumen = _obtener_datos_reporte_ventas_por_producto(
+            session,
+            fecha_desde=fecha_desde,
+            fecha_hasta=fecha_hasta,
+            cliente_id=cliente_id,
+            categoria_id=categoria_id,
+            producto_id=producto_id,
+            producto_ids=producto_ids,
+            vendedor_id=vendedor_id,
+            canal_venta_id=canal_venta_id,
+        )
+        config = session.query(ConfiguracionEmpresa).first()
+        pdf_buffer = generar_pdf_reporte_ventas_productos(resumen, config, fecha_desde, fecha_hasta)
+        return StreamingResponse(
+            pdf_buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_ventas_productos", fecha_desde, fecha_hasta)}"'},
+        )
+    finally:
+        session.close()
+
+
+@router.get("/ventas-por-producto/excel")
+def exportar_reporte_ventas_por_producto_excel(
+    fecha_desde: Optional[date] = Query(None),
+    fecha_hasta: Optional[date] = Query(None),
+    cliente_id: Optional[int] = Query(None),
+    categoria_id: Optional[int] = Query(None),
+    producto_id: Optional[int] = Query(None),
+    producto_ids: Optional[List[int]] = Query(None),
+    vendedor_id: Optional[int] = Query(None),
+    canal_venta_id: Optional[int] = Query(None),
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        resumen = _obtener_datos_reporte_ventas_por_producto(
+            session,
+            fecha_desde=fecha_desde,
+            fecha_hasta=fecha_hasta,
+            cliente_id=cliente_id,
+            categoria_id=categoria_id,
+            producto_id=producto_id,
+            producto_ids=producto_ids,
+            vendedor_id=vendedor_id,
+            canal_venta_id=canal_venta_id,
+        )
+        config = session.query(ConfiguracionEmpresa).first()
+        excel_buffer = generar_excel_reporte_ventas_productos(resumen, config, fecha_desde, fecha_hasta)
+        return StreamingResponse(
+            excel_buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_ventas_productos", fecha_desde, fecha_hasta, "xlsx")}"'},
+        )
+    finally:
+        session.close()
+
+
 @router.get("/ventas/comparativo-mensual", response_model=ReporteComparativoMensualOut)
 def obtener_reporte_comparativo_mensual(
     tenant_slug: str = Depends(get_tenant_slug),
@@ -1559,7 +1952,7 @@ def obtener_reporte_comparativo_mensual(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        fecha_base = fecha_referencia or date.today()
+        fecha_base = fecha_referencia or fecha_actual_negocio(session)
         fecha_dt = datetime.combine(fecha_base, datetime.min.time())
         modo_normalizado = (modo or "MES").upper()
         if modo_normalizado not in ("MES", "DIA"):
@@ -1576,7 +1969,8 @@ def obtener_comparativa_dashboard_ventas(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        return _obtener_comparativa_dashboard(session)
+        historical_cache = get_dashboard_historical_cache(session)
+        return _obtener_comparativa_dashboard(session, historical_cache=historical_cache)
     finally:
         session.close()
 
@@ -1606,7 +2000,7 @@ def obtener_reporte_compras(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        hoy = date.today()
+        hoy = fecha_actual_negocio(session)
         fecha_desde = fecha_desde or hoy.replace(day=1)
         fecha_hasta = fecha_hasta or hoy
         resumen, _ = _obtener_datos_reporte_compras(
@@ -1665,7 +2059,7 @@ def obtener_reporte_financiero(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        hoy = date.today()
+        hoy = fecha_actual_negocio(session)
         if desde_inicio:
             fecha_desde = date(2000, 1, 1)
             fecha_hasta = hoy
@@ -1715,7 +2109,7 @@ def exportar_reporte_ventas_pdf(
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": "inline; filename=reporte_ventas.pdf"}
+            headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_ventas", fecha_desde, fecha_hasta)}"'}
         )
     finally:
         session.close()
@@ -1734,7 +2128,7 @@ def exportar_reporte_compras_pdf(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        hoy = date.today()
+        hoy = fecha_actual_negocio(session)
         fecha_desde = fecha_desde or hoy.replace(day=1)
         fecha_hasta = fecha_hasta or hoy
         resumen, compras_data = _obtener_datos_reporte_compras(
@@ -1751,7 +2145,7 @@ def exportar_reporte_compras_pdf(
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": "inline; filename=reporte_compras.pdf"}
+            headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_compras", fecha_desde, fecha_hasta)}"'}
         )
     finally:
         session.close()
@@ -1767,14 +2161,15 @@ def exportar_estado_cuenta_cliente_pdf(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        fecha_desde, fecha_hasta, _, _ = _inicio_fin_periodo(fecha_desde, fecha_hasta)
+        fecha_desde, fecha_hasta, _, _ = _inicio_fin_periodo(session, fecha_desde, fecha_hasta)
         detalle = _obtener_detalle_saldo_cliente(session, cliente_id, fecha_desde, fecha_hasta)
+        cliente_slug = sanitize_filename_component(detalle.cliente.nombre if detalle and detalle.cliente else None, "cliente")
         config = session.query(ConfiguracionEmpresa).first()
         pdf_buffer = generar_pdf_estado_cuenta_cliente(detalle, config, fecha_desde, fecha_hasta)
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": f"inline; filename=estado_cuenta_cliente_{cliente_id}.pdf"}
+            headers={"Content-Disposition": f'inline; filename="estado_cuenta_{cliente_slug}_{build_period_suffix(fecha_desde, fecha_hasta)}.pdf"'}
         )
     finally:
         session.close()
@@ -1810,7 +2205,7 @@ def exportar_reporte_ventas_excel(
         return StreamingResponse(
             excel_buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "inline; filename=reporte_ventas.xlsx"}
+            headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_ventas", fecha_desde, fecha_hasta, "xlsx")}"'}
         )
     finally:
         session.close()
@@ -1829,7 +2224,7 @@ def exportar_reporte_compras_excel(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        hoy = date.today()
+        hoy = fecha_actual_negocio(session)
         fecha_desde = fecha_desde or hoy.replace(day=1)
         fecha_hasta = fecha_hasta or hoy
         resumen, compras_data = _obtener_datos_reporte_compras(
@@ -1846,7 +2241,7 @@ def exportar_reporte_compras_excel(
         return StreamingResponse(
             excel_buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "inline; filename=reporte_compras.xlsx"}
+            headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_compras", fecha_desde, fecha_hasta, "xlsx")}"'}
         )
     finally:
         session.close()
@@ -1864,7 +2259,7 @@ def exportar_reporte_finanzas_pdf(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        hoy = date.today()
+        hoy = fecha_actual_negocio(session)
         if desde_inicio:
             fecha_desde = date(2000, 1, 1)
             fecha_hasta = hoy
@@ -1886,7 +2281,7 @@ def exportar_reporte_finanzas_pdf(
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": "inline; filename=reporte_finanzas.pdf"}
+            headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_finanzas", fecha_desde, fecha_hasta)}"'}
         )
     finally:
         session.close()
@@ -1904,7 +2299,7 @@ def exportar_reporte_finanzas_excel(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        hoy = date.today()
+        hoy = fecha_actual_negocio(session)
         if desde_inicio:
             fecha_desde = date(2000, 1, 1)
             fecha_hasta = hoy
@@ -1926,7 +2321,7 @@ def exportar_reporte_finanzas_excel(
         return StreamingResponse(
             excel_buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "inline; filename=reporte_finanzas.xlsx"}
+            headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_finanzas", fecha_desde, fecha_hasta, "xlsx")}"'}
         )
     finally:
         session.close()
@@ -1988,7 +2383,7 @@ def obtener_reporte_trabajos_laboratorio(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        hoy = date.today()
+        hoy = fecha_actual_negocio(session)
         fecha_desde = fecha_desde or hoy.replace(day=1)
         fecha_hasta = fecha_hasta or hoy
         return _obtener_trabajos_laboratorio(session, fecha_desde, fecha_hasta, buscar)
@@ -2006,7 +2401,7 @@ def exportar_reporte_trabajos_laboratorio_pdf(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        hoy = date.today()
+        hoy = fecha_actual_negocio(session)
         fecha_desde = fecha_desde or hoy.replace(day=1)
         fecha_hasta = fecha_hasta or hoy
         resumen = _obtener_trabajos_laboratorio(session, fecha_desde, fecha_hasta, buscar)
@@ -2015,7 +2410,7 @@ def exportar_reporte_trabajos_laboratorio_pdf(
         return StreamingResponse(
             pdf_buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": "inline; filename=reporte_trabajos_laboratorio.pdf"},
+            headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_trabajos_laboratorio", fecha_desde, fecha_hasta)}"'},
         )
     finally:
         session.close()

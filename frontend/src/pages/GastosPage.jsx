@@ -3,14 +3,27 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CalendarDays, Edit2, Plus, Receipt, Tags, Trash2, Wallet } from 'lucide-react'
 
 import Modal from '../components/Modal'
+import FinancialJornadaNotice from '../components/FinancialJornadaNotice'
 import { api } from '../context/AuthContext'
+import { invalidateJornadaLiveData, useFinancialJornadaStatus } from '../hooks/useFinancialJornada'
+import usePendingNavigationGuard from '../utils/usePendingNavigationGuard'
+import { parseBackendDateTime, toDateInputValue as toBusinessDateInputValue, toDateTimeLocalValue as toBusinessDateTimeLocalValue } from '../utils/formatters'
 
 function fmt(value) {
     return new Intl.NumberFormat('es-PY').format(value ?? 0)
 }
 
 function fmtDate(value) {
-    return value ? new Date(value).toLocaleString('es-PY') : '-'
+    const date = parseBackendDateTime(value)
+    return date ? date.toLocaleString('es-PY') : '-'
+}
+
+function toDateInputValue(value) {
+    return toBusinessDateInputValue(value)
+}
+
+function toDateTimeLocalValue(value) {
+    return toBusinessDateTimeLocalValue(value)
 }
 
 function orderCategorias(categories, parentId = null, level = 0) {
@@ -30,8 +43,8 @@ export default function GastosPage() {
     const [modalGasto, setModalGasto] = useState(null)
     const [categoriaEditando, setCategoriaEditando] = useState(null)
     const [categoriaFiltro, setCategoriaFiltro] = useState('')
-    const [fechaDesde, setFechaDesde] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10))
-    const [fechaHasta, setFechaHasta] = useState(() => new Date().toISOString().slice(0, 10))
+    const [fechaDesde, setFechaDesde] = useState(() => toDateInputValue(new Date(new Date().getFullYear(), new Date().getMonth(), 1)))
+    const [fechaHasta, setFechaHasta] = useState(() => toDateInputValue(new Date()))
 
     const [formCategoria, setFormCategoria] = useState({ nombre: '', descripcion: '', categoria_padre_id: '' })
     const [formGasto, setFormGasto] = useState({
@@ -41,8 +54,10 @@ export default function GastosPage() {
         comprobante: '',
         metodo_pago: 'EFECTIVO',
         banco_id: '',
-        fecha: new Date().toISOString().slice(0, 16),
+        fecha: toDateTimeLocalValue(new Date()),
     })
+    const { data: jornadaEstado } = useFinancialJornadaStatus()
+    const jornadaAbierta = Boolean(jornadaEstado?.abierta)
 
     const resetFormGasto = () => setFormGasto({
         categoria_id: '',
@@ -51,7 +66,7 @@ export default function GastosPage() {
         comprobante: '',
         metodo_pago: 'EFECTIVO',
         banco_id: '',
-        fecha: new Date().toISOString().slice(0, 16),
+        fecha: toDateTimeLocalValue(new Date()),
     })
 
     const { data: categorias = [] } = useQuery({
@@ -120,11 +135,14 @@ export default function GastosPage() {
 
     const crearGasto = useMutation({
         mutationFn: payload => api.post('/gastos/', payload),
-        onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['gastos'] })
-            queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
-            queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
-            queryClient.invalidateQueries({ queryKey: ['bancos'] })
+        onSuccess: async () => {
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ['gastos'] }),
+                queryClient.invalidateQueries({ queryKey: ['saldo-caja'] }),
+                queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] }),
+                queryClient.invalidateQueries({ queryKey: ['bancos'] }),
+            ])
+            invalidateJornadaLiveData(queryClient)
             setModalGasto(null)
             resetFormGasto()
         },
@@ -132,15 +150,21 @@ export default function GastosPage() {
 
     const editarGasto = useMutation({
         mutationFn: ({ id, ...payload }) => api.put(`/gastos/${id}`, payload),
-        onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['gastos'] })
-            queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
-            queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
-            queryClient.invalidateQueries({ queryKey: ['bancos'] })
+        onSuccess: async () => {
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ['gastos'] }),
+                queryClient.invalidateQueries({ queryKey: ['saldo-caja'] }),
+                queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] }),
+                queryClient.invalidateQueries({ queryKey: ['bancos'] }),
+            ])
+            invalidateJornadaLiveData(queryClient)
             setModalGasto(null)
             resetFormGasto()
         },
     })
+
+    const gastoModalBusy = crearGasto.isPending || editarGasto.isPending
+    const confirmCloseGastoModal = usePendingNavigationGuard(gastoModalBusy, 'El gasto aun se esta guardando. Espera a que termine antes de cerrar.')
 
     const eliminarGasto = useMutation({
         mutationFn: gastoId => api.delete(`/gastos/${gastoId}`),
@@ -149,11 +173,13 @@ export default function GastosPage() {
             queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
             queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
             queryClient.invalidateQueries({ queryKey: ['bancos'] })
+            invalidateJornadaLiveData(queryClient)
         },
     })
 
     return (
         <div className="page-body">
+            <FinancialJornadaNotice compact />
             <div className="flex-between mb-24">
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                     <div style={{ width: 40, height: 40, background: 'rgba(239,68,68,0.15)', borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -168,7 +194,7 @@ export default function GastosPage() {
                     <button className="btn btn-secondary" onClick={() => setModalCategoria(true)}>
                         <Tags size={16} /> Nueva Categoria
                     </button>
-                    <button className="btn btn-primary" onClick={() => { resetFormGasto(); setModalGasto('nuevo') }}>
+                    <button className="btn btn-primary" onClick={() => { resetFormGasto(); setModalGasto('nuevo') }} disabled={!jornadaAbierta}>
                         <Plus size={16} /> Registrar Gasto
                     </button>
                 </div>
@@ -252,6 +278,7 @@ export default function GastosPage() {
                                             <button
                                                 className="btn btn-secondary btn-sm btn-icon"
                                                 onClick={() => {
+                                                    if (!jornadaAbierta) return
                                                     setFormGasto({
                                                         categoria_id: String(gasto.categoria_id),
                                                         monto: String(gasto.monto ?? ''),
@@ -259,10 +286,11 @@ export default function GastosPage() {
                                                         comprobante: gasto.comprobante || '',
                                                         metodo_pago: gasto.metodo_pago || 'EFECTIVO',
                                                         banco_id: gasto.banco_id ? String(gasto.banco_id) : '',
-                                                        fecha: gasto.fecha ? new Date(gasto.fecha).toISOString().slice(0, 16) : new Date().toISOString().slice(0, 16),
+                                                        fecha: gasto.fecha ? toDateTimeLocalValue(gasto.fecha) : toDateTimeLocalValue(new Date()),
                                                     })
                                                     setModalGasto(gasto)
                                                 }}
+                                                disabled={!jornadaAbierta}
                                                 title="Editar gasto"
                                             >
                                                 <Edit2 size={14} />
@@ -270,7 +298,7 @@ export default function GastosPage() {
                                             <button
                                                 className="btn btn-danger btn-sm btn-icon"
                                                 onClick={() => eliminarGasto.mutate(gasto.id)}
-                                                disabled={eliminarGasto.isPending}
+                                                disabled={eliminarGasto.isPending || !jornadaAbierta}
                                                 title="Eliminar gasto"
                                             >
                                                 <Trash2 size={14} />
@@ -404,7 +432,13 @@ export default function GastosPage() {
             )}
 
             {modalGasto && (
-                <Modal title={modalGasto === 'nuevo' ? 'Registrar Gasto Operativo' : `Editar Gasto: ${modalGasto.concepto}`} onClose={() => setModalGasto(null)} maxWidth="620px">
+                <Modal
+                    title={modalGasto === 'nuevo' ? 'Registrar Gasto Operativo' : `Editar Gasto: ${modalGasto.concepto}`}
+                    onClose={() => setModalGasto(null)}
+                    maxWidth="620px"
+                    closeDisabled={gastoModalBusy}
+                    onCloseAttempt={() => window.alert('El gasto aun se esta guardando. Espera a que termine antes de cerrar.')}
+                >
                     <form onSubmit={event => {
                         event.preventDefault()
                         const payload = {
@@ -412,7 +446,7 @@ export default function GastosPage() {
                             categoria_id: parseInt(formGasto.categoria_id, 10),
                             monto: parseFloat(formGasto.monto),
                             banco_id: formGasto.banco_id ? parseInt(formGasto.banco_id, 10) : null,
-                            fecha: formGasto.fecha ? new Date(formGasto.fecha).toISOString() : null,
+                            fecha: formGasto.fecha || null,
                         }
                         if (modalGasto === 'nuevo') {
                             crearGasto.mutate(payload)
@@ -423,7 +457,7 @@ export default function GastosPage() {
                         <div className="grid-2">
                             <div className="form-group">
                                 <label className="form-label">Categoria</label>
-                                <select className="form-select" value={formGasto.categoria_id} onChange={event => setFormGasto(prev => ({ ...prev, categoria_id: event.target.value }))} required>
+                                <select className="form-select" value={formGasto.categoria_id} onChange={event => setFormGasto(prev => ({ ...prev, categoria_id: event.target.value }))} required disabled={gastoModalBusy}>
                                     <option value="">Seleccionar...</option>
                                     {categoriasOrdenadas.map(category => (
                                         <option key={category.id} value={category.id}>
@@ -434,15 +468,15 @@ export default function GastosPage() {
                             </div>
                             <div className="form-group">
                                 <label className="form-label">Fecha</label>
-                                <input className="form-input" type="datetime-local" value={formGasto.fecha} onChange={event => setFormGasto(prev => ({ ...prev, fecha: event.target.value }))} />
+                                <input className="form-input" type="datetime-local" value={formGasto.fecha} onChange={event => setFormGasto(prev => ({ ...prev, fecha: event.target.value }))} disabled={gastoModalBusy} />
                             </div>
                             <div className="form-group">
                                 <label className="form-label">Monto (Gs.)</label>
-                                <input className="form-input" type="number" min="0" step="100" value={formGasto.monto} onChange={event => setFormGasto(prev => ({ ...prev, monto: event.target.value }))} required />
+                                <input className="form-input" type="number" min="0" step="100" value={formGasto.monto} onChange={event => setFormGasto(prev => ({ ...prev, monto: event.target.value }))} required disabled={gastoModalBusy} />
                             </div>
                             <div className="form-group">
                                 <label className="form-label">Metodo de pago</label>
-                                <select className="form-select" value={formGasto.metodo_pago} onChange={event => setFormGasto(prev => ({ ...prev, metodo_pago: event.target.value, banco_id: event.target.value === 'EFECTIVO' ? '' : prev.banco_id }))}>
+                                <select className="form-select" value={formGasto.metodo_pago} onChange={event => setFormGasto(prev => ({ ...prev, metodo_pago: event.target.value, banco_id: event.target.value === 'EFECTIVO' ? '' : prev.banco_id }))} disabled={gastoModalBusy}>
                                     <option value="EFECTIVO">EFECTIVO</option>
                                     <option value="TRANSFERENCIA">TRANSFERENCIA</option>
                                     <option value="TARJETA">TARJETA</option>
@@ -453,7 +487,7 @@ export default function GastosPage() {
                         {formGasto.metodo_pago !== 'EFECTIVO' && (
                             <div className="form-group">
                                 <label className="form-label">Banco</label>
-                                <select className="form-select" value={formGasto.banco_id} onChange={event => setFormGasto(prev => ({ ...prev, banco_id: event.target.value }))} required>
+                                <select className="form-select" value={formGasto.banco_id} onChange={event => setFormGasto(prev => ({ ...prev, banco_id: event.target.value }))} required disabled={gastoModalBusy}>
                                     <option value="">Seleccionar banco...</option>
                                     {bancos.map(banco => (
                                         <option key={banco.id} value={banco.id}>{banco.nombre_banco}</option>
@@ -463,12 +497,17 @@ export default function GastosPage() {
                         )}
                         <div className="form-group">
                             <label className="form-label">Concepto</label>
-                            <input className="form-input" value={formGasto.concepto} onChange={event => setFormGasto(prev => ({ ...prev, concepto: event.target.value }))} required />
+                            <input className="form-input" value={formGasto.concepto} onChange={event => setFormGasto(prev => ({ ...prev, concepto: event.target.value }))} required disabled={gastoModalBusy} />
                         </div>
                         <div className="form-group">
                             <label className="form-label">Comprobante</label>
-                            <input className="form-input" value={formGasto.comprobante} onChange={event => setFormGasto(prev => ({ ...prev, comprobante: event.target.value }))} placeholder="Factura, recibo o referencia" />
+                            <input className="form-input" value={formGasto.comprobante} onChange={event => setFormGasto(prev => ({ ...prev, comprobante: event.target.value }))} placeholder="Factura, recibo o referencia" disabled={gastoModalBusy} />
                         </div>
+                        {(crearGasto.isError || editarGasto.isError) && (
+                            <div style={{ background: 'rgba(239,68,68,0.1)', color: '#f87171', padding: '8px 12px', borderRadius: 6, fontSize: '0.8rem', marginBottom: 12 }}>
+                                {crearGasto.error?.response?.data?.detail || editarGasto.error?.response?.data?.detail || 'No se pudo guardar el gasto.'}
+                            </div>
+                        )}
                         <div className="card mb-16" style={{ padding: '12px 14px', background: 'rgba(255,255,255,0.03)' }}>
                             <div style={{ display: 'flex', gap: 8, alignItems: 'center', color: 'var(--text-secondary)', fontSize: '0.86rem' }}>
                                 <CalendarDays size={16} />
@@ -478,9 +517,9 @@ export default function GastosPage() {
                             </div>
                         </div>
                         <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
-                            <button type="button" className="btn btn-secondary" onClick={() => setModalGasto(null)}>Cancelar</button>
-                            <button type="submit" className="btn btn-primary" disabled={crearGasto.isPending || editarGasto.isPending}>
-                                {modalGasto === 'nuevo' ? 'Registrar Gasto' : 'Guardar Cambios'}
+                            <button type="button" className="btn btn-secondary" onClick={() => { if (confirmCloseGastoModal()) setModalGasto(null) }} disabled={gastoModalBusy}>Cancelar</button>
+                            <button type="submit" className="btn btn-primary" disabled={gastoModalBusy || !jornadaAbierta}>
+                                {gastoModalBusy ? (modalGasto === 'nuevo' ? 'Guardando gasto...' : 'Guardando cambios...') : (modalGasto === 'nuevo' ? 'Registrar Gasto' : 'Guardar Cambios')}
                             </button>
                         </div>
                     </form>

@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
 
+import LoadingButton from '../components/LoadingButton'
 import Modal from '../components/Modal'
 import RemoteSearchSelect from '../components/RemoteSearchSelect'
 import { api } from '../context/AuthContext'
+import { nowBusinessDateTimeLocalValue, parseBackendDateTime, toDateTimeLocalValue as toBusinessDateTimeLocalValue } from '../utils/formatters'
 import { exportReportBlob } from '../utils/reportExports'
 import { CreditCard, Eye, FileText } from 'lucide-react'
 
@@ -11,7 +13,20 @@ function fmt(value) {
 }
 
 function fmtDate(value) {
-    return value ? new Date(value).toLocaleDateString('es-PY') : '-'
+    const date = parseBackendDateTime(value)
+    return date ? date.toLocaleDateString('es-PY') : '-'
+}
+
+function formatDateTimeLocalValue(value) {
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return ''
+    const pad = number => String(number).padStart(2, '0')
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function serializeLocalDateTime(value) {
+    if (!value) return null
+    return value.length === 16 ? `${value}:00` : value
 }
 
 function ClienteActions({ item, filtros, onVerDetalle, onPdf, onCobrar }) {
@@ -45,7 +60,7 @@ function PagoVentaModal({ ventaId, onClose, onSaved }) {
         metodo_pago: 'EFECTIVO',
         banco_id: '',
         nota: '',
-        fecha: new Date().toISOString().slice(0, 16),
+        fecha: nowBusinessDateTimeLocalValue(),
     })
 
     useEffect(() => {
@@ -86,7 +101,7 @@ function PagoVentaModal({ ventaId, onClose, onSaved }) {
                 metodo_pago: form.metodo_pago,
                 banco_id: requiereBanco ? parseInt(form.banco_id, 10) : null,
                 nota: form.nota || null,
-                fecha: new Date(form.fecha).toISOString(),
+                fecha: serializeLocalDateTime(form.fecha),
             })
             onSaved()
         } catch (err) {
@@ -423,7 +438,7 @@ export default function ReporteSaldosClientesPage() {
                     </div>
                 </div>
                 <div className="filters-actions" style={{ display: 'flex', gap: '10px', marginTop: '15px', flexWrap: 'wrap' }}>
-                    <button className="btn btn-primary" onClick={aplicarFiltros}>Aplicar filtros</button>
+                    <LoadingButton className="btn btn-primary" onClick={aplicarFiltros} loading={loading} loadingText="Aplicando filtros...">Aplicar filtros</LoadingButton>
                     <button className="btn btn-secondary" onClick={limpiarFiltros}>Limpiar</button>
                 </div>
             </div>

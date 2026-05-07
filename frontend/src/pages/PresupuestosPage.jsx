@@ -1,22 +1,38 @@
 // HESAKA Web — Página: Presupuestos
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { flushSync } from 'react-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../context/AuthContext'
 import Modal from '../components/Modal'
-import { FileText, Plus, Search, ShoppingBag, X, AlertCircle, ClipboardList } from 'lucide-react'
+import { FileText, Plus, Search, ShoppingBag, X, AlertCircle, ClipboardList, Clock } from 'lucide-react'
 import usePendingNavigationGuard from '../utils/usePendingNavigationGuard'
+import { requestAndOpenPdf } from '../utils/fileDownloads'
+import { nowBusinessDateTimeLocalValue, parseBackendDateTime, todayBusinessInputValue } from '../utils/formatters'
+import { formatGsAmount, normalizeGsInput, parseGsInput } from '../utils/currencyInputs'
 
 const fmt = v => new Intl.NumberFormat('es-PY').format(v ?? 0)
-const fmtDate = d => d ? new Date(d).toLocaleDateString('es-PY') : '—'
+const fmtDate = d => {
+    const date = parseBackendDateTime(d)
+    return date ? date.toLocaleDateString('es-PY') : '?'
+}
 const formatDateInputValue = value => {
-    const date = value instanceof Date ? value : new Date(value)
-    if (Number.isNaN(date.getTime())) return ''
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return ''
     const year = date.getFullYear()
     const month = String(date.getMonth() + 1).padStart(2, '0')
     const day = String(date.getDate()).padStart(2, '0')
     return `${year}-${month}-${day}`
 }
+const formatDateTimeLocalValue = value => {
+    if (!value) return ''
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return ''
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    return `${year}-${month}-${day}`
+}
+const buildDatePatchValue = value => (value ? `${value}T12:00:00` : null)
 const addMonthsToDateInput = (baseValue, months) => {
     const baseDate = baseValue ? new Date(`${baseValue}T12:00:00`) : new Date()
     if (Number.isNaN(baseDate.getTime())) return ''
@@ -24,16 +40,152 @@ const addMonthsToDateInput = (baseValue, months) => {
     next.setMonth(next.getMonth() + months)
     return formatDateInputValue(next)
 }
+const calculateItemGross = item => Math.max(0, (Number(item?.precio_unitario || 0) * Number(item?.cantidad || 0)))
+const sanitizeItemFinancials = item => {
+    const cantidad = Math.max(1, parseInt(item?.cantidad, 10) || 1)
+    const precioUnitario = Math.max(0, Math.trunc(Number(item?.precio_unitario || 0)))
+    const bruto = precioUnitario * cantidad
+    const descuento = Math.min(Math.max(0, Math.trunc(Number(item?.descuento || 0))), bruto)
+    return {
+        ...item,
+        cantidad,
+        precio_unitario: precioUnitario,
+        descuento,
+        subtotal: bruto - descuento,
+    }
+}
 const abrirPresupuestoPdf = async presupuestoId => {
-    const response = await api.get(`/presupuestos/${presupuestoId}/pdf`, { responseType: 'blob' })
-    const file = new Blob([response.data], { type: 'application/pdf' })
-    const fileURL = URL.createObjectURL(file)
-    window.open(fileURL, '_blank')
-    setTimeout(() => URL.revokeObjectURL(fileURL), 30000)
+    await requestAndOpenPdf(
+        () => api.get(`/presupuestos/${presupuestoId}/pdf`, { responseType: 'blob' }),
+        `presupuesto_${presupuestoId}.pdf`,
+    )
 }
 const estadoBadge = e => {
     const m = { PENDIENTE: 'badge-yellow', VENDIDO: 'badge-green', VENCIDO: 'badge-red', CANCELADO: 'badge-gray' }
     return <span className={`badge ${m[e] || 'badge-gray'}`}>{e}</span>
+}
+
+function PresupuestoRowActions({
+    presupuesto,
+    rowBusy,
+    pdfOpening,
+    editing,
+    canceling,
+    deleting,
+    converting,
+    onCorregirFecha,
+    onAbrirPdf,
+    onConvertir,
+    onEditar,
+    onCancelar,
+    onEliminar,
+}) {
+    const [open, setOpen] = useState(false)
+    const [menuPosition, setMenuPosition] = useState(null)
+    const triggerRef = useRef(null)
+
+    useEffect(() => {
+        if (!open || !triggerRef.current) return
+
+        const updatePosition = () => {
+            if (!triggerRef.current) return
+            const rect = triggerRef.current.getBoundingClientRect()
+            const viewportHeight = window.innerHeight
+            const menuHeight = 240
+            const spaceBelow = viewportHeight - rect.bottom - 8
+            const openUpward = spaceBelow < menuHeight
+            const top = openUpward ? Math.max(8, rect.top - 6) : rect.bottom + 6
+
+            setMenuPosition({
+                top,
+                left: Math.max(8, rect.right),
+                openUpward,
+            })
+        }
+
+        updatePosition()
+        window.addEventListener('resize', updatePosition)
+        window.addEventListener('scroll', updatePosition, true)
+        return () => {
+            window.removeEventListener('resize', updatePosition)
+            window.removeEventListener('scroll', updatePosition, true)
+        }
+    }, [open])
+
+    const handleAction = cb => {
+        setOpen(false)
+        window.setTimeout(() => {
+            cb()
+        }, 0)
+    }
+
+    const showWorkflowActions = ['PENDIENTE', 'BORRADOR'].includes(presupuesto.estado)
+
+    return (
+        <div style={{ position: 'relative' }}>
+            <button
+                ref={triggerRef}
+                type="button"
+                className="btn btn-secondary btn-sm"
+                style={{ fontSize: '0.72rem' }}
+                onClick={() => !rowBusy && setOpen(prev => !prev)}
+                disabled={rowBusy}
+            >
+                {rowBusy ? 'Procesando...' : 'Acciones ▾'}
+            </button>
+
+            {open && menuPosition && (
+                <>
+                    <div style={{ position: 'fixed', inset: 0, zIndex: 119 }} onClick={() => setOpen(false)} />
+                    <div
+                        style={{
+                            position: 'fixed',
+                            top: menuPosition.top,
+                            left: menuPosition.left,
+                            transform: menuPosition.openUpward ? 'translate(-100%, -100%)' : 'translate(-100%, 0)',
+                            minWidth: 220,
+                            background: 'var(--bg-card)',
+                            border: '1px solid var(--border)',
+                            borderRadius: 10,
+                            boxShadow: '0 14px 34px rgba(0,0,0,0.45)',
+                            padding: '6px 0',
+                            zIndex: 120,
+                        }}
+                    >
+                        <button className="dropdown-item" onClick={() => handleAction(onCorregirFecha)} disabled={rowBusy}>
+                            <Clock size={14} style={{ marginRight: 8 }} /> Corregir fecha
+                        </button>
+                        <button className="dropdown-item" onClick={() => handleAction(onAbrirPdf)} disabled={rowBusy}>
+                            <FileText size={14} style={{ marginRight: 8 }} /> {pdfOpening ? 'Abriendo PDF...' : 'Abrir PDF'}
+                        </button>
+
+                        {showWorkflowActions && (
+                            <>
+                                <button className="dropdown-item" onClick={() => handleAction(onConvertir)} disabled={rowBusy}>
+                                    <ShoppingBag size={14} style={{ marginRight: 8 }} /> {converting ? 'Convirtiendo...' : 'Convertir a venta'}
+                                </button>
+                                <button className="dropdown-item" onClick={() => handleAction(onEditar)} disabled={rowBusy}>
+                                    {editing ? 'Cargando...' : 'Editar'}
+                                </button>
+                                <button className="dropdown-item" style={{ color: 'var(--warning)' }} onClick={() => handleAction(onCancelar)} disabled={rowBusy}>
+                                    {canceling ? 'Cancelando...' : 'Cancelar'}
+                                </button>
+                            </>
+                        )}
+
+                        {presupuesto.estado !== 'VENDIDO' && (
+                            <>
+                                <div style={{ height: 1, background: 'var(--border)', margin: '4px 0' }} />
+                                <button className="dropdown-item" style={{ color: 'var(--danger)' }} onClick={() => handleAction(onEliminar)} disabled={rowBusy}>
+                                    <X size={14} style={{ marginRight: 8 }} /> {deleting ? 'Eliminando...' : 'Eliminar'}
+                                </button>
+                            </>
+                        )}
+                    </div>
+                </>
+            )}
+        </div>
+    )
 }
 
 // Sub-formulario de ítem — con buscador de producto y precio visible
@@ -73,13 +225,14 @@ function ItemRow({ item, idx, onUpdate, onRemove }) {
             }
         }
         onUpdate(idx, {
-            ...item,
-            busq: prod.nombre,
-            producto_id: prod.id,
-            precio_unitario: prod.precio_venta,
-            costo_unitario: costoUnitario,
-            costo_variable: Boolean(prod.costo_variable),
-            subtotal: prod.precio_venta * item.cantidad - item.descuento,
+            ...sanitizeItemFinancials({
+                ...item,
+                busq: prod.nombre,
+                producto_id: prod.id,
+                precio_unitario: prod.precio_venta,
+                costo_unitario: costoUnitario,
+                costo_variable: Boolean(prod.costo_variable),
+            }),
         })
     }
 
@@ -145,11 +298,34 @@ function ItemRow({ item, idx, onUpdate, onRemove }) {
                 )}
             </td>
             <td><input type="number" className="form-input" style={{ width: 70, padding: '6px 8px' }} value={item.cantidad} min={1}
-                onChange={e => { const q = parseInt(e.target.value) || 1; onUpdate(idx, { ...item, cantidad: q, subtotal: item.precio_unitario * q - item.descuento }) }} /></td>
-            <td><input type="number" className="form-input" style={{ width: 110, padding: '6px 8px' }} value={item.precio_unitario}
-                onChange={e => { const pr = parseFloat(e.target.value) || 0; onUpdate(idx, { ...item, precio_unitario: pr, subtotal: pr * item.cantidad - item.descuento }) }} /></td>
-            <td><input type="number" className="form-input" style={{ width: 90, padding: '6px 8px' }} value={item.descuento}
-                onChange={e => { const d = parseFloat(e.target.value) || 0; onUpdate(idx, { ...item, descuento: d, subtotal: item.precio_unitario * item.cantidad - d }) }} /></td>
+                onChange={e => {
+                    const q = parseInt(e.target.value, 10) || 1
+                    onUpdate(idx, sanitizeItemFinancials({ ...item, cantidad: q }))
+                }} /></td>
+            <td><input
+                type="text"
+                inputMode="numeric"
+                className="form-input"
+                style={{ width: 110, padding: '6px 8px' }}
+                value={formatGsAmount(item.precio_unitario)}
+                onChange={e => {
+                    const precioUnitario = normalizeGsInput(e.target.value).amount
+                    onUpdate(idx, sanitizeItemFinancials({ ...item, precio_unitario: precioUnitario }))
+                }}
+                onFocus={e => e.target.select()}
+            /></td>
+            <td><input
+                type="text"
+                inputMode="numeric"
+                className="form-input"
+                style={{ width: 90, padding: '6px 8px' }}
+                value={formatGsAmount(item.descuento)}
+                onChange={e => {
+                    const descuento = normalizeGsInput(e.target.value).amount
+                    onUpdate(idx, sanitizeItemFinancials({ ...item, descuento }))
+                }}
+                onFocus={e => e.target.select()}
+            /></td>
             <td style={{ fontWeight: 600, color: 'var(--primary-light)', whiteSpace: 'nowrap' }}>Gs. {fmt(item.subtotal)}</td>
             <td><button type="button" className="btn btn-danger btn-sm btn-icon" onClick={() => onRemove(idx)}><X size={13} /></button></td>
         </tr>
@@ -166,6 +342,8 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
     const [pagoInicial, setPagoInicial] = useState(false)
 
     const { data: bancos = [] } = useQuery({ queryKey: ['bancos'], queryFn: () => api.get('/bancos/').then(r => r.data) })
+    const montoMaximo = Math.max(0, Math.trunc(Number(presupuesto?.total || 0)))
+    const montoCobrado = parseGsInput(monto)
 
     const removerPresupuestoDeCache = presupuestoId => {
         const queries = qc.getQueriesData({ queryKey: ['presupuestos'] })
@@ -220,7 +398,12 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
             ]).catch(() => {})
         }
     })
-    const confirmNavigation = usePendingNavigationGuard(convertir.isPending, 'La conversion a venta aun se esta procesando. ¿Seguro que desea salir de esta vista?')
+    const confirmNavigation = usePendingNavigationGuard(
+        convertir.isPending || pagoInicial,
+        convertir.isPending
+            ? 'La conversion a venta aun se esta procesando. ¿Seguro que desea salir de esta vista?'
+            : 'Hay un cobro inicial abierto en este presupuesto. Si sales ahora, puedes perder los datos cargados. ¿Deseas continuar?'
+    )
 
     useEffect(() => {
         onBusyChange?.(convertir.isPending)
@@ -229,10 +412,14 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
 
     const handleSubmit = e => {
         e.preventDefault()
+        if (pagoInicial && montoCobrado > montoMaximo) {
+            window.alert('El monto cobrado no puede superar el total pendiente del presupuesto.')
+            return
+        }
         const pagos = []
-        if (pagoInicial && parseFloat(monto) > 0) {
+        if (pagoInicial && montoCobrado > 0) {
             pagos.push({
-                monto: parseFloat(monto),
+                monto: montoCobrado,
                 metodo_pago: metodo,
                 banco_id: bancoId ? parseInt(bancoId) : null,
                 nota: nota || null
@@ -254,7 +441,11 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
                 </div>
             </div>
             <label style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16, cursor: 'pointer' }}>
-                <input type="checkbox" checked={pagoInicial} onChange={e => setPagoInicial(e.target.checked)} style={{ width: 16, height: 16, accentColor: 'var(--primary-light)' }} />
+                <input type="checkbox" checked={pagoInicial} onChange={e => {
+                    const nextChecked = e.target.checked
+                    setPagoInicial(nextChecked)
+                    if (nextChecked && !monto) setMonto(formatGsAmount(montoMaximo))
+                }} style={{ width: 16, height: 16, accentColor: 'var(--primary-light)' }} />
                 <span style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Registrar cobro inicial</span>
             </label>
             {pagoInicial && (
@@ -262,7 +453,19 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
                     <div className="grid-2 mb-16">
                         <div className="form-group">
                             <label className="form-label">Monto cobrado (Gs.)</label>
-                            <input className="form-input" type="number" value={monto} onChange={e => setMonto(e.target.value)} placeholder="0" max={presupuesto.total} min={0} step="any" disabled={convertir.isPending} />
+                            <input
+                                className="form-input"
+                                type="text"
+                                inputMode="numeric"
+                                value={monto}
+                                onChange={e => setMonto(normalizeGsInput(e.target.value).formatted)}
+                                onFocus={e => e.target.select()}
+                                placeholder="0"
+                                disabled={convertir.isPending}
+                            />
+                            <div style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: '0.76rem' }}>
+                                Sugerido: Gs. {fmt(montoMaximo)}. No se permite cargar más que el saldo pendiente.
+                            </div>
                         </div>
                         <div className="form-group">
                             <label className="form-label">Método</label>
@@ -333,8 +536,12 @@ function AsignacionComercialModal({ presupuesto, onClose, onBusyChange }) {
     const submit = event => {
         event.preventDefault()
         setError('')
+        if (!vendedor) {
+            setError('Debes seleccionar un vendedor.')
+            return
+        }
         guardar.mutate({
-            vendedor_id: vendedor ? parseInt(vendedor, 10) : null,
+            vendedor_id: parseInt(vendedor, 10),
             canal_venta_id: canalVenta ? parseInt(canalVenta, 10) : null,
         })
     }
@@ -354,9 +561,9 @@ function AsignacionComercialModal({ presupuesto, onClose, onBusyChange }) {
 
             <div className="grid-2 mb-16">
                 <div className="form-group">
-                    <label className="form-label">Vendedor</label>
-                    <select className="form-select" value={vendedor} onChange={e => setVendedor(e.target.value)}>
-                        <option value="">Sin vendedor asignado</option>
+                    <label className="form-label">Vendedor *</label>
+                    <select className="form-select" value={vendedor} onChange={e => setVendedor(e.target.value)} required>
+                        <option value="">Selecciona un vendedor</option>
                         {vendedores.map(item => <option key={item.id} value={item.id}>{item.nombre}</option>)}
                     </select>
                 </div>
@@ -380,6 +587,85 @@ function AsignacionComercialModal({ presupuesto, onClose, onBusyChange }) {
                 <button type="submit" className="btn btn-primary" disabled={guardar.isPending}>
                     {guardar.isPending ? 'Guardando...' : 'Guardar asignacion'}
                 </button>
+            </div>
+        </form>
+    )
+}
+
+function CorregirFechaPresupuestoModal({ presupuesto, onClose, onBusyChange }) {
+    const qc = useQueryClient()
+    const [fecha, setFecha] = useState(() => formatDateTimeLocalValue(presupuesto?.fecha) || nowBusinessDateTimeLocalValue())
+    const [sincronizarVenta, setSincronizarVenta] = useState(presupuesto?.estado === 'VENDIDO')
+    const [error, setError] = useState('')
+
+    const guardar = useMutation({
+        mutationFn: payload => api.patch(`/presupuestos/${presupuesto.id}/fecha`, payload),
+        onSuccess: async () => {
+            await Promise.all([
+                qc.invalidateQueries({ queryKey: ['presupuestos'] }),
+                qc.invalidateQueries({ queryKey: ['ventas'] }),
+                qc.invalidateQueries({ queryKey: ['ventas-optimizado'] }),
+            ])
+            onClose()
+        },
+        onError: err => {
+            setError(err?.response?.data?.detail || 'No se pudo corregir la fecha del presupuesto.')
+        },
+    })
+
+    useEffect(() => {
+        onBusyChange?.(guardar.isPending)
+        return () => onBusyChange?.(false)
+    }, [guardar.isPending, onBusyChange])
+
+    const handleSubmit = event => {
+        event.preventDefault()
+        if (!fecha) {
+            setError('Debes indicar una fecha valida.')
+            return
+        }
+        setError('')
+        guardar.mutate({
+            fecha: buildDatePatchValue(fecha),
+            actualizar_venta_relacionada: sincronizarVenta,
+        })
+    }
+
+    return (
+        <form onSubmit={handleSubmit}>
+            <div style={{ display: 'grid', gap: 16 }}>
+                <div className="card" style={{ padding: '14px 16px', marginBottom: 0 }}>
+                    <div style={{ fontWeight: 700 }}>{presupuesto?.codigo}</div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem', marginTop: 4 }}>
+                        Cliente: {presupuesto?.cliente_nombre || 'Sin cliente'}
+                    </div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem', marginTop: 4 }}>
+                        Fecha actual: {fmtDate(presupuesto?.fecha)}
+                    </div>
+                </div>
+                <div className="form-group" style={{ marginBottom: 0 }}>
+                    <label className="form-label">Nueva fecha del presupuesto</label>
+                    <input className="form-input" type="date" value={fecha} onChange={event => setFecha(event.target.value)} disabled={guardar.isPending} />
+                </div>
+                {presupuesto?.estado === 'VENDIDO' && (
+                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: guardar.isPending ? 'not-allowed' : 'pointer', opacity: guardar.isPending ? 0.7 : 1 }}>
+                        <input type="checkbox" checked={sincronizarVenta} onChange={event => setSincronizarVenta(event.target.checked)} disabled={guardar.isPending} style={{ marginTop: 2 }} />
+                        <span style={{ fontSize: '0.88rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                            Cambiar tambien la fecha de la venta relacionada.
+                        </span>
+                    </label>
+                )}
+                {error ? (
+                    <div className="alert alert-error" style={{ marginBottom: 0 }}>
+                        <AlertCircle size={16} /> {error}
+                    </div>
+                ) : null}
+                <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
+                    <button type="button" className="btn btn-secondary" onClick={onClose} disabled={guardar.isPending}>Cancelar</button>
+                    <button type="submit" className="btn btn-primary" disabled={guardar.isPending}>
+                        {guardar.isPending ? 'Guardando fecha...' : 'Guardar fecha'}
+                    </button>
+                </div>
             </div>
         </form>
     )
@@ -419,7 +705,7 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
     const [proximoControl, setProximoControl] = useState(
         presupuesto?.fecha_proximo_control
             ? String(presupuesto.fecha_proximo_control).slice(0, 10)
-            : addMonthsToDateInput(presupuesto?.fecha ? presupuesto.fecha.split('T')[0] : new Date().toISOString().split('T')[0], 12)
+            : addMonthsToDateInput(presupuesto?.fecha ? presupuesto.fecha.split('T')[0] : todayBusinessInputValue(), 12)
     )
     const [noRequiereProximoControl, setNoRequiereProximoControl] = useState(Boolean(presupuesto?.no_requiere_proximo_control))
     const [consultaClinicaVinculada, setConsultaClinicaVinculada] = useState(
@@ -438,7 +724,7 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
     const [comisionAlerta, setComisionAlerta] = useState(false)
     const [importandoGraduacion, setImportandoGraduacion] = useState(false)
     const [fecha, setFecha] = useState(
-        presupuesto?.fecha ? presupuesto.fecha.split('T')[0] : new Date().toISOString().split('T')[0]
+        presupuesto?.fecha ? presupuesto.fecha.split('T')[0] : todayBusinessInputValue()
     )
 
     const { data: clientes = [] } = useQuery({ queryKey: ['clientes', buscarCli], queryFn: () => api.get(`/clientes/?buscar=${buscarCli}&limit=20`).then(r => r.data), retry: false, enabled: buscarCli.length >= 1 })
@@ -624,13 +910,25 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
     const handleSubmit = e => {
         e.preventDefault()
         if (!cliente) return
+        if (!vendedor) {
+            window.alert('Debes seleccionar un vendedor antes de guardar el presupuesto.')
+            return
+        }
+        const itemsSanitizados = items
+            .filter(i => i.producto_id)
+            .map(i => sanitizeItemFinancials(i))
+        const itemInvalido = itemsSanitizados.find(i => i.descuento > calculateItemGross(i))
+        if (itemInvalido) {
+            window.alert('Uno de los descuentos supera el valor total de su item. Revisa los importes antes de guardar.')
+            return
+        }
         // Alerta si hay referidor pero sin comisión
         if (referidor && (!comision || parseFloat(comision) === 0)) {
             if (!window.confirm('El referidor seleccionado no tiene comisión asignada. ¿Desea guardar el presupuesto igual?')) return
         }
         crear.mutate({
             cliente_id: parseInt(cliente),
-            fecha: fecha || new Date().toISOString(),
+            fecha: buildDatePatchValue(fecha) || buildDatePatchValue(todayBusinessInputValue()),
             graduacion_od_esfera: grad.od_esfera || null, graduacion_od_cilindro: grad.od_cilindro || null,
             graduacion_od_eje: grad.od_eje || null, graduacion_od_adicion: grad.od_adicion || null,
             graduacion_oi_esfera: grad.oi_esfera || null, graduacion_oi_cilindro: grad.oi_cilindro || null,
@@ -641,10 +939,10 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
             consulta_clinica_id: noRequiereProximoControl ? null : (consultaClinicaVinculada?.id || null),
             consulta_clinica_tipo: noRequiereProximoControl ? null : (consultaClinicaVinculada?.tipo || null),
             referidor_id: referidor ? parseInt(referidor) : null,
-            vendedor_id: vendedor ? parseInt(vendedor) : null,
+            vendedor_id: parseInt(vendedor, 10),
             canal_venta_id: canalVenta ? parseInt(canalVenta) : null,
             comision_monto: parseFloat(comision) || 0,
-            items: items.filter(i => i.producto_id).map(i => ({
+            items: itemsSanitizados.map(i => ({
                 id: i.id || null,
                 producto_id: parseInt(i.producto_id), cantidad: i.cantidad,
                 precio_unitario: i.precio_unitario, costo_unitario: i.costo_unitario || 0,
@@ -795,14 +1093,15 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
 
             <div className="grid-2 mb-16">
                 <div className="form-group">
-                    <label className="form-label">Vendedor</label>
+                    <label className="form-label">Vendedor *</label>
                     <select
                         className="form-select"
                         value={vendedor}
                         onChange={e => setVendedor(e.target.value)}
                         style={{ background: '#1a1d27', color: 'var(--text-primary)' }}
+                        required
                     >
-                        <option value="" style={{ background: '#1a1d27' }}>Sin vendedor asignado</option>
+                        <option value="" style={{ background: '#1a1d27' }}>Selecciona un vendedor</option>
                         {vendedores.map(v => <option key={v.id} value={v.id} style={{ background: '#1a1d27' }}>{v.nombre}</option>)}
                     </select>
                 </div>
@@ -971,8 +1270,11 @@ export default function PresupuestosPage() {
     const [buscar, setBuscar] = useState('')
     const [modal, setModal] = useState(false)
     const [editarPre, setEditarPre] = useState(null)     // presupuesto a editar
+    const [fechaPre, setFechaPre] = useState(null)
     const [asignacionPre, setAsignacionPre] = useState(null)
     const [estadoFiltro, setEstadoFiltro] = useState('')
+    const [fechaDesdeFiltro, setFechaDesdeFiltro] = useState('')
+    const [fechaHastaFiltro, setFechaHastaFiltro] = useState('')
     const [vendedorFiltro, setVendedorFiltro] = useState('')
     const [canalFiltro, setCanalFiltro] = useState('')
     const [convertirPre, setConvertirPre] = useState(null)
@@ -984,17 +1286,26 @@ export default function PresupuestosPage() {
     const [presupuestoModalBusy, setPresupuestoModalBusy] = useState(false)
     const [convertirModalBusy, setConvertirModalBusy] = useState(false)
     const [asignacionModalBusy, setAsignacionModalBusy] = useState(false)
+    const [fechaModalBusy, setFechaModalBusy] = useState(false)
     const hasPendingNavigation = Boolean(pdfOpeningId || cancelingId || deletingId)
-    const confirmNavigation = usePendingNavigationGuard(hasPendingNavigation, 'Hay una accion de presupuesto aun en proceso. ¿Seguro que desea salir de esta vista?')
+    const hasOpenPresupuesto = Boolean(modal || editarPre)
+    const confirmNavigation = usePendingNavigationGuard(
+        hasPendingNavigation || hasOpenPresupuesto,
+        hasPendingNavigation
+            ? 'Hay una accion de presupuesto aun en proceso. ¿Seguro que desea salir de esta vista?'
+            : 'Hay un presupuesto abierto que todavia podria tener datos sin guardar. ¿Seguro que desea salir de esta vista?'
+    )
 
     const { data: vendedoresFiltro = [] } = useQuery({ queryKey: ['presupuestos-vendedores-filtro'], queryFn: () => api.get('/vendedores/?solo_activos=true&limit=200').then(r => r.data), retry: false })
     const { data: canalesFiltro = [] } = useQuery({ queryKey: ['presupuestos-canales-filtro'], queryFn: () => api.get('/canales-venta/?solo_activos=true&limit=200').then(r => r.data), retry: false })
 
     const { data: presupuestosData, isLoading } = useQuery({
-        queryKey: ['presupuestos', estadoFiltro, vendedorFiltro, canalFiltro, buscar],
+        queryKey: ['presupuestos', estadoFiltro, fechaDesdeFiltro, fechaHastaFiltro, vendedorFiltro, canalFiltro, buscar],
         queryFn: () => {
             const params = new URLSearchParams({ page: '1', page_size: '100' })
             if (estadoFiltro) params.append('estado', estadoFiltro)
+            if (fechaDesdeFiltro) params.append('fecha_desde', fechaDesdeFiltro)
+            if (fechaHastaFiltro) params.append('fecha_hasta', fechaHastaFiltro)
             if (vendedorFiltro) params.append('vendedor_id', vendedorFiltro)
             if (canalFiltro) params.append('canal_venta_id', canalFiltro)
             if (buscar.trim()) params.append('search', buscar.trim())
@@ -1079,6 +1390,22 @@ export default function PresupuestosPage() {
                         <option value="">Todos los estados</option>
                         {['PENDIENTE', 'VENDIDO', 'VENCIDO', 'CANCELADO'].map(s => <option key={s} value={s}>{s}</option>)}
                     </select>
+                    <input
+                        className="form-input"
+                        style={{ width: 155 }}
+                        type="date"
+                        value={fechaDesdeFiltro}
+                        onChange={e => setFechaDesdeFiltro(e.target.value)}
+                        title="Desde"
+                    />
+                    <input
+                        className="form-input"
+                        style={{ width: 155 }}
+                        type="date"
+                        value={fechaHastaFiltro}
+                        onChange={e => setFechaHastaFiltro(e.target.value)}
+                        title="Hasta"
+                    />
                     <select className="form-select" style={{ width: 180 }} value={vendedorFiltro} onChange={e => setVendedorFiltro(e.target.value)}>
                         <option value="">Todos los vendedores</option>
                         {vendedoresFiltro.map(vendedor => <option key={vendedor.id} value={vendedor.id}>{vendedor.nombre}</option>)}
@@ -1087,6 +1414,20 @@ export default function PresupuestosPage() {
                         <option value="">Todos los canales</option>
                         {canalesFiltro.map(canal => <option key={canal.id} value={canal.id}>{canal.nombre}</option>)}
                     </select>
+                    <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => {
+                            setBuscar('')
+                            setEstadoFiltro('')
+                            setFechaDesdeFiltro('')
+                            setFechaHastaFiltro('')
+                            setVendedorFiltro('')
+                            setCanalFiltro('')
+                        }}
+                    >
+                        Limpiar filtros
+                    </button>
                 </div>
             </div>
 
@@ -1119,33 +1460,22 @@ export default function PresupuestosPage() {
                                         </td>
                                         <td style={{ fontWeight: 600 }}>Gs. {fmt(p.total)}</td>
                                         <td>{estadoBadge(p.estado)}</td>
-                                        <td style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                                            {['PENDIENTE', 'BORRADOR'].includes(p.estado) && (
-                                                <>
-                                                    <button className="btn btn-secondary btn-sm" style={{ fontSize: '0.72rem' }} onClick={() => handleAbrirPdf(p.id)} disabled={rowBusy}>
-                                                        <FileText size={12} /> {pdfOpeningId === p.id ? 'Abriendo PDF...' : 'PDF'}
-                                                    </button>
-                                                    <button className="btn btn-primary btn-sm" style={{ fontSize: '0.72rem' }} onClick={() => setConvertirPre(p)} disabled={rowBusy}>
-                                                        <ShoppingBag size={12} /> Vender
-                                                    </button>
-                                                    <button className="btn btn-secondary btn-sm" style={{ fontSize: '0.72rem' }} onClick={() => handleEditar(p.id)} disabled={rowBusy}>
-                                                        {editingId === p.id ? 'Cargando...' : '✏️ Editar'}
-                                                    </button>
-                                                    <button className="btn btn-secondary btn-sm" style={{ fontSize: '0.72rem', color: 'var(--warning)' }} onClick={() => { setCancelingId(p.id); cambiarEstado.mutate({ id: p.id, estado: 'CANCELADO' }) }} disabled={rowBusy}>
-                                                        Cancelar
-                                                    </button>
-                                                </>
-                                            )}
-                                            {p.estado !== 'VENDIDO' && (
-                                                <button className="btn btn-danger btn-sm btn-icon" onClick={() => handleEliminar(p)} title="Eliminar" disabled={rowBusy}>
-                                                    <X size={12} />
-                                                </button>
-                                            )}
-                                            {p.estado === 'VENDIDO' && (
-                                                <button className="btn btn-secondary btn-sm" style={{ fontSize: '0.72rem' }} onClick={() => handleAbrirPdf(p.id)} disabled={rowBusy}>
-                                                    <FileText size={12} /> {pdfOpeningId === p.id ? 'Abriendo PDF...' : 'PDF'}
-                                                </button>
-                                            )}
+                                        <td>
+                                            <PresupuestoRowActions
+                                                presupuesto={p}
+                                                rowBusy={rowBusy}
+                                                pdfOpening={pdfOpeningId === p.id}
+                                                editing={editingId === p.id}
+                                                canceling={cancelingId === p.id}
+                                                deleting={deletingId === p.id}
+                                                converting={convertingId === p.id}
+                                                onCorregirFecha={() => setFechaPre(p)}
+                                                onAbrirPdf={() => handleAbrirPdf(p.id)}
+                                                onConvertir={() => setConvertirPre(p)}
+                                                onEditar={() => handleEditar(p.id)}
+                                                onCancelar={() => { setCancelingId(p.id); cambiarEstado.mutate({ id: p.id, estado: 'CANCELADO' }) }}
+                                                onEliminar={() => handleEliminar(p)}
+                                            />
                                         </td>
                                     </tr>
                                     )
@@ -1202,6 +1532,17 @@ export default function PresupuestosPage() {
                     onCloseAttempt={() => window.alert('La asignacion comercial aun se esta guardando. Espera a que termine antes de cerrar.')}
                 >
                     <AsignacionComercialModal presupuesto={asignacionPre} onClose={() => setAsignacionPre(null)} onBusyChange={setAsignacionModalBusy} />
+                </Modal>
+            )}
+            {fechaPre && (
+                <Modal
+                    title={`Corregir fecha ${fechaPre.codigo}`}
+                    onClose={() => setFechaPre(null)}
+                    maxWidth="520px"
+                    closeDisabled={fechaModalBusy}
+                    onCloseAttempt={() => window.alert('La fecha del presupuesto aun se esta guardando. Espera a que termine antes de cerrar.')}
+                >
+                    <CorregirFechaPresupuestoModal presupuesto={fechaPre} onClose={() => setFechaPre(null)} onBusyChange={setFechaModalBusy} />
                 </Modal>
             )}
         </div>

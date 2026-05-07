@@ -4,15 +4,58 @@ import { AlertCircle, CheckSquare, Eye, FileText, MessageCircle, PackagePlus, Pe
 import { createPortal } from 'react-dom'
 
 import Modal from '../components/Modal'
+import FinancialJornadaNotice from '../components/FinancialJornadaNotice'
 import { api, useAuth } from '../context/AuthContext'
 import { exportReportBlob } from '../utils/reportExports'
 import { hasActionAccess } from '../utils/roles'
+import { invalidateJornadaLiveData, useFinancialJornadaStatus } from '../hooks/useFinancialJornada'
+import { getWhatsappTemplateByCode, useActualizarWhatsappTemplate, useWhatsappTemplatesCatalog } from '../hooks/useWhatsappTemplates'
+import { parseBackendDateTime, toDateInputValue } from '../utils/formatters'
+import { formatGsAmount, normalizeGsInput, parseGsInput } from '../utils/currencyInputs'
 
 const fmt = value => new Intl.NumberFormat('es-PY').format(value ?? 0)
-const fmtDate = value => value ? new Date(value).toLocaleDateString('es-PY') : '-'
-const fmtDateTime = value => value ? new Date(value).toLocaleString('es-PY') : '-'
+const fmtDate = value => {
+    const date = parseBackendDateTime(value)
+    return date ? date.toLocaleDateString('es-PY') : '-'
+}
+const fmtDateTime = value => {
+    const date = parseBackendDateTime(value)
+    return date ? date.toLocaleString('es-PY') : '-'
+}
+const formatDateInputValue = toDateInputValue
 const RETIRO_WHATSAPP_TEMPLATE_KEY = 'hesaka-retiro-whatsapp-template'
 const DEFAULT_RETIRO_WHATSAPP_TEMPLATE = 'Hola {cliente}, te escribimos de {empresa}. Tu trabajo{venta} ya esta disponible para retiro. Cuando gustes, puedes pasar por la optica. Quedamos atentos.'
+const RETIRO_TEMPLATE_CODE = 'venta_aviso_retiro'
+const COMPRA_FLOW_OPTIONS = [
+    {
+        key: 'PEDIDO_CLIENTE',
+        title: 'Pedido de cliente',
+        description: 'Primero eliges la venta y luego completas proveedor y costos reales.',
+        tipoCompra: 'ORIGINAL',
+        startWithVentas: true,
+    },
+    {
+        key: 'STOCK',
+        title: 'Stock o servicio',
+        description: 'Carga libre para stock, laboratorio o compras no ligadas a una venta.',
+        tipoCompra: 'STOCK/SERVICIO',
+        startWithVentas: false,
+    },
+    {
+        key: 'GARANTIA',
+        title: 'Garantia',
+        description: 'Para reposiciones o cambios, con posibilidad de asociar una venta si hace falta.',
+        tipoCompra: 'GARANTIA',
+        startWithVentas: false,
+    },
+    {
+        key: 'REEMPLAZO',
+        title: 'Reemplazo',
+        description: 'Compra de reemplazo con datos tentativos editables.',
+        tipoCompra: 'REEMPLAZO',
+        startWithVentas: true,
+    },
+]
 
 function normalizarTelefonoWhatsapp(value) {
     let digits = String(value || '').replace(/\D/g, '')
@@ -65,7 +108,7 @@ function buildRetiroWhatsappLink(context, message = '') {
     return `https://wa.me/${telefono}?text=${encodeURIComponent(finalMessage)}`
 }
 
-function WhatsappRetiroModal({ context, onClose }) {
+function WhatsappRetiroModal({ context, onClose, onGuardarPlantilla = null, guardandoPlantilla = false }) {
     const [message, setMessage] = useState(() => buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate()))
     const whatsappLink = buildRetiroWhatsappLink(context, message)
 
@@ -78,8 +121,12 @@ function WhatsappRetiroModal({ context, onClose }) {
     }
 
     const saveTemplate = () => {
+        const template = message
+        if (onGuardarPlantilla) {
+            onGuardarPlantilla(template)
+        }
         if (typeof window !== 'undefined') {
-            localStorage.setItem(RETIRO_WHATSAPP_TEMPLATE_KEY, message)
+            localStorage.setItem(RETIRO_WHATSAPP_TEMPLATE_KEY, template)
         }
         window.alert('Plantilla de retiro guardada.')
     }
@@ -123,7 +170,7 @@ function WhatsappRetiroModal({ context, onClose }) {
                     <button type="button" className="btn btn-secondary" onClick={restoreSuggested}>
                         <RotateCcw size={15} /> Restaurar sugerido
                     </button>
-                    <button type="button" className="btn btn-secondary" onClick={saveTemplate}>
+                    <button type="button" className="btn btn-secondary" onClick={saveTemplate} disabled={guardandoPlantilla}>
                         Guardar plantilla
                     </button>
                 </div>
@@ -175,10 +222,11 @@ function createEmptyItem() {
 }
 
 function recalcItem(item) {
-    const cantidad = parseInt(item.cantidad, 10) || 1
-    const costo = parseFloat(item.costo_unitario) || 0
-    const descuento = parseFloat(item.descuento) || 0
-    return { ...item, cantidad, subtotal: Math.max(0, costo * cantidad - descuento) }
+    const cantidad = Math.max(1, parseInt(item.cantidad, 10) || 1)
+    const costo = Math.max(0, Math.trunc(Number(item.costo_unitario || 0)))
+    const bruto = costo * cantidad
+    const descuento = Math.min(Math.max(0, Math.trunc(Number(item.descuento || 0))), bruto)
+    return { ...item, cantidad, costo_unitario: costo, descuento, subtotal: Math.max(0, bruto - descuento) }
 }
 
 function buildImportedItems(ventas) {
@@ -228,6 +276,32 @@ function buildVentasResumen(compra) {
         venta_codigo: compra.ventas_codigos?.[index] || `VENTA #${ventaId}`,
         cliente_nombre: compra.clientes_nombres?.join(', ') || '',
     }))
+}
+
+function getVentaSuggestedProviders(venta) {
+    return Array.from(
+        new Map(
+            (venta?.items_pendientes || [])
+                .filter(item => item.proveedor_id || item.proveedor_nombre)
+                .map(item => [String(item.proveedor_id || item.proveedor_nombre), {
+                    proveedor_id: item.proveedor_id || null,
+                    proveedor_nombre: item.proveedor_nombre || 'Sin proveedor sugerido',
+                }])
+        ).values()
+    )
+}
+
+function getSuggestedProveedorFromVentas(ventas) {
+    const providers = Array.from(
+        new Map(
+            ventas
+                .flatMap(venta => getVentaSuggestedProviders(venta))
+                .filter(provider => provider.proveedor_id)
+                .map(provider => [provider.proveedor_id, provider])
+        ).values()
+    )
+    if (providers.length === 1) return providers[0]
+    return null
 }
 
 function ActionButton({ title, danger = false, onClick, children }) {
@@ -454,7 +528,7 @@ function VentaSelectorModal({ proveedorId, tipoCompra, selectedVentas, onConfirm
             if (buscar.trim()) params.append('buscar', buscar.trim())
             return api.get(`/compras/ventas-pendientes?${params.toString()}`).then(response => response.data)
         },
-        enabled: Boolean(proveedorId) && tipoCompra !== 'STOCK/SERVICIO',
+        enabled: tipoCompra !== 'STOCK/SERVICIO',
         retry: false,
     })
 
@@ -471,62 +545,98 @@ function VentaSelectorModal({ proveedorId, tipoCompra, selectedVentas, onConfirm
 
     return (
         <Modal title="Seleccionar Ventas" onClose={onClose} maxWidth="1100px">
-            {!proveedorId ? (
-                <div className="empty-state" style={{ padding: '36px 20px' }}>
-                    <AlertCircle size={34} />
-                    <p>Selecciona primero un proveedor para importar items automaticamente.</p>
-                </div>
-            ) : (
-                <>
-                    <div className="card mb-16" style={{ padding: '14px 16px' }}>
-                        <div className="search-bar">
-                            <Search size={16} />
-                            <input placeholder="Buscar por codigo de venta o cliente..." value={buscar} onChange={event => setBuscar(event.target.value)} />
-                        </div>
+            <>
+                <div className="card mb-16" style={{ padding: '14px 16px', display: 'grid', gap: 10 }}>
+                    <div className="search-bar">
+                        <Search size={16} />
+                        <input placeholder="Buscar por codigo de venta o cliente..." value={buscar} onChange={event => setBuscar(event.target.value)} />
                     </div>
-                    <div className="card" style={{ padding: 0, marginBottom: 16 }}>
-                        {isLoading ? (
-                            <div className="flex-center" style={{ padding: 60 }}><div className="spinner" style={{ width: 30, height: 30 }} /></div>
-                        ) : ventas.length === 0 ? (
-                            <div className="empty-state" style={{ padding: '36px 20px' }}>
-                                <PackagePlus size={34} />
-                                <p>No hay ventas con items pendientes para importar.</p>
-                            </div>
-                        ) : (
-                            <div className="table-container" style={{ maxHeight: '70vh', minHeight: '420px', overflowY: 'auto' }}>
-                                <table>
-                                    <thead>
-                                        <tr><th></th><th>Venta</th><th>Cliente</th><th>Fecha</th><th>Estado</th><th>Items</th></tr>
-                                    </thead>
-                                    <tbody>
-                                        {ventas.map(venta => (
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem', lineHeight: 1.45 }}>
+                        Aqui eliges primero la venta que necesita compra. El proveedor actual sirve solo como referencia y despues puedes cambiarlo si compras en otro lado.
+                    </div>
+                    {!proveedorId && (
+                        <div style={{ background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.24)', borderRadius: 8, padding: '10px 14px', color: 'var(--text-secondary)', fontSize: '0.82rem' }}>
+                            Todavia no elegiste proveedor. Puedes importar la venta igual y definir el proveedor real despues.
+                        </div>
+                    )}
+                </div>
+                <div className="card" style={{ padding: 0, marginBottom: 16 }}>
+                    {isLoading ? (
+                        <div className="flex-center" style={{ padding: 60 }}><div className="spinner" style={{ width: 30, height: 30 }} /></div>
+                    ) : ventas.length === 0 ? (
+                        <div className="empty-state" style={{ padding: '36px 20px' }}>
+                            <PackagePlus size={34} />
+                            <p>No hay ventas con items pendientes para importar.</p>
+                        </div>
+                    ) : (
+                        <div className="table-container" style={{ maxHeight: '70vh', minHeight: '420px', overflowY: 'auto' }}>
+                            <table>
+                                <thead>
+                                    <tr><th></th><th>Venta</th><th>Cliente</th><th>Fecha</th><th>Estado</th><th>Prov. sugerido</th><th>Items</th></tr>
+                                </thead>
+                                <tbody>
+                                    {ventas.map(venta => {
+                                        const proveedores = getVentaSuggestedProviders(venta)
+                                        return (
                                             <tr key={venta.venta_id}>
                                                 <td><input type="checkbox" checked={selectedIds.has(venta.venta_id)} onChange={() => toggleVenta(venta.venta_id)} style={{ accentColor: 'var(--primary-light)' }} /></td>
                                                 <td style={{ fontWeight: 600 }}>{venta.venta_codigo}</td>
                                                 <td>{venta.cliente_nombre}</td>
                                                 <td style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>{fmtDate(venta.fecha)}</td>
                                                 <td>{estadoBadge(venta.estado_entrega || 'EN_LABORATORIO')}</td>
+                                                <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', whiteSpace: 'normal', lineHeight: 1.25, wordBreak: 'break-word' }}>
+                                                    {proveedores.length ? proveedores.map(proveedor => proveedor.proveedor_nombre).join(', ') : 'Sin sugerencia'}
+                                                </td>
                                                 <td>{venta.items_pendientes.length}</td>
                                             </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        )}
-                    </div>
-                    <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
-                        <button type="button" className="btn btn-secondary" onClick={onClose}>Cancelar</button>
-                        <button type="button" className="btn btn-primary" onClick={() => onConfirm(ventasSeleccionadas)} disabled={ventasSeleccionadas.length === 0}>
-                            <CheckSquare size={15} /> Importar Seleccion
-                        </button>
-                    </div>
-                </>
-            )}
+                                        )
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                </div>
+                <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
+                    <button type="button" className="btn btn-secondary" onClick={onClose}>Cancelar</button>
+                    <button type="button" className="btn btn-primary" onClick={() => onConfirm(ventasSeleccionadas)} disabled={ventasSeleccionadas.length === 0}>
+                        <CheckSquare size={15} /> Importar Seleccion
+                    </button>
+                </div>
+            </>
         </Modal>
     )
 }
 
-function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null }) {
+function CompraTipoSelectorModal({ onSelect, onClose }) {
+    return (
+        <Modal title="Nueva Compra" onClose={onClose} maxWidth="720px">
+            <div style={{ display: 'grid', gap: 14 }}>
+                <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem', lineHeight: 1.5 }}>
+                    Elige primero que tipo de compra vas a cargar. Asi el sistema abre el camino correcto y evita pasos innecesarios.
+                </div>
+                <div style={{ display: 'grid', gap: 12 }}>
+                    {COMPRA_FLOW_OPTIONS.map(option => (
+                        <button
+                            key={option.key}
+                            type="button"
+                            className="btn btn-secondary"
+                            onClick={() => onSelect(option)}
+                            style={{ justifyContent: 'flex-start', textAlign: 'left', padding: '14px 16px', display: 'grid', gap: 4 }}
+                        >
+                            <span style={{ fontWeight: 700 }}>{option.title}</span>
+                            <span style={{ color: 'var(--text-muted)', fontSize: '0.82rem', fontWeight: 400 }}>{option.description}</span>
+                        </button>
+                    ))}
+                </div>
+                <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
+                    <button type="button" className="btn btn-secondary" onClick={onClose}>Cancelar</button>
+                </div>
+            </div>
+        </Modal>
+    )
+}
+
+function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null, initialTipoCompra = 'ORIGINAL', startWithVentas = false }) {
     const queryClient = useQueryClient()
     const editando = Boolean(compraId)
     const [proveedor, setProveedor] = useState('')
@@ -534,13 +644,14 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null }) {
     const [nroFactura, setNroFactura] = useState('')
     const [condicionPago, setCondicionPago] = useState('CONTADO')
     const [fechaVencimiento, setFechaVencimiento] = useState('')
-    const [tipoCompra, setTipoCompra] = useState('ORIGINAL')
+    const [tipoCompra, setTipoCompra] = useState(initialTipoCompra)
     const [estadoEntrega, setEstadoEntrega] = useState('RECIBIDO')
     const [observaciones, setObservaciones] = useState('')
     const [ventasSeleccionadas, setVentasSeleccionadas] = useState([])
     const [items, setItems] = useState([createEmptyItem()])
     const [showVentasModal, setShowVentasModal] = useState(false)
     const [proveedorNombre, setProveedorNombre] = useState('')
+    const salesFlowInitializedRef = useRef(false)
 
     const { data: compraDetalle, isLoading: loadingCompra } = useQuery({
         queryKey: ['compra-detalle', compraId],
@@ -556,13 +667,19 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null }) {
         setTipoDocumento(compraDetalle.tipo_documento || 'FACTURA')
         setNroFactura(compraDetalle.nro_factura || '')
         setCondicionPago(compraDetalle.condicion_pago || 'CONTADO')
-        setFechaVencimiento(compraDetalle.fecha_vencimiento ? new Date(compraDetalle.fecha_vencimiento).toISOString().slice(0, 10) : '')
+        setFechaVencimiento(compraDetalle.fecha_vencimiento ? formatDateInputValue(compraDetalle.fecha_vencimiento) : '')
         setTipoCompra(compraDetalle.tipo_compra || 'ORIGINAL')
         setEstadoEntrega(compraDetalle.estado_entrega || 'RECIBIDO')
         setObservaciones(compraDetalle.observaciones || '')
         setVentasSeleccionadas(buildVentasResumen(compraDetalle))
         setItems(buildItemsFromCompra(compraDetalle))
     }, [compraDetalle])
+
+    useEffect(() => {
+        if (editando || salesFlowInitializedRef.current || !startWithVentas || initialTipoCompra === 'STOCK/SERVICIO') return
+        salesFlowInitializedRef.current = true
+        setShowVentasModal(true)
+    }, [editando, initialTipoCompra, startWithVentas])
 
     useEffect(() => {
         if (tipoCompra === 'STOCK/SERVICIO') {
@@ -610,19 +727,30 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null }) {
         const importados = buildImportedItems(ventas)
         setVentasSeleccionadas(ventas)
         setItems(importados.length ? [...manuales, ...importados] : (manuales.length ? manuales : [createEmptyItem()]))
+        const proveedorSugerido = getSuggestedProveedorFromVentas(ventas)
+        if (proveedorSugerido && !proveedor) {
+            setProveedor(String(proveedorSugerido.proveedor_id))
+            setProveedorNombre(proveedorSugerido.proveedor_nombre || '')
+        }
         setShowVentasModal(false)
     }
 
     const handleSubmit = event => {
         event.preventDefault()
+        const nroDoc = String(nroFactura || '').trim()
+        if (!nroDoc) {
+            window.alert('Debe cargar el número de documento de la compra (número de factura u orden de servicio).')
+            return
+        }
         const itemsValidos = items
             .filter(item => item.descripcion && (parseInt(item.cantidad, 10) || 0) > 0)
+            .map(item => recalcItem(item))
             .map(item => ({
                 descripcion: item.descripcion,
-                cantidad: parseInt(item.cantidad, 10) || 1,
-                costo_unitario: parseFloat(item.costo_unitario) || 0,
+                cantidad: item.cantidad,
+                costo_unitario: item.costo_unitario,
                 iva: parseInt(item.iva, 10) || 10,
-                descuento: parseFloat(item.descuento) || 0,
+                descuento: item.descuento || 0,
                 subtotal: item.subtotal || 0,
                 producto_id: item.producto_id || null,
                 presupuesto_item_id: item.presupuesto_item_id || null,
@@ -631,7 +759,7 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null }) {
         mutation.mutate({
             proveedor_id: proveedor ? parseInt(proveedor, 10) : null,
             tipo_documento: tipoDocumento,
-            nro_factura: nroFactura || null,
+            nro_factura: nroDoc,
             total,
             condicion_pago: condicionPago,
             fecha_vencimiento: condicionPago === 'CREDITO' && fechaVencimiento ? `${fechaVencimiento}T00:00:00` : null,
@@ -656,7 +784,7 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null }) {
                     <div className="form-group"><label className="form-label">Proveedor</label><RemoteProveedorSelect value={proveedor} proveedorNombre={proveedorNombre} onChange={(nextId, nextNombre) => { setProveedor(nextId); setProveedorNombre(nextNombre) }} /></div>
                     <div className="form-group"><label className="form-label">Tipo de Compra</label><select className="form-select" value={tipoCompra} onChange={event => setTipoCompra(event.target.value)}><option value="ORIGINAL">ORIGINAL</option><option value="GARANTIA">GARANTIA</option><option value="REEMPLAZO">REEMPLAZO</option><option value="STOCK/SERVICIO">STOCK/SERVICIO</option></select></div>
                     <div className="form-group"><label className="form-label">Tipo de Documento</label><select className="form-select" value={tipoDocumento} onChange={event => setTipoDocumento(event.target.value)}><option value="FACTURA">FACTURA</option><option value="ORDEN_SERVICIO">ORDEN_SERVICIO</option></select></div>
-                    <div className="form-group"><label className="form-label">{tipoDocumento === 'FACTURA' ? 'Nro. Factura' : 'Nro. Orden de Servicio'}</label><input className="form-input" value={nroFactura} onChange={event => setNroFactura(event.target.value)} /></div>
+                    <div className="form-group"><label className="form-label">{tipoDocumento === 'FACTURA' ? 'Nro. Factura' : 'Nro. Orden de Servicio'} <span style={{ color: '#f87171' }}>*</span></label><input className="form-input" value={nroFactura} onChange={event => setNroFactura(event.target.value)} required placeholder="Obligatorio" /></div>
                     <div className="form-group"><label className="form-label">Condicion de Pago</label><select className="form-select" value={condicionPago} onChange={event => setCondicionPago(event.target.value)}><option value="CONTADO">CONTADO</option><option value="CREDITO">CREDITO</option></select></div>
                     <div className="form-group"><label className="form-label">Estado de Entrega</label><select className="form-select" value={estadoEntrega} onChange={event => setEstadoEntrega(event.target.value)}><option value="RECIBIDO">RECIBIDO</option><option value="EN_LABORATORIO">EN_LABORATORIO</option><option value="ENTREGADO">ENTREGADO</option><option value="PENDIENTE_ENVIO">PENDIENTE_ENVIO</option></select></div>
                 </div>
@@ -667,8 +795,13 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null }) {
                             <div style={{ fontWeight: 700 }}>Ventas Asociadas</div>
                             <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>{ventasSeleccionadas.length ? ventasSeleccionadas.map(venta => venta.venta_codigo).join(', ') : 'Ninguna venta seleccionada.'}</div>
                             {clientesTexto && <div style={{ marginTop: 6, color: 'var(--text-secondary)', fontSize: '0.82rem' }}>Clientes: {clientesTexto}</div>}
+                            {!proveedor && ventasSeleccionadas.length > 0 && (
+                                <div style={{ marginTop: 6, color: 'var(--warning)', fontSize: '0.82rem' }}>
+                                    Aun falta definir el proveedor real de esta compra antes de guardar.
+                                </div>
+                            )}
                         </div>
-                        <button type="button" className="btn btn-secondary" onClick={() => setShowVentasModal(true)} disabled={tipoCompra === 'STOCK/SERVICIO'}><PackagePlus size={15} /> Seleccionar Ventas</button>
+                        <button type="button" className="btn btn-secondary" onClick={() => setShowVentasModal(true)} disabled={tipoCompra === 'STOCK/SERVICIO'}><PackagePlus size={15} /> {ventasSeleccionadas.length ? 'Cambiar Ventas' : 'Seleccionar Ventas'}</button>
                     </div>
                 </div>
                 <div style={{ marginBottom: 16 }}>
@@ -686,8 +819,24 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null }) {
                                             <CompraProductoSelect item={item} index={index} onUpdateItem={updateItemObject} />
                                         </td>
                                         <td><input type="number" min="1" className="form-input" style={{ width: 84, padding: '6px 8px' }} value={item.cantidad} onChange={event => updateItem(index, 'cantidad', event.target.value)} /></td>
-                                        <td><input type="number" min="0" className="form-input" style={{ width: 130, padding: '6px 8px' }} value={item.costo_unitario} onChange={event => updateItem(index, 'costo_unitario', event.target.value)} /></td>
-                                        <td><input type="number" min="0" className="form-input" style={{ width: 100, padding: '6px 8px' }} value={item.descuento} onChange={event => updateItem(index, 'descuento', event.target.value)} /></td>
+                                        <td><input
+                                            type="text"
+                                            inputMode="numeric"
+                                            className="form-input"
+                                            style={{ width: 130, padding: '6px 8px' }}
+                                            value={formatGsAmount(item.costo_unitario)}
+                                            onChange={event => updateItem(index, 'costo_unitario', normalizeGsInput(event.target.value).amount)}
+                                            onFocus={event => event.target.select()}
+                                        /></td>
+                                        <td><input
+                                            type="text"
+                                            inputMode="numeric"
+                                            className="form-input"
+                                            style={{ width: 100, padding: '6px 8px' }}
+                                            value={formatGsAmount(item.descuento)}
+                                            onChange={event => updateItem(index, 'descuento', normalizeGsInput(event.target.value).amount)}
+                                            onFocus={event => event.target.select()}
+                                        /></td>
                                         <td style={{ fontWeight: 700, color: 'var(--primary-light)' }}>Gs. {fmt(item.subtotal)}</td>
                                         <td style={{ color: 'var(--text-muted)', fontSize: '0.78rem' }}>{item.origen || (item.autoImportado ? 'IMPORTADO' : 'MANUAL')}</td>
                                         <td>{items.length > 1 && <ActionButton title="Quitar item" danger onClick={() => setItems(prev => prev.filter((_, currentIndex) => currentIndex !== index))}><X size={13} /></ActionButton>}</td>
@@ -709,10 +858,14 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null }) {
 
 function PagoCompraModal({ compra, onClose }) {
     const queryClient = useQueryClient()
-    const [monto, setMonto] = useState(compra.saldo || 0)
+    const [monto, setMonto] = useState(() => formatGsAmount(compra.saldo || 0))
     const [metodoPago, setMetodoPago] = useState('EFECTIVO')
     const [bancoId, setBancoId] = useState('')
     const [nroComprobante, setNroComprobante] = useState('')
+    const { data: jornadaEstado } = useFinancialJornadaStatus()
+    const jornadaAbierta = Boolean(jornadaEstado?.abierta)
+    const saldoPendiente = Math.max(0, Math.trunc(Number(compra?.saldo || 0)))
+    const montoPago = parseGsInput(monto)
 
     const { data: pagos = [], isLoading: pagosLoading } = useQuery({
         queryKey: ['compra-pagos', compra.id],
@@ -734,6 +887,7 @@ function PagoCompraModal({ compra, onClose }) {
             queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
             queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
             queryClient.invalidateQueries({ queryKey: ['bancos'] })
+            invalidateJornadaLiveData(queryClient)
             onClose()
         },
     })
@@ -746,13 +900,23 @@ function PagoCompraModal({ compra, onClose }) {
             queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
             queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
             queryClient.invalidateQueries({ queryKey: ['bancos'] })
+            invalidateJornadaLiveData(queryClient)
         },
     })
 
     const handleSubmit = event => {
         event.preventDefault()
+        if (!jornadaAbierta) return
+        if (montoPago <= 0) {
+            window.alert('Debes indicar un monto mayor a cero.')
+            return
+        }
+        if (montoPago > saldoPendiente) {
+            window.alert('El monto a pagar no puede superar el saldo pendiente de la compra.')
+            return
+        }
         registrarPago.mutate({
-            monto: parseFloat(monto) || 0,
+            monto: montoPago,
             metodo_pago: metodoPago,
             banco_id: metodoPago === 'EFECTIVO' ? null : (bancoId ? parseInt(bancoId, 10) : null),
             nro_comprobante: nroComprobante || null,
@@ -761,6 +925,7 @@ function PagoCompraModal({ compra, onClose }) {
 
     return (
         <form onSubmit={handleSubmit}>
+            <FinancialJornadaNotice compact />
             <div className="card mb-16" style={{ padding: '14px 16px' }}>
                 <div style={{ display: 'grid', gap: 6 }}>
                     <div style={{ fontWeight: 700 }}>{compra.proveedor_nombre || 'Sin proveedor'}</div>
@@ -792,7 +957,7 @@ function PagoCompraModal({ compra, onClose }) {
                                         <td style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>{pago.banco_nombre || '-'}</td>
                                         <td style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>{pago.nro_comprobante || '-'}</td>
                                         <td style={{ fontSize: '0.84rem', fontWeight: 700, color: 'var(--success)' }}>Gs. {fmt(pago.monto)}</td>
-                                        <td><button type="button" className="btn btn-danger btn-sm" onClick={() => { if (confirm('¿Eliminar este pago? Se revertirá en caja o banco.')) eliminarPago.mutate(pago.id) }} disabled={eliminarPago.isPending}>Eliminar</button></td>
+                                        <td><button type="button" className="btn btn-danger btn-sm" onClick={() => { if (confirm('¿Eliminar este pago? Se revertirá en caja o banco.')) eliminarPago.mutate(pago.id) }} disabled={eliminarPago.isPending || !jornadaAbierta}>Eliminar</button></td>
                                     </tr>
                                 ))}
                             </tbody>
@@ -802,14 +967,14 @@ function PagoCompraModal({ compra, onClose }) {
             </div>
 
             <div className="grid-2 mb-16">
-                <div className="form-group"><label className="form-label">Monto a Pagar</label><input type="number" min="0" max={compra.saldo || 0} step="0.01" className="form-input" value={monto} onChange={event => setMonto(event.target.value)} /></div>
-                <div className="form-group"><label className="form-label">Metodo de Pago</label><select className="form-select" value={metodoPago} onChange={event => setMetodoPago(event.target.value)}><option value="EFECTIVO">EFECTIVO</option><option value="TRANSFERENCIA">TRANSFERENCIA</option><option value="TARJETA">TARJETA</option><option value="CHEQUE">CHEQUE</option></select></div>
-                <div className="form-group"><label className="form-label">Banco</label><select className="form-select" value={bancoId} onChange={event => setBancoId(event.target.value)} disabled={metodoPago === 'EFECTIVO'}><option value="">Seleccionar banco</option>{bancos.map(banco => <option key={banco.id} value={banco.id}>{banco.nombre_banco}</option>)}</select></div>
-                <div className="form-group"><label className="form-label">Nro. Comprobante</label><input className="form-input" value={nroComprobante} onChange={event => setNroComprobante(event.target.value)} placeholder="Opcional" /></div>
+                <div className="form-group"><label className="form-label">Monto a Pagar</label><input type="text" inputMode="numeric" className="form-input" value={monto} onChange={event => setMonto(normalizeGsInput(event.target.value).formatted)} onFocus={event => event.target.select()} disabled={!jornadaAbierta || registrarPago.isPending} /><div style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: '0.76rem' }}>Sugerido: Gs. {fmt(saldoPendiente)}. No se permite pagar más que el saldo pendiente.</div></div>
+                <div className="form-group"><label className="form-label">Metodo de Pago</label><select className="form-select" value={metodoPago} onChange={event => setMetodoPago(event.target.value)} disabled={!jornadaAbierta || registrarPago.isPending}><option value="EFECTIVO">EFECTIVO</option><option value="TRANSFERENCIA">TRANSFERENCIA</option><option value="TARJETA">TARJETA</option><option value="CHEQUE">CHEQUE</option></select></div>
+                <div className="form-group"><label className="form-label">Banco</label><select className="form-select" value={bancoId} onChange={event => setBancoId(event.target.value)} disabled={!jornadaAbierta || metodoPago === 'EFECTIVO' || registrarPago.isPending}><option value="">Seleccionar banco</option>{bancos.map(banco => <option key={banco.id} value={banco.id}>{banco.nombre_banco}</option>)}</select></div>
+                <div className="form-group"><label className="form-label">Nro. Comprobante</label><input className="form-input" value={nroComprobante} onChange={event => setNroComprobante(event.target.value)} placeholder="Opcional" disabled={!jornadaAbierta || registrarPago.isPending} /></div>
             </div>
 
             {(registrarPago.isError || eliminarPago.isError) && <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: '0.82rem', color: '#f87171', display: 'flex', gap: 8 }}><AlertCircle size={16} /> {registrarPago.error?.response?.data?.detail || eliminarPago.error?.response?.data?.detail || 'Error al procesar el pago.'}</div>}
-            <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}><button type="button" className="btn btn-secondary" onClick={onClose}>Cancelar</button><button type="submit" className="btn btn-primary" disabled={registrarPago.isPending}>{registrarPago.isPending ? <span className="spinner" style={{ width: 16, height: 16 }} /> : <><Wallet size={15} /> Registrar Pago</>}</button></div>
+            <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}><button type="button" className="btn btn-secondary" onClick={onClose}>Cancelar</button><button type="submit" className="btn btn-primary" disabled={registrarPago.isPending || !jornadaAbierta}>{registrarPago.isPending ? <span className="spinner" style={{ width: 16, height: 16 }} /> : <><Wallet size={15} /> Registrar Pago</>}</button></div>
         </form>
     )
 }
@@ -953,7 +1118,9 @@ function CompraRowActions({ compra, onVer, onEditar, onEntrega, onPDF, onElimina
 
     const handleAction = callback => {
         setOpen(false)
-        callback()
+        window.setTimeout(() => {
+            callback()
+        }, 0)
     }
     const pdfBusy = pdfOpeningId === compra.id
     const deletingBusy = deletingId === compra.id
@@ -1050,6 +1217,8 @@ export default function ComprasPage() {
     const [buscarDebounced, setBuscarDebounced] = useState('')
     const [estadoFiltro, setEstadoFiltro] = useState('')
     const [showCreate, setShowCreate] = useState(false)
+    const [showCreateType, setShowCreateType] = useState(false)
+    const [createConfig, setCreateConfig] = useState(null)
     const [compraFormId, setCompraFormId] = useState(null)
     const [compraDetalle, setCompraDetalle] = useState(null)
     const [compraEntrega, setCompraEntrega] = useState(null)
@@ -1059,6 +1228,13 @@ export default function ComprasPage() {
     const [deletingId, setDeletingId] = useState(null)
     const [entregaProcessing, setEntregaProcessing] = useState(false)
     const [whatsappRetiro, setWhatsappRetiro] = useState(null)
+    const { data: whatsappTemplates = [] } = useWhatsappTemplatesCatalog()
+    const actualizarWhatsappTemplate = useActualizarWhatsappTemplate()
+
+    useEffect(() => {
+        const retiroTemplate = getWhatsappTemplateByCode(whatsappTemplates, RETIRO_TEMPLATE_CODE, DEFAULT_RETIRO_WHATSAPP_TEMPLATE)
+        localStorage.setItem(RETIRO_WHATSAPP_TEMPLATE_KEY, retiroTemplate)
+    }, [whatsappTemplates])
 
     useEffect(() => {
         const timer = setTimeout(() => setBuscarDebounced(buscar.trim()), 350)
@@ -1094,6 +1270,7 @@ export default function ComprasPage() {
             queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
             queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
             queryClient.invalidateQueries({ queryKey: ['bancos'] })
+            invalidateJornadaLiveData(queryClient)
         },
         onSettled: () => {
             setDeletingId(null)
@@ -1138,7 +1315,7 @@ export default function ComprasPage() {
                     </div>
                 </div>
                 {hasActionAccess(user, 'compras.crear', 'compras') && (
-                    <button className="btn btn-primary" onClick={() => setShowCreate(true)} style={{ flexShrink: 0 }}>
+                    <button className="btn btn-primary" onClick={() => setShowCreateType(true)} style={{ flexShrink: 0 }}>
                         <Plus size={16} /> Nueva Compra
                     </button>
                 )}
@@ -1292,7 +1469,26 @@ export default function ComprasPage() {
                 </div>
             </div>
 
-            {showCreate && <Modal title="Nueva Compra" onClose={() => setShowCreate(false)} maxWidth="1100px"><CompraFormModal onClose={() => setShowCreate(false)} onWhatsappReady={setWhatsappRetiro} /></Modal>}
+            {showCreateType && (
+                <CompraTipoSelectorModal
+                    onClose={() => setShowCreateType(false)}
+                    onSelect={option => {
+                        setCreateConfig(option)
+                        setShowCreateType(false)
+                        setShowCreate(true)
+                    }}
+                />
+            )}
+            {showCreate && (
+                <Modal title="Nueva Compra" onClose={() => setShowCreate(false)} maxWidth="1100px">
+                    <CompraFormModal
+                        onClose={() => setShowCreate(false)}
+                        onWhatsappReady={setWhatsappRetiro}
+                        initialTipoCompra={createConfig?.tipoCompra || 'ORIGINAL'}
+                        startWithVentas={Boolean(createConfig?.startWithVentas)}
+                    />
+                </Modal>
+            )}
             {compraFormId && <Modal title={`Editar Compra #${compraFormId}`} onClose={() => setCompraFormId(null)} maxWidth="1100px"><CompraFormModal compraId={compraFormId} onClose={() => setCompraFormId(null)} /></Modal>}
             {compraDetalle && <Modal title={`Detalle Compra #${compraDetalle.id}`} onClose={() => setCompraDetalle(null)} maxWidth="980px"><DetalleCompraModal compraId={compraDetalle.id} onClose={() => setCompraDetalle(null)} /></Modal>}
             {compraEntrega && (
@@ -1318,7 +1514,17 @@ export default function ComprasPage() {
                     onClose={() => setWhatsappRetiro(null)}
                     maxWidth="680px"
                 >
-                    <WhatsappRetiroModal context={whatsappRetiro} onClose={() => setWhatsappRetiro(null)} />
+                    <WhatsappRetiroModal
+                        context={whatsappRetiro}
+                        onClose={() => setWhatsappRetiro(null)}
+                        guardandoPlantilla={actualizarWhatsappTemplate.isPending}
+                        onGuardarPlantilla={plantilla => {
+                            actualizarWhatsappTemplate.mutate({
+                                codigo: RETIRO_TEMPLATE_CODE,
+                                payload: { plantilla, activo: true },
+                            })
+                        }}
+                    />
                 </Modal>
             )}
         </div>

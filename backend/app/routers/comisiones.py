@@ -9,6 +9,7 @@ from app.middleware.tenant import get_tenant_slug
 from app.models.models import Banco, Comision, ConfiguracionCaja, MovimientoBanco, MovimientoCaja, Venta
 from app.schemas.schemas import ComisionOut, ComisionPagoCreate
 from app.utils.auth import get_current_user, require_roles
+from app.utils.jornada import ahora_negocio, require_jornada_abierta, require_jornada_abierta_para_fecha
 
 router = APIRouter(prefix="/api/comisiones", tags=["Comisiones"])
 
@@ -25,12 +26,22 @@ def _query_comision_detallada(session, comision_id: int):
     )
 
 
-def _serializar_comision(comision: Comision) -> ComisionOut:
+def _serializar_comision(session, comision: Comision) -> ComisionOut:
     venta = comision.venta_rel
     cliente = venta.cliente_rel if venta else None
+    fecha_pago = None
+
+    if comision.movimiento_caja_id:
+        movimiento_caja = session.query(MovimientoCaja).filter(MovimientoCaja.id == comision.movimiento_caja_id).first()
+        fecha_pago = movimiento_caja.fecha if movimiento_caja else None
+    elif comision.movimiento_banco_id:
+        movimiento_banco = session.query(MovimientoBanco).filter(MovimientoBanco.id == comision.movimiento_banco_id).first()
+        fecha_pago = movimiento_banco.fecha if movimiento_banco else None
+
     return ComisionOut(
         id=comision.id,
         fecha=comision.fecha,
+        fecha_pago=fecha_pago,
         referidor_id=comision.referidor_id,
         referidor_nombre=comision.referidor_rel.nombre if comision.referidor_rel else None,
         venta_id=comision.venta_id,
@@ -54,6 +65,7 @@ def _obtener_o_crear_caja(session):
 
 
 def _revertir_movimientos_comision(session, comision: Comision):
+    require_jornada_abierta(session)
     movimiento_banco_id = comision.movimiento_banco_id
     movimiento_caja_id = comision.movimiento_caja_id
 
@@ -113,7 +125,7 @@ def listar_comisiones(
             query = query.filter(Comision.estado == estado.upper())
 
         comisiones = query.order_by(Comision.fecha.desc(), Comision.id.desc()).all()
-        return [_serializar_comision(comision) for comision in comisiones]
+        return [_serializar_comision(session, comision) for comision in comisiones]
     finally:
         session.close()
 
@@ -129,7 +141,7 @@ def obtener_comision(
         comision = _query_comision_detallada(session, comision_id)
         if not comision:
             raise HTTPException(status_code=404, detail="Comision no encontrada.")
-        return _serializar_comision(comision)
+        return _serializar_comision(session, comision)
     finally:
         session.close()
 
@@ -148,6 +160,12 @@ def pagar_comision(
             raise HTTPException(status_code=404, detail="Comision no encontrada.")
         if (comision.estado or "PENDIENTE") == "PAGADO":
             raise HTTPException(status_code=422, detail="La comision ya esta pagada.")
+
+        if data.fecha_pago:
+            fecha_mov = datetime.combine(data.fecha_pago, datetime.now().time()).replace(microsecond=0)
+        else:
+            fecha_mov = ahora_negocio(session)
+        jornada = require_jornada_abierta_para_fecha(session, fecha_mov, accion="registrar un pago de comision")
 
         metodo_pago = data.metodo_pago
         banco = None
@@ -172,12 +190,13 @@ def pagar_comision(
             saldo_anterior = caja.saldo_actual or 0.0
             caja.saldo_actual = saldo_anterior - float(comision.monto or 0)
             movimiento = MovimientoCaja(
-                fecha=datetime.now(),
+                fecha=fecha_mov,
                 tipo="EGRESO",
                 monto=float(comision.monto or 0),
                 concepto=f"PAGO COMISION - {referidor} (Venta: {venta_codigo})",
                 saldo_anterior=saldo_anterior,
                 saldo_nuevo=caja.saldo_actual,
+                jornada_id=jornada.id,
             )
             session.add(movimiento)
             session.flush()
@@ -187,12 +206,13 @@ def pagar_comision(
             banco.saldo_actual = saldo_anterior - float(comision.monto or 0)
             movimiento = MovimientoBanco(
                 banco_id=banco.id,
-                fecha=datetime.now(),
+                fecha=fecha_mov,
                 tipo="EGRESO",
                 monto=float(comision.monto or 0),
                 concepto=f"PAGO COMISION - {referidor} - {metodo_pago} {data.numero_referencia or ''}".strip(),
                 saldo_anterior=saldo_anterior,
                 saldo_nuevo=banco.saldo_actual,
+                jornada_id=jornada.id,
             )
             session.add(movimiento)
             session.flush()
@@ -200,7 +220,7 @@ def pagar_comision(
 
         session.commit()
         session.refresh(comision)
-        return _serializar_comision(comision)
+        return _serializar_comision(session, comision)
     except HTTPException:
         session.rollback()
         raise
@@ -228,7 +248,7 @@ def volver_comision_pendiente(
 
         session.commit()
         session.refresh(comision)
-        return _serializar_comision(comision)
+        return _serializar_comision(session, comision)
     except HTTPException:
         session.rollback()
         raise

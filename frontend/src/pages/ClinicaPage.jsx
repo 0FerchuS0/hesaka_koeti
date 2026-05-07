@@ -20,6 +20,9 @@ import Modal from '../components/Modal'
 import RemoteSearchSelect from '../components/RemoteSearchSelect'
 import { api, useAuth } from '../context/AuthContext'
 import { hasActionAccess } from '../utils/roles'
+import usePendingNavigationGuard from '../utils/usePendingNavigationGuard'
+import { getWhatsappTemplateByCode, useActualizarWhatsappTemplate, useWhatsappTemplatesCatalog } from '../hooks/useWhatsappTemplates'
+import { nowBusinessDateTimeLocalValue, todayBusinessInputValue } from '../utils/formatters'
 
 const CLINICA_PALETTE = {
     accent: '#1dd3c7',
@@ -41,7 +44,8 @@ const CLINICA_TABS = [
 ]
 
 const WHATSAPP_TEMPLATE_KEY = 'hesaka-clinica-whatsapp-template'
-const DEFAULT_WHATSAPP_TEMPLATE = 'Hola {paciente}, te escribimos de HESAKA. Tu ultima consulta fue el {ultima_consulta} y tu proximo control esta previsto para el {proxima_consulta}. Quedamos atentos para ayudarte a confirmar tu cita.'
+const DEFAULT_WHATSAPP_TEMPLATE = 'Hola {paciente}, te escribimos de {empresa}. Te recordamos tu turno para el {proxima_consulta} a las {hora_turno}. Te esperamos. Si no podras asistir, por favor avisanos para reprogramar.'
+const CLINICA_TEMPLATE_CODE = 'clinica_recordatorio_turno'
 
 function formatError(error, fallback = 'Ocurrio un error.') {
     const detail = error?.response?.data?.detail
@@ -54,27 +58,78 @@ function formatError(error, fallback = 'Ocurrio un error.') {
     return fallback
 }
 
+function parseBackendDateTime(value) {
+    if (!value) return null
+    if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value
+
+    const raw = String(value).trim()
+    const localMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2})(?::(\d{2}))?)?$/)
+    if (localMatch) {
+        const [, y, m, d, hh = '00', mm = '00', ss = '00'] = localMatch
+        const localDate = new Date(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm), Number(ss), 0)
+        return Number.isNaN(localDate.getTime()) ? null : localDate
+    }
+
+    const parsed = new Date(raw)
+    return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
 function fmtDate(value) {
     if (!value) return '-'
-    const date = new Date(value)
-    if (Number.isNaN(date.getTime())) return '-'
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return '-'
     return date.toLocaleDateString('es-PY')
 }
 
 function fmtDateTime(value) {
     if (!value) return '-'
-    const date = new Date(value)
-    if (Number.isNaN(date.getTime())) return '-'
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return '-'
     return date.toLocaleString('es-PY')
 }
 
+function fmtTime(value) {
+    if (!value) return 'sin hora'
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return 'sin hora'
+    return date.toLocaleTimeString('es-PY', { hour: '2-digit', minute: '2-digit' })
+}
+
 function formatDateInputValue(value) {
-    const date = value instanceof Date ? value : new Date(value)
-    if (Number.isNaN(date.getTime())) return ''
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return ''
     const year = date.getFullYear()
     const month = String(date.getMonth() + 1).padStart(2, '0')
     const day = String(date.getDate()).padStart(2, '0')
     return `${year}-${month}-${day}`
+}
+
+function formatDateTimeLocalValue(value) {
+    if (!value) return ''
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return ''
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    const hours = String(date.getHours()).padStart(2, '0')
+    const minutes = String(date.getMinutes()).padStart(2, '0')
+    return `${year}-${month}-${day}T${hours}:${minutes}`
+}
+
+function serializeDateTimeLocalValue(value, originalValue = null, originalLocalValue = '') {
+    if (!value) return null
+    if (originalValue && originalLocalValue && value === originalLocalValue) {
+        return originalValue
+    }
+    const [datePart, timePart = '00:00'] = String(value).split('T')
+    const [year, month, day] = datePart.split('-').map(Number)
+    const [hours, minutes] = timePart.split(':').map(Number)
+    if (!year || !month || !day) return originalValue || null
+    const localDate = new Date(year, month - 1, day, hours || 0, minutes || 0, 0, 0)
+    if (Number.isNaN(localDate.getTime())) return originalValue || null
+    const hh = String(hours || 0).padStart(2, '0')
+    const min = String(minutes || 0).padStart(2, '0')
+    return `${datePart}T${hh}:${min}:00`
 }
 
 function parseDateInputValue(value) {
@@ -85,7 +140,7 @@ function parseDateInputValue(value) {
 }
 
 function addMonthsToDateInput(baseValue, months) {
-    const baseDate = parseDateInputValue(baseValue) || new Date()
+    const baseDate = parseDateInputValue(baseValue) || parseDateInputValue(todayBusinessInputValue())
     const next = new Date(baseDate)
     next.setMonth(next.getMonth() + months)
     return formatDateInputValue(next)
@@ -111,7 +166,15 @@ function normalizarTelefonoWhatsapp(value) {
         return `595${digits.slice(1)}`
     }
 
+    if (digits.startsWith('0') && digits.length >= 7 && digits.length <= 11) {
+        return `595${digits.slice(1)}`
+    }
+
     if (digits.startsWith('9') && digits.length === 9) {
+        return `595${digits}`
+    }
+
+    if (digits.startsWith('9') && digits.length >= 8 && digits.length <= 10) {
         return `595${digits}`
     }
 
@@ -119,7 +182,11 @@ function normalizarTelefonoWhatsapp(value) {
         return digits
     }
 
-    return digits.startsWith('595') ? digits : ''
+    return digits.startsWith('595') && digits.length >= 10 ? digits : ''
+}
+
+function getTurnoTelefono(item) {
+    return item?.paciente_telefono || item?.paciente_telefono_libre || ''
 }
 
 function getWhatsappTemplate() {
@@ -127,30 +194,79 @@ function getWhatsappTemplate() {
     return localStorage.getItem(WHATSAPP_TEMPLATE_KEY) || DEFAULT_WHATSAPP_TEMPLATE
 }
 
-function buildWhatsappMessage(item, template = DEFAULT_WHATSAPP_TEMPLATE) {
-    const ultimaConsulta = item?.ultima_consulta_fecha ? fmtDate(item.ultima_consulta_fecha) : 'sin registro'
-    const proximaConsulta = item?.fecha_hora ? fmtDate(item.fecha_hora) : 'sin fecha'
-    return (template || DEFAULT_WHATSAPP_TEMPLATE)
-        .replaceAll('{paciente}', item?.paciente_nombre || '')
-        .replaceAll('{ultima_consulta}', ultimaConsulta)
-        .replaceAll('{proxima_consulta}', proximaConsulta)
-        .replaceAll('{empresa}', 'HESAKA')
+function applyWhatsappTemplate(template, replacements) {
+    return Object.entries(replacements).reduce(
+        (result, [placeholder, value]) => result.replaceAll(placeholder, value ?? ''),
+        template || '',
+    )
 }
 
-function buildReminderWhatsappLink(item, message = '') {
-    const telefono = normalizarTelefonoWhatsapp(item?.paciente_telefono)
+function buildWhatsappMessage(item, template = DEFAULT_WHATSAPP_TEMPLATE, empresa = 'HESAKA') {
+    const ultimaConsulta = item?.ultima_consulta_fecha ? fmtDate(item.ultima_consulta_fecha) : 'sin registro'
+    const proximaConsulta = item?.fecha_hora ? fmtDate(item.fecha_hora) : 'sin fecha'
+    const horaTurno = fmtTime(item?.fecha_hora)
+    return applyWhatsappTemplate(template || DEFAULT_WHATSAPP_TEMPLATE, {
+        '{paciente}': item?.paciente_nombre || '',
+        '{ultima_consulta}': ultimaConsulta,
+        '{proxima_consulta}': proximaConsulta,
+        '{hora_turno}': horaTurno,
+        '{empresa}': empresa,
+    })
+}
+
+function buildReminderWhatsappLink(item, message = '', empresa = 'HESAKA', telefonoValue = null) {
+    const telefono = normalizarTelefonoWhatsapp(telefonoValue ?? getTurnoTelefono(item))
     if (!telefono) return ''
-    const finalMessage = message || buildWhatsappMessage(item, getWhatsappTemplate())
+    const finalMessage = buildWhatsappMessage(item, message || getWhatsappTemplate(), empresa)
     return `https://wa.me/${telefono}?text=${encodeURIComponent(finalMessage)}`
 }
 
-function buildTemplateFromMessage(message, item) {
+function buildAgendaConsultaDraft(turno) {
+    if (!turno) return null
+    return {
+        fecha: turno.fecha_hora || null,
+        doctor_id: turno.doctor_id || '',
+        lugar_atencion_id: turno.lugar_atencion_id || '',
+        motivo: turno.motivo || '',
+    }
+}
+
+function buildAgendaConsultaState(turno, patientOverride = null) {
+    const selectedPatient = patientOverride || (turno?.paciente_id ? {
+        id: turno.paciente_id,
+        nombre_completo: turno.paciente_nombre,
+        ci_pasaporte: turno.paciente_ci || null,
+        telefono: turno.paciente_telefono || turno.paciente_telefono_libre || null,
+        referidor_nombre: turno.referidor_nombre || null,
+        edad_calculada: turno.edad_calculada ?? null,
+        edad_manual: turno.edad_manual ?? null,
+        es_cliente: turno.es_cliente ?? false,
+    } : null)
+    if (!selectedPatient?.id) return null
+    return {
+        selectedPatient,
+        autoOpenConsulta: true,
+        agendaTurnoId: turno?.id || null,
+        initialConsultaData: buildAgendaConsultaDraft(turno),
+    }
+}
+
+function buildAgendaPacienteInitialData(turno) {
+    return {
+        nombre_completo: turno?.paciente_nombre || turno?.paciente_nombre_libre || '',
+        telefono: turno?.paciente_telefono || turno?.paciente_telefono_libre || '',
+        notas: turno?.notas || '',
+    }
+}
+
+function buildTemplateFromMessage(message, item, empresa = 'HESAKA') {
     let template = message || ''
     const replacements = [
         [item?.paciente_nombre || '', '{paciente}'],
         [item?.ultima_consulta_fecha ? fmtDate(item.ultima_consulta_fecha) : 'sin registro', '{ultima_consulta}'],
         [item?.fecha_hora ? fmtDate(item.fecha_hora) : 'sin fecha', '{proxima_consulta}'],
-        ['HESAKA', '{empresa}'],
+        [fmtTime(item?.fecha_hora), '{hora_turno}'],
+        [empresa, '{empresa}'],
     ]
     replacements.forEach(([value, placeholder]) => {
         if (!value) return
@@ -161,15 +277,14 @@ function buildTemplateFromMessage(message, item) {
 
 function getDailyReminderStorageKey(user) {
     const userKey = user?.id || user?.email || user?.nombre || 'anon'
-    const dayKey = formatDateInputValue(new Date())
+    const dayKey = todayBusinessInputValue()
     return `hesaka-recordatorios-vistos-${userKey}-${dayKey}`
 }
 
 function flattenReminderBuckets(reminderBuckets) {
     return [
         ...(reminderBuckets?.hoy || []),
-        ...(reminderBuckets?.ocho_dias || []),
-        ...(reminderBuckets?.quince_dias || []),
+        ...(reminderBuckets?.tres_dias || []),
     ]
 }
 
@@ -200,8 +315,8 @@ function ReminderCards({ items, onMarkRemembered, onOpenWhatsappEditor = null, a
                                     </div>
                                 ) : null}
                             </div>
-                            <span className={`badge ${item.recordatorio_categoria === 'hoy' ? 'badge-red' : item.recordatorio_categoria === '8_dias' ? 'badge-yellow' : 'badge-blue'}`}>
-                                {item.recordatorio_categoria === 'hoy' ? 'Hoy' : item.recordatorio_categoria === '8_dias' ? '8 dias' : '15 dias'}
+                            <span className={`badge ${item.recordatorio_categoria === 'hoy' ? 'badge-red' : 'badge-yellow'}`}>
+                                {item.recordatorio_categoria === 'hoy' ? 'Hoy' : '3 dias'}
                             </span>
                         </div>
                         <div className="flex gap-12" style={{ marginTop: 12, flexWrap: 'wrap' }}>
@@ -215,19 +330,19 @@ function ReminderCards({ items, onMarkRemembered, onOpenWhatsappEditor = null, a
                             </button>
                             <button
                                 type="button"
-                                className={`btn btn-secondary btn-sm ${!whatsappLink ? 'disabled' : ''}`}
+                                className="btn btn-secondary btn-sm"
                                 onClick={() => {
-                                    if (!whatsappLink) {
-                                        window.alert('Este paciente no tiene telefono cargado para abrir WhatsApp.')
-                                        return
-                                    }
                                     if (onOpenWhatsappEditor) {
                                         onOpenWhatsappEditor(item)
                                         return
                                     }
+                                    if (!whatsappLink) {
+                                        window.alert('Carga un telefono valido para abrir WhatsApp.')
+                                        return
+                                    }
                                     window.open(whatsappLink, '_blank', 'noopener,noreferrer')
                                 }}
-                                style={!whatsappLink ? { pointerEvents: 'auto', opacity: 0.6 } : undefined}
+                                title={whatsappLink ? 'Enviar recordatorio por WhatsApp' : 'Completar telefono para WhatsApp'}
                             >
                                 <MessageCircle size={14} /> WhatsApp
                             </button>
@@ -275,6 +390,21 @@ function buildAnamnesisSummary(anamnesis) {
     if (symptoms.length) parts.push(`SINTOMAS: ${symptoms.join(', ')}`)
     if (anamnesis.antecedentes_familiares) parts.push(`ANTECEDENTES: ${anamnesis.antecedentes_familiares}`)
     if (anamnesis.medicamentos) parts.push(`MEDICAMENTOS: ${anamnesis.medicamentos}`)
+    const graduacionAnteriorOd = [
+        anamnesis.graduacion_anterior_od_esfera,
+        anamnesis.graduacion_anterior_od_cilindro,
+        anamnesis.graduacion_anterior_od_eje,
+        anamnesis.graduacion_anterior_od_adicion,
+    ].filter(Boolean).join(' / ')
+    const graduacionAnteriorOi = [
+        anamnesis.graduacion_anterior_oi_esfera,
+        anamnesis.graduacion_anterior_oi_cilindro,
+        anamnesis.graduacion_anterior_oi_eje,
+        anamnesis.graduacion_anterior_oi_adicion,
+    ].filter(Boolean).join(' / ')
+    if (graduacionAnteriorOd || graduacionAnteriorOi) {
+        parts.push(`GRAD. ANT.: OD ${graduacionAnteriorOd || '-'} | OI ${graduacionAnteriorOi || '-'}`)
+    }
     return parts.join(' | ')
 }
 
@@ -307,6 +437,14 @@ function createEmptyAnamnesisDraft() {
         antecedentes_familiares: '',
         usa_anteojos: false,
         proposito_anteojos: '',
+        graduacion_anterior_od_esfera: '',
+        graduacion_anterior_od_cilindro: '',
+        graduacion_anterior_od_eje: '',
+        graduacion_anterior_od_adicion: '',
+        graduacion_anterior_oi_esfera: '',
+        graduacion_anterior_oi_cilindro: '',
+        graduacion_anterior_oi_eje: '',
+        graduacion_anterior_oi_adicion: '',
         usa_lentes_contacto: false,
         tipo_lentes_contacto: '',
         horas_uso_lc: '',
@@ -584,7 +722,9 @@ function TurnoAgendaActions({
 
     const handleAction = callback => {
         setOpen(false)
-        callback()
+        window.setTimeout(() => {
+            callback()
+        }, 0)
     }
 
     const toggleMenu = () => {
@@ -657,10 +797,6 @@ function TurnoAgendaActions({
                             Reprogramar
                         </button>
                         <button className="dropdown-item" onClick={() => handleAction(() => {
-                            if (!whatsappLink) {
-                                window.alert('Este paciente no tiene telefono cargado para abrir WhatsApp.')
-                                return
-                            }
                             onWhatsapp()
                         })}>
                             <MessageCircle size={14} style={{ marginRight: 8 }} /> WhatsApp
@@ -677,16 +813,39 @@ function TurnoAgendaActions({
 }
 
 function WhatsappMessageModal({ item, onClose }) {
-    const [message, setMessage] = useState(() => buildWhatsappMessage(item, getWhatsappTemplate()))
+    const { data: configPublica } = useQuery({
+        queryKey: ['configuracion-general-publica'],
+        queryFn: () => api.get('/configuracion-general/publica').then(response => response.data),
+        retry: false,
+    })
+    const empresaNombre = (configPublica?.nombre || '').trim() || 'HESAKA'
+    const actualizarWhatsappTemplate = useActualizarWhatsappTemplate()
+    const [telefono, setTelefono] = useState(() => getTurnoTelefono(item))
+    const [message, setMessage] = useState(() => buildWhatsappMessage(item, getWhatsappTemplate(), empresaNombre))
 
-    const whatsappLink = buildReminderWhatsappLink(item, message)
+    const telefonoNormalizado = normalizarTelefonoWhatsapp(telefono)
+    const whatsappLink = buildReminderWhatsappLink(item, message, empresaNombre, telefono)
+
+    useEffect(() => {
+        setTelefono(getTurnoTelefono(item))
+        setMessage(buildWhatsappMessage(item, getWhatsappTemplate(), empresaNombre))
+    }, [item, empresaNombre])
 
     const restoreSuggested = () => {
-        setMessage(buildWhatsappMessage(item, DEFAULT_WHATSAPP_TEMPLATE))
+        setMessage(buildWhatsappMessage(item, DEFAULT_WHATSAPP_TEMPLATE, empresaNombre))
     }
 
-    const saveAsTemplate = () => {
-        const template = buildTemplateFromMessage(message, item)
+    const saveAsTemplate = async () => {
+        const template = buildTemplateFromMessage(message, item, empresaNombre)
+        try {
+            await actualizarWhatsappTemplate.mutateAsync({
+                codigo: CLINICA_TEMPLATE_CODE,
+                payload: { plantilla: template, activo: true },
+            })
+        } catch {
+            window.alert('No se pudo guardar la plantilla en el catálogo. Verifica permisos de administrador.')
+            return
+        }
         localStorage.setItem(WHATSAPP_TEMPLATE_KEY, template)
         window.alert('Plantilla de WhatsApp guardada correctamente.')
     }
@@ -697,7 +856,7 @@ function WhatsappMessageModal({ item, onClose }) {
                 <div style={{ color: 'var(--text-muted)', fontSize: '0.92rem' }}>
                     Puedes editar el texto antes de abrir WhatsApp. Variables automáticas disponibles en la plantilla:
                     {' '}
-                    <code>{'{paciente}'}</code>, <code>{'{ultima_consulta}'}</code>, <code>{'{proxima_consulta}'}</code>, <code>{'{empresa}'}</code>.
+                    <code>{'{paciente}'}</code>, <code>{'{ultima_consulta}'}</code>, <code>{'{proxima_consulta}'}</code>, <code>{'{hora_turno}'}</code>, <code>{'{empresa}'}</code>.
                 </div>
                 <div className="card" style={{ padding: 14, background: 'rgba(255,255,255,0.02)' }}>
                     <div style={{ fontWeight: 700 }}>{item?.paciente_nombre || 'Sin paciente'}</div>
@@ -706,6 +865,18 @@ function WhatsappMessageModal({ item, onClose }) {
                     </div>
                     <div style={{ marginTop: 4, color: 'var(--text-muted)', fontSize: '0.9rem' }}>
                         Proxima consulta: {fmtDateTime(item?.fecha_hora)}
+                    </div>
+                </div>
+                <div className="form-group" style={{ marginBottom: 0 }}>
+                    <label className="form-label">Telefono WhatsApp</label>
+                    <input
+                        className="form-input"
+                        value={telefono}
+                        onChange={event => setTelefono(event.target.value)}
+                        placeholder="Ej.: 0981 123 456"
+                    />
+                    <div style={{ marginTop: 8, color: telefonoNormalizado ? 'var(--text-muted)' : '#f87171', fontSize: '0.82rem' }}>
+                        {telefonoNormalizado ? `Se abrira como +${telefonoNormalizado}.` : 'Carga un numero valido. Ej.: 0981 123 456 o +595981123456.'}
                     </div>
                 </div>
                 <div className="form-group">
@@ -723,8 +894,8 @@ function WhatsappMessageModal({ item, onClose }) {
                     <button type="button" className="btn btn-secondary" onClick={restoreSuggested}>
                         Restaurar sugerido
                     </button>
-                    <button type="button" className="btn btn-secondary" onClick={saveAsTemplate}>
-                        Guardar como plantilla
+                    <button type="button" className="btn btn-secondary" onClick={saveAsTemplate} disabled={actualizarWhatsappTemplate.isPending}>
+                        {actualizarWhatsappTemplate.isPending ? 'Guardando...' : 'Guardar como plantilla'}
                     </button>
                 </div>
                 <div className="modal-actions">
@@ -732,9 +903,10 @@ function WhatsappMessageModal({ item, onClose }) {
                     <button
                         type="button"
                         className="btn btn-primary"
+                        disabled={!whatsappLink}
                         onClick={() => {
                             if (!whatsappLink) {
-                                window.alert('Este paciente no tiene telefono cargado para abrir WhatsApp.')
+                                window.alert('Carga un telefono valido para abrir WhatsApp.')
                                 return
                             }
                             window.open(whatsappLink, '_blank', 'noopener,noreferrer')
@@ -773,41 +945,44 @@ function SectionHeader({ title, subtitle, actions }) {
 }
 
 function ClinicaShell({ currentKey, onNavigate, children }) {
+    const currentTab = CLINICA_TABS.find(tab => tab.key === currentKey) || CLINICA_TABS[0]
     return (
         <div className="page-body" style={{ minWidth: 0 }}>
             <div
                 className="card"
                 style={{
-                    padding: 28,
+                    padding: '22px 28px',
                     background: CLINICA_PALETTE.panel,
                     border: `1px solid ${CLINICA_PALETTE.accentBorder}`,
                     boxShadow: '0 20px 50px rgba(0,0,0,0.18)',
                 }}
             >
-                <div style={{ width: 56, height: 56, borderRadius: 18, display: 'grid', placeItems: 'center', background: CLINICA_PALETTE.accentSoft, border: `1px solid ${CLINICA_PALETTE.accentBorder}`, color: CLINICA_PALETTE.accent, marginBottom: 16 }}>
-                    <Stethoscope size={28} />
-                </div>
-                <h1 style={{ fontSize: '2rem', marginBottom: 10 }}>Modulo Clinico</h1>
-                <p style={{ color: 'var(--text-muted)', maxWidth: 760, marginBottom: 20 }}>
-                    Dashboard propio para la operacion clinica, con una paleta mas sanitaria y un flujo separado del administrativo.
-                </p>
-                <div className="flex gap-12" style={{ flexWrap: 'wrap' }}>
-                    {CLINICA_TABS.map(tab => {
-                        const Icon = tab.icon
-                        const active = tab.key === currentKey
-                        return (
-                            <button
-                                key={tab.key}
-                                type="button"
-                                className={active ? 'btn btn-primary' : 'btn btn-secondary'}
-                                onClick={() => onNavigate(tab.path)}
-                                style={active ? { background: CLINICA_PALETTE.accentSoft, color: '#b6fff9', border: `1px solid ${CLINICA_PALETTE.accentBorder}` } : {}}
-                            >
-                                <Icon size={16} />
-                                {tab.label}
-                            </button>
-                        )
-                    })}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 16, minWidth: 0 }}>
+                        <div style={{ width: 52, height: 52, borderRadius: 16, display: 'grid', placeItems: 'center', background: CLINICA_PALETTE.accentSoft, border: `1px solid ${CLINICA_PALETTE.accentBorder}`, color: CLINICA_PALETTE.accent, flexShrink: 0 }}>
+                            <Stethoscope size={26} />
+                        </div>
+                        <div style={{ minWidth: 0 }}>
+                            <h1 style={{ fontSize: '1.75rem', marginBottom: 6 }}>Modulo Clinico</h1>
+                            <p style={{ color: 'var(--text-muted)', marginBottom: 0 }}>
+                                Gestion clinica separada del administrativo, con foco en agenda, consultas e historial.
+                            </p>
+                        </div>
+                    </div>
+                    <div
+                        style={{
+                            padding: '8px 12px',
+                            borderRadius: 999,
+                            background: CLINICA_PALETTE.accentSoft,
+                            border: `1px solid ${CLINICA_PALETTE.accentBorder}`,
+                            color: '#b6fff9',
+                            fontSize: '0.84rem',
+                            fontWeight: 700,
+                            whiteSpace: 'nowrap',
+                        }}
+                    >
+                        Seccion actual: {currentTab.label}
+                    </div>
                 </div>
             </div>
             {children}
@@ -956,7 +1131,7 @@ function DashboardClinicoSection() {
                                     <div>
                                         <div style={{ fontWeight: 700, color: '#38bdf8' }}>Recordatorios clinicos pendientes</div>
                                         <div style={{ marginTop: 6, color: 'var(--text-muted)' }}>
-                                            Tienes {reminderItems.length} recordatorio(s) pendientes entre hoy, 8 dias y 15 dias.
+                                            Tienes {reminderItems.length} recordatorio(s) pendientes entre hoy y 3 dias para la agenda clinica.
                                         </div>
                                     </div>
                                     <button type="button" className="btn btn-secondary btn-sm" onClick={() => setShowReminderModal(true)}>
@@ -1006,12 +1181,14 @@ function TurnoClinicoForm({
                 id: initialData.paciente_id,
                 nombre_completo: initialData.paciente_nombre,
                 ci_pasaporte: initialData.paciente_ci,
+                telefono: initialData.paciente_telefono,
             }
             : null,
         paciente_nombre_libre: initialData?.paciente_nombre_libre || (!initialData?.paciente_id ? initialData?.paciente_nombre || '' : ''),
+        paciente_telefono_libre: initialData?.paciente_telefono_libre || (!initialData?.paciente_id ? initialData?.paciente_telefono || '' : ''),
         doctor_id: initialData?.doctor_id || '',
         lugar_atencion_id: initialData?.lugar_atencion_id || '',
-        fecha_hora: initialData?.fecha_hora ? String(initialData.fecha_hora).slice(0, 16) : new Date().toISOString().slice(0, 16),
+        fecha_hora: initialData?.fecha_hora ? formatDateTimeLocalValue(initialData.fecha_hora) : nowBusinessDateTimeLocalValue(),
         estado: initialData?.estado || 'PENDIENTE',
         motivo: initialData?.motivo || '',
         notas: initialData?.notas || '',
@@ -1024,12 +1201,14 @@ function TurnoClinicoForm({
                     id: initialData.paciente_id,
                     nombre_completo: initialData.paciente_nombre,
                     ci_pasaporte: initialData.paciente_ci,
+                    telefono: initialData.paciente_telefono,
                 }
                 : null,
             paciente_nombre_libre: initialData?.paciente_nombre_libre || (!initialData?.paciente_id ? initialData?.paciente_nombre || '' : ''),
+            paciente_telefono_libre: initialData?.paciente_telefono_libre || (!initialData?.paciente_id ? initialData?.paciente_telefono || '' : ''),
             doctor_id: initialData?.doctor_id || '',
             lugar_atencion_id: initialData?.lugar_atencion_id || '',
-            fecha_hora: initialData?.fecha_hora ? String(initialData.fecha_hora).slice(0, 16) : new Date().toISOString().slice(0, 16),
+            fecha_hora: initialData?.fecha_hora ? formatDateTimeLocalValue(initialData.fecha_hora) : nowBusinessDateTimeLocalValue(),
             estado: initialData?.estado || 'PENDIENTE',
             motivo: initialData?.motivo || '',
             notas: initialData?.notas || '',
@@ -1045,9 +1224,14 @@ function TurnoClinicoForm({
         onSave({
             paciente_id: form.paciente?.id || null,
             paciente_nombre_libre: form.paciente?.id ? null : (form.paciente_nombre_libre.trim() || null),
+            paciente_telefono_libre: form.paciente?.id ? null : (form.paciente_telefono_libre.trim() || null),
             doctor_id: form.doctor_id === '' ? null : Number(form.doctor_id),
             lugar_atencion_id: form.lugar_atencion_id === '' ? null : Number(form.lugar_atencion_id),
-            fecha_hora: new Date(form.fecha_hora).toISOString(),
+            fecha_hora: serializeDateTimeLocalValue(
+                form.fecha_hora,
+                initialData?.fecha_hora || null,
+                initialData?.fecha_hora ? formatDateTimeLocalValue(initialData.fecha_hora) : '',
+            ),
             estado: form.estado,
             motivo: form.motivo.trim() || null,
             notas: form.notas.trim() || null,
@@ -1061,7 +1245,7 @@ function TurnoClinicoForm({
                     <label className="form-label">Paciente</label>
                     <RemoteSearchSelect
                         value={form.paciente}
-                        onChange={option => setForm(prev => ({ ...prev, paciente: option, paciente_nombre_libre: option ? '' : prev.paciente_nombre_libre }))}
+                        onChange={option => setForm(prev => ({ ...prev, paciente: option, paciente_nombre_libre: option ? '' : prev.paciente_nombre_libre, paciente_telefono_libre: option ? '' : prev.paciente_telefono_libre }))}
                         onSearch={onSearchPaciente}
                         options={pacienteOptions}
                         loading={pacienteLoading}
@@ -1090,6 +1274,21 @@ function TurnoClinicoForm({
                         placeholder="Ej.: Juan Perez"
                         disabled={Boolean(form.paciente?.id)}
                     />
+                </div>
+                <div className="form-group">
+                    <label className="form-label">Telefono del agendado</label>
+                    <input
+                        className="form-input"
+                        value={form.paciente?.id ? (form.paciente.telefono || '') : form.paciente_telefono_libre}
+                        onChange={event => setForm(prev => ({ ...prev, paciente_telefono_libre: event.target.value, paciente: null }))}
+                        placeholder="Ej.: 0981 123 456"
+                        disabled={Boolean(form.paciente?.id)}
+                    />
+                    {form.paciente?.id ? (
+                        <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: '0.82rem' }}>
+                            El telefono viene de la ficha del paciente.
+                        </div>
+                    ) : null}
                 </div>
                 <div className="form-group">
                     <label className="form-label">Doctor</label>
@@ -1136,17 +1335,19 @@ function AgendaClinicaSection() {
     const plusDays = useMemo(() => {
         const next = new Date(today)
         next.setDate(next.getDate() + 7)
-        return next.toISOString().slice(0, 10)
+        return formatDateInputValue(next)
     }, [today])
     const [buscar, setBuscar] = useState('')
     const [estado, setEstado] = useState('')
     const [recordatorioFiltro, setRecordatorioFiltro] = useState('')
-    const [fechaDesde, setFechaDesde] = useState(today.toISOString().slice(0, 10))
+    const [fechaDesde, setFechaDesde] = useState(formatDateInputValue(today))
     const [fechaHasta, setFechaHasta] = useState(plusDays)
     const [page, setPage] = useState(1)
     const [pageSize, setPageSize] = useState(25)
     const [modalTurno, setModalTurno] = useState(null)
+    const [modalPaciente, setModalPaciente] = useState(null)
     const [pacienteSearch, setPacienteSearch] = useState('')
+    const [referidorSearch, setReferidorSearch] = useState('')
     const [whatsappItem, setWhatsappItem] = useState(null)
 
     const agendaQuery = useQuery({
@@ -1175,6 +1376,12 @@ function AgendaClinicaSection() {
         queryFn: async () => (await api.get(`/clinica/pacientes?${queryString({ buscar: pacienteSearch, page: 1, page_size: 12 })}`)).data,
         enabled: Boolean(modalTurno),
         staleTime: 60 * 1000,
+    })
+
+    const referidoresQuery = useQuery({
+        queryKey: ['clinica', 'agenda-referidores', referidorSearch],
+        queryFn: async () => (await api.get(`/referidores/listado-optimizado?${queryString({ buscar: referidorSearch, page: 1, page_size: 12 })}`)).data,
+        enabled: Boolean(modalPaciente?.open),
     })
 
     const doctoresQuery = useQuery({
@@ -1219,6 +1426,7 @@ function AgendaClinicaSection() {
             await api.put(`/clinica/agenda/${item.id}`, {
                 paciente_id: item.paciente_id,
                 paciente_nombre_libre: item.paciente_nombre_libre,
+                paciente_telefono_libre: item.paciente_telefono_libre,
                 doctor_id: item.doctor_id,
                 lugar_atencion_id: item.lugar_atencion_id,
                 fecha_hora: item.fecha_hora,
@@ -1234,31 +1442,50 @@ function AgendaClinicaSection() {
         },
     })
 
+    const savePacienteMutation = useMutation({
+        mutationFn: async payload => (await api.post('/clinica/pacientes', payload)).data,
+        onSuccess: async result => {
+            const sourceAgendaTurno = modalPaciente?.sourceAgendaTurno || null
+            let turnoActualizado = sourceAgendaTurno
+            if (sourceAgendaTurno?.id && result?.id) {
+                turnoActualizado = await api.put(`/clinica/agenda/${sourceAgendaTurno.id}`, {
+                    paciente_id: result.id,
+                    paciente_nombre_libre: null,
+                    paciente_telefono_libre: null,
+                    doctor_id: sourceAgendaTurno.doctor_id || null,
+                    lugar_atencion_id: sourceAgendaTurno.lugar_atencion_id || null,
+                    fecha_hora: sourceAgendaTurno.fecha_hora,
+                    estado: 'ATENDIDO',
+                    motivo: sourceAgendaTurno.motivo || null,
+                    notas: sourceAgendaTurno.notas || null,
+                }).then(response => response.data).catch(() => sourceAgendaTurno)
+            }
+            setModalPaciente(null)
+            setReferidorSearch('')
+            await queryClient.invalidateQueries({ queryKey: ['clinica', 'pacientes'] })
+            await queryClient.invalidateQueries({ queryKey: ['clinica', 'agenda'] })
+            await queryClient.invalidateQueries({ queryKey: ['clinica', 'agenda-recordatorios'] })
+            await queryClient.invalidateQueries({ queryKey: ['clinica', 'dashboard'] })
+            const nextState = buildAgendaConsultaState(turnoActualizado, result)
+            if (nextState) {
+                navigate('/clinica/consulta', { state: nextState })
+            }
+        },
+    })
+
     const atenderTurno = async item => {
         try {
             const actualizado = await cambiarEstadoMutation.mutateAsync({ item, nextEstado: 'ATENDIDO' })
-            if (actualizado?.paciente_id) {
-                navigate('/clinica/consulta', {
-                    state: {
-                        selectedPatient: {
-                            id: actualizado.paciente_id,
-                            nombre_completo: actualizado.paciente_nombre,
-                            ci_pasaporte: actualizado.paciente_ci || null,
-                        },
-                        autoOpenConsulta: true,
-                        agendaTurnoId: actualizado?.id || item.id,
-                    },
-                })
+            const nextState = buildAgendaConsultaState(actualizado || item)
+            if (nextState) {
+                navigate('/clinica/consulta', { state: nextState })
                 return
             }
-            navigate('/clinica/pacientes', {
-                state: {
-                    openNewFromAgenda: {
-                        agendaTurnoId: actualizado?.id || item.id,
-                        nombre_completo: actualizado?.paciente_nombre || item.paciente_nombre || '',
-                        turno: actualizado || { ...item, estado: 'ATENDIDO' },
-                    },
-                },
+            setModalPaciente({
+                open: true,
+                mode: 'create',
+                data: buildAgendaPacienteInitialData(actualizado || item),
+                sourceAgendaTurno: actualizado || { ...item, estado: 'ATENDIDO' },
             })
         } catch (error) {
             window.alert(formatError(error, 'No se pudo marcar el turno como atendido.'))
@@ -1266,7 +1493,7 @@ function AgendaClinicaSection() {
     }
 
     const items = agendaQuery.data?.items || []
-    const reminderBuckets = reminderQuery.data || { hoy: [], ocho_dias: [], quince_dias: [] }
+    const reminderBuckets = reminderQuery.data || { hoy: [], tres_dias: [] }
     const aplicarFiltroRapido = tipo => {
         const base = new Date()
         const from = new Date(base)
@@ -1277,8 +1504,8 @@ function AgendaClinicaSection() {
         } else if (tipo === 'semana') {
             to.setDate(to.getDate() + 7)
         }
-        setFechaDesde(from.toISOString().slice(0, 10))
-        setFechaHasta(to.toISOString().slice(0, 10))
+        setFechaDesde(formatDateInputValue(from))
+        setFechaHasta(formatDateInputValue(to))
         setRecordatorioFiltro('')
         setPage(1)
     }
@@ -1298,10 +1525,9 @@ function AgendaClinicaSection() {
                     subtitle="Base operativa de turnos por paciente, doctor, lugar, fecha y estado."
                     actions={hasActionAccess(user, 'clinica.consultas_crear', 'clinica') ? <button className="btn btn-primary" onClick={() => setModalTurno({ mode: 'create', data: null })}><Plus size={16} /> Nuevo turno</button> : null}
                 />
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12, marginBottom: 18 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 12, marginBottom: 18 }}>
                     {[
-                        { key: '15', title: 'Recordar en 15 dias', items: reminderBuckets.quince_dias || [], color: '#a78bfa' },
-                        { key: '8', title: 'Recordar en 8 dias', items: reminderBuckets.ocho_dias || [], color: '#f59e0b' },
+                        { key: '3', title: 'Recordar en 3 dias', items: reminderBuckets.tres_dias || [], color: '#f59e0b' },
                         { key: 'hoy', title: 'Recordar hoy', items: reminderBuckets.hoy || [], color: '#38bdf8' },
                     ].map(bucket => (
                         <div key={bucket.key} className="card" style={{ padding: 14, background: `${bucket.color}12`, border: `1px solid ${bucket.color}44` }}>
@@ -1362,8 +1588,7 @@ function AgendaClinicaSection() {
                     <button type="button" className="btn btn-secondary btn-sm" onClick={() => aplicarFiltroRapido('hoy')}>Hoy</button>
                     <button type="button" className="btn btn-secondary btn-sm" onClick={() => aplicarFiltroRapido('manana')}>Manana</button>
                     <button type="button" className="btn btn-secondary btn-sm" onClick={() => aplicarFiltroRapido('semana')}>Prox. 7 dias</button>
-                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => aplicarFiltroRecordatorio('15')}>Recordatorios 15 dias</button>
-                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => aplicarFiltroRecordatorio('8')}>Recordatorios 8 dias</button>
+                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => aplicarFiltroRecordatorio('3')}>Recordatorios 3 dias</button>
                     <button type="button" className="btn btn-secondary btn-sm" onClick={() => aplicarFiltroRecordatorio('hoy')}>Recordatorios hoy</button>
                     {recordatorioFiltro ? (
                         <button
@@ -1371,7 +1596,7 @@ function AgendaClinicaSection() {
                             className="btn btn-secondary btn-sm"
                             onClick={() => {
                                 setRecordatorioFiltro('')
-                                setFechaDesde(today.toISOString().slice(0, 10))
+                                setFechaDesde(formatDateInputValue(today))
                                 setFechaHasta(plusDays)
                                 setPage(1)
                             }}
@@ -1382,7 +1607,7 @@ function AgendaClinicaSection() {
                 </div>
                 {recordatorioFiltro ? (
                     <div className="alert alert-info" style={{ marginBottom: 18 }}>
-                        Mostrando bandeja interna de recordatorios para {recordatorioFiltro === '15' ? '15 dias' : recordatorioFiltro === '8' ? '8 dias' : 'hoy'}.
+                        Mostrando bandeja interna de recordatorios para {recordatorioFiltro === '3' ? '3 dias' : 'hoy'}.
                     </div>
                 ) : null}
 
@@ -1398,47 +1623,65 @@ function AgendaClinicaSection() {
                                     <tr>
                                         <th>Fecha y hora</th>
                                         <th>Paciente</th>
+                                        <th>Telefono</th>
                                         <th>Doctor</th>
                                         <th>Lugar</th>
                                         <th>Motivo</th>
                                         <th>Estado</th>
-                                        <th style={{ width: 150 }}>Acciones</th>
+                                        <th style={{ width: 230 }}>Acciones</th>
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {items.length ? items.map(item => (
-                                        <tr key={item.id}>
-                                            <td>{fmtDateTime(item.fecha_hora)}</td>
-                                            <td style={{ fontWeight: 700 }}>{item.paciente_nombre}</td>
-                                            <td>{item.doctor_nombre || '-'}</td>
-                                            <td>{item.lugar_nombre || '-'}</td>
-                                            <td>
-                                                <div>{item.motivo || '-'}</div>
-                                                {item.es_control ? (
-                                                    <div style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: '0.82rem' }}>
-                                                        Seguimiento {typeof item.dias_restantes === 'number' ? `- faltan ${item.dias_restantes} dia(s)` : ''}
+                                    {items.length ? items.map(item => {
+                                        const telefonoTurno = getTurnoTelefono(item)
+                                        const whatsappLink = buildReminderWhatsappLink(item)
+                                        return (
+                                            <tr key={item.id}>
+                                                <td>{fmtDateTime(item.fecha_hora)}</td>
+                                                <td style={{ fontWeight: 700 }}>{item.paciente_nombre}</td>
+                                                <td style={{ whiteSpace: 'nowrap', color: telefonoTurno ? 'var(--text)' : 'var(--text-muted)' }}>
+                                                    {telefonoTurno || '-'}
+                                                </td>
+                                                <td>{item.doctor_nombre || '-'}</td>
+                                                <td>{item.lugar_nombre || '-'}</td>
+                                                <td>
+                                                    <div>{item.motivo || '-'}</div>
+                                                    {item.es_control ? (
+                                                        <div style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: '0.82rem' }}>
+                                                            Seguimiento {typeof item.dias_restantes === 'number' ? `- faltan ${item.dias_restantes} dia(s)` : ''}
+                                                        </div>
+                                                    ) : null}
+                                                </td>
+                                                <td><span className={`badge ${item.estado === 'ATENDIDO' ? 'badge-green' : item.estado === 'CANCELADO' ? 'badge-gray' : 'badge-blue'}`}>{item.estado}</span></td>
+                                                <td>
+                                                    <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+                                                        <button
+                                                            type="button"
+                                                            className="btn btn-secondary btn-sm"
+                                                            title={whatsappLink ? 'Enviar recordatorio por WhatsApp' : 'Completar telefono para WhatsApp'}
+                                                            onClick={() => setWhatsappItem(item)}
+                                                        >
+                                                            <MessageCircle size={14} /> WhatsApp
+                                                        </button>
+                                                        <TurnoAgendaActions
+                                                            item={item}
+                                                            disabled={cambiarEstadoMutation.isPending || deleteTurnoMutation.isPending}
+                                                            onEditar={() => setModalTurno({ mode: 'edit', data: item })}
+                                                            onConfirmar={() => cambiarEstadoMutation.mutate({ item, nextEstado: 'CONFIRMADO' })}
+                                                            onAtender={() => atenderTurno(item)}
+                                                            onCancelar={() => cambiarEstadoMutation.mutate({ item, nextEstado: 'CANCELADO' })}
+                                                            onReprogramar={() => setModalTurno({ mode: 'edit', data: item })}
+                                                            onWhatsapp={() => setWhatsappItem(item)}
+                                                            onEliminar={() => {
+                                                                if (!window.confirm('Se eliminara este turno. Desea continuar?')) return
+                                                                deleteTurnoMutation.mutate(item.id)
+                                                            }}
+                                                        />
                                                     </div>
-                                                ) : null}
-                                            </td>
-                                            <td><span className={`badge ${item.estado === 'ATENDIDO' ? 'badge-green' : item.estado === 'CANCELADO' ? 'badge-gray' : 'badge-blue'}`}>{item.estado}</span></td>
-                                            <td>
-                                                <TurnoAgendaActions
-                                                    item={item}
-                                                    disabled={cambiarEstadoMutation.isPending || deleteTurnoMutation.isPending}
-                                                    onEditar={() => setModalTurno({ mode: 'edit', data: item })}
-                                                    onConfirmar={() => cambiarEstadoMutation.mutate({ item, nextEstado: 'CONFIRMADO' })}
-                                                    onAtender={() => atenderTurno(item)}
-                                                    onCancelar={() => cambiarEstadoMutation.mutate({ item, nextEstado: 'CANCELADO' })}
-                                                    onReprogramar={() => setModalTurno({ mode: 'edit', data: item })}
-                                                    onWhatsapp={() => setWhatsappItem(item)}
-                                                    onEliminar={() => {
-                                                        if (!window.confirm('Se eliminara este turno. Desea continuar?')) return
-                                                        deleteTurnoMutation.mutate(item.id)
-                                                    }}
-                                                />
-                                            </td>
-                                        </tr>
-                                    )) : <tr><td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No hay turnos para los filtros seleccionados.</td></tr>}
+                                                </td>
+                                            </tr>
+                                        )
+                                    }) : <tr><td colSpan={8} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No hay turnos para los filtros seleccionados.</td></tr>}
                                 </tbody>
                             </table>
                         </div>
@@ -1469,12 +1712,26 @@ function AgendaClinicaSection() {
                     />
                 </Modal>
             )}
+            {modalPaciente?.open && (
+                <Modal title="Nuevo paciente desde agenda" onClose={() => setModalPaciente(null)} maxWidth="860px">
+                    <PacienteForm
+                        initialData={modalPaciente.data}
+                        sourceAgendaTurno={modalPaciente.sourceAgendaTurno}
+                        referidorOptions={referidoresQuery.data?.items || []}
+                        onSearchReferidor={setReferidorSearch}
+                        referidorLoading={referidoresQuery.isFetching}
+                        onSave={payload => savePacienteMutation.mutate(payload)}
+                        onCancel={() => setModalPaciente(null)}
+                        saving={savePacienteMutation.isPending}
+                    />
+                </Modal>
+            )}
             {whatsappItem ? <WhatsappMessageModal item={whatsappItem} onClose={() => setWhatsappItem(null)} /> : null}
         </>
     )
 }
 
-function PacienteForm({ initialData, referidorOptions, onSearchReferidor, referidorLoading, onSave, onCancel, saving }) {
+function PacienteForm({ initialData, sourceAgendaTurno = null, referidorOptions, onSearchReferidor, referidorLoading, onSave, onCancel, saving }) {
     const [form, setForm] = useState(() => ({
         nombre_completo: initialData?.nombre_completo || '',
         ci_pasaporte: initialData?.ci_pasaporte || '',
@@ -1516,6 +1773,33 @@ function PacienteForm({ initialData, referidorOptions, onSearchReferidor, referi
 
     return (
         <form onSubmit={submit}>
+            {sourceAgendaTurno ? (
+                <div
+                    className="card"
+                    style={{
+                        padding: 14,
+                        marginBottom: 16,
+                        background: 'rgba(56,189,248,0.08)',
+                        border: '1px solid rgba(56,189,248,0.2)',
+                        display: 'grid',
+                        gap: 6,
+                    }}
+                >
+                    <div style={{ fontWeight: 800 }}>Contexto del turno que se va a atender</div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                        Fecha y hora: {fmtDateTime(sourceAgendaTurno.fecha_hora)}
+                    </div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                        Telefono: {sourceAgendaTurno.paciente_telefono || sourceAgendaTurno.paciente_telefono_libre || 'Sin telefono'}
+                    </div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                        Doctor: {sourceAgendaTurno.doctor_nombre || 'Sin doctor'} {sourceAgendaTurno.lugar_nombre ? `- Lugar: ${sourceAgendaTurno.lugar_nombre}` : ''}
+                    </div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem' }}>
+                        Al guardar, este mismo contexto pasa directo a la nueva consulta.
+                    </div>
+                </div>
+            ) : null}
             <div className="form-group">
                 <label className="form-label">Nombre completo</label>
                 <input className="form-input" value={form.nombre_completo} onChange={event => setForm(prev => ({ ...prev, nombre_completo: event.target.value }))} required />
@@ -1573,8 +1857,8 @@ function PacienteForm({ initialData, referidorOptions, onSearchReferidor, referi
 
 function ConsultaClinicaForm({ type, initialData, pacienteId, doctores, lugares, onSave, onCancel, saving, savingText = 'Guardando...', readOnly = false, saved = false }) {
     const buildFormState = useMemo(() => {
-        const fechaBase = initialData?.fecha ? String(initialData.fecha).slice(0, 16) : new Date().toISOString().slice(0, 16)
-        const fechaBaseControl = fechaBase ? fechaBase.slice(0, 10) : formatDateInputValue(new Date())
+        const fechaBase = initialData?.fecha ? formatDateTimeLocalValue(initialData.fecha) : nowBusinessDateTimeLocalValue()
+        const fechaBaseControl = fechaBase ? fechaBase.slice(0, 10) : todayBusinessInputValue()
         return ({
         fecha: fechaBase,
         doctor_id: initialData?.doctor_id || '',
@@ -1654,6 +1938,8 @@ function ConsultaClinicaForm({ type, initialData, pacienteId, doctores, lugares,
     const [recommendation, setRecommendation] = useState(() => parseRecommendationState(initialData))
     const [patologiaSearch, setPatologiaSearch] = useState('')
     const [patologiaSeleccionada, setPatologiaSeleccionada] = useState(null)
+    const initialFechaRaw = initialData?.fecha || null
+    const initialFechaLocal = formatDateTimeLocalValue(initialFechaRaw)
 
     useEffect(() => {
         setForm(buildFormState)
@@ -1720,7 +2006,7 @@ function ConsultaClinicaForm({ type, initialData, pacienteId, doctores, lugares,
             paciente_id: pacienteId,
             doctor_id: form.doctor_id === '' ? null : Number(form.doctor_id),
             lugar_atencion_id: form.lugar_atencion_id === '' ? null : Number(form.lugar_atencion_id),
-            fecha: form.fecha ? new Date(form.fecha).toISOString() : null,
+            fecha: serializeDateTimeLocalValue(form.fecha, initialFechaRaw, initialFechaLocal),
             motivo: type === 'OFTALMOLOGIA' ? (form.motivo || null) : undefined,
             diagnostico: form.diagnostico || null,
             plan_tratamiento: form.plan_tratamiento || null,
@@ -2486,6 +2772,34 @@ function AnamnesisClinicaForm({ value, onChange }) {
                             <option value="Descanso">Descanso</option>
                         </select>
                     </div>
+                    <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                        <label className="form-label">Graduacion anterior</label>
+                        <div className="card" style={{ padding: 14, background: 'rgba(255,255,255,0.02)' }}>
+                            <div style={{ display: 'grid', gap: 10 }}>
+                                <div style={{ display: 'grid', gridTemplateColumns: '72px repeat(4, minmax(72px, 1fr))', gap: 8, fontSize: '0.76rem', color: 'var(--text-muted)', fontWeight: 700 }}>
+                                    <div />
+                                    <div>Esfera</div>
+                                    <div>Cilindro</div>
+                                    <div>Eje</div>
+                                    <div>Add</div>
+                                </div>
+                                <div style={{ display: 'grid', gridTemplateColumns: '72px repeat(4, minmax(72px, 1fr))', gap: 8 }}>
+                                    <div style={{ fontWeight: 800, color: 'var(--text-primary)', alignSelf: 'center' }}>OD</div>
+                                    <input className="form-input" value={value.graduacion_anterior_od_esfera || ''} onChange={event => onChange(prev => ({ ...prev, graduacion_anterior_od_esfera: event.target.value }))} placeholder="0.00" />
+                                    <input className="form-input" value={value.graduacion_anterior_od_cilindro || ''} onChange={event => onChange(prev => ({ ...prev, graduacion_anterior_od_cilindro: event.target.value }))} placeholder="0.00" />
+                                    <input className="form-input" value={value.graduacion_anterior_od_eje || ''} onChange={event => onChange(prev => ({ ...prev, graduacion_anterior_od_eje: event.target.value }))} placeholder="0" />
+                                    <input className="form-input" value={value.graduacion_anterior_od_adicion || ''} onChange={event => onChange(prev => ({ ...prev, graduacion_anterior_od_adicion: event.target.value }))} placeholder="0.00" />
+                                </div>
+                                <div style={{ display: 'grid', gridTemplateColumns: '72px repeat(4, minmax(72px, 1fr))', gap: 8 }}>
+                                    <div style={{ fontWeight: 800, color: 'var(--text-primary)', alignSelf: 'center' }}>OI</div>
+                                    <input className="form-input" value={value.graduacion_anterior_oi_esfera || ''} onChange={event => onChange(prev => ({ ...prev, graduacion_anterior_oi_esfera: event.target.value }))} placeholder="0.00" />
+                                    <input className="form-input" value={value.graduacion_anterior_oi_cilindro || ''} onChange={event => onChange(prev => ({ ...prev, graduacion_anterior_oi_cilindro: event.target.value }))} placeholder="0.00" />
+                                    <input className="form-input" value={value.graduacion_anterior_oi_eje || ''} onChange={event => onChange(prev => ({ ...prev, graduacion_anterior_oi_eje: event.target.value }))} placeholder="0" />
+                                    <input className="form-input" value={value.graduacion_anterior_oi_adicion || ''} onChange={event => onChange(prev => ({ ...prev, graduacion_anterior_oi_adicion: event.target.value }))} placeholder="0.00" />
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                     <label className="flex gap-12" style={{ alignItems: 'center', color: 'var(--text-primary)' }}>
                         <input type="checkbox" checked={Boolean(value.usa_lentes_contacto)} onChange={event => onChange(prev => ({ ...prev, usa_lentes_contacto: event.target.checked }))} />
                         <span>Usa lentes de contacto</span>
@@ -2539,6 +2853,7 @@ function ConsultaIntegralModal({
     onOpenRecetaMedicamentos,
     initialAnamnesis,
     anamnesisLoading,
+    initialConsultaData = null,
 }) {
     const [activeTab, setActiveTab] = useState('anamnesis')
     const [showConsultaSavedNotice, setShowConsultaSavedNotice] = useState(false)
@@ -2567,6 +2882,13 @@ function ConsultaIntegralModal({
             window.clearTimeout(revealDocuments)
         }
     }, [successData?.id])
+
+    usePendingNavigationGuard(
+        open,
+        successData?.id
+            ? 'Hay una consulta abierta. Si cierras sesion ahora, la ventana se cerrara.'
+            : 'Hay una consulta abierta que aun no fue guardada. Si cierras sesion o sales de esta vista, perderas los datos cargados. ¿Deseas continuar?'
+    )
 
     const handleCloseRequest = () => {
         if (!successData?.id) {
@@ -2772,7 +3094,7 @@ function ConsultaIntegralModal({
                             <ConsultaClinicaForm
                                 key={`${type}-${patient.id}`}
                                 type={type}
-                                initialData={null}
+                                initialData={initialConsultaData}
                                 pacienteId={patient.id}
                                 doctores={doctores}
                                 lugares={lugares}
@@ -2870,7 +3192,7 @@ function RecetaMedicamentoForm({
 }) {
     const recipeAlreadySaved = Boolean(savedReceta?.id)
     const [form, setForm] = useState(() => ({
-        fecha_emision: initialData?.fecha_emision ? String(initialData.fecha_emision).slice(0, 16) : new Date().toISOString().slice(0, 16),
+        fecha_emision: initialData?.fecha_emision ? String(initialData.fecha_emision).slice(0, 16) : nowBusinessDateTimeLocalValue(),
         doctor_nombre: initialData?.doctor_nombre || '',
         diagnostico: initialData?.diagnostico || '',
         observaciones: initialData?.observaciones || '',
@@ -2886,7 +3208,7 @@ function RecetaMedicamentoForm({
 
     useEffect(() => {
         setForm({
-            fecha_emision: initialData?.fecha_emision ? String(initialData.fecha_emision).slice(0, 16) : new Date().toISOString().slice(0, 16),
+            fecha_emision: initialData?.fecha_emision ? String(initialData.fecha_emision).slice(0, 16) : nowBusinessDateTimeLocalValue(),
             doctor_nombre: initialData?.doctor_nombre || '',
             diagnostico: initialData?.diagnostico || '',
             observaciones: initialData?.observaciones || '',
@@ -2982,7 +3304,7 @@ function RecetaMedicamentoForm({
             paciente_id: pacienteId,
             consulta_id: consultaId,
             consulta_tipo: consultaTipo,
-            fecha_emision: form.fecha_emision ? new Date(form.fecha_emision).toISOString() : null,
+            fecha_emision: serializeDateTimeLocalValue(form.fecha_emision),
             doctor_nombre: form.doctor_nombre.trim() || null,
             diagnostico: form.diagnostico.trim() || null,
             observaciones: form.observaciones.trim() || null,
@@ -3510,7 +3832,7 @@ function HistorialClinicoModal({ open, pacienteId, onClose, onEditPaciente, onRe
                                             consultaId: selectedId,
                                             consultaTipo: tab === 'oftalmologia' ? 'OFTALMOLOGIA' : 'CONTACTOLOGIA',
                                             initialData: {
-                                                fecha_emision: new Date().toISOString(),
+                                                fecha_emision: nowBusinessDateTimeLocalValue(),
                                                 doctor_nombre: selectedItem?.doctor_nombre || detalleQuery.data?.doctor_nombre || '',
                                                 diagnostico: detalleQuery.data?.diagnostico || selectedItem?.diagnostico || '',
                                                 observaciones: detalleQuery.data?.plan_tratamiento || selectedItem?.plan_tratamiento || '',
@@ -3777,9 +4099,7 @@ function PacientesSection() {
         setModalPaciente({
             open: true,
             mode: 'create',
-            data: {
-                nombre_completo: agendaDraft.nombre_completo || '',
-            },
+            data: buildAgendaPacienteInitialData(agendaDraft.turno || agendaDraft),
             sourceAgendaTurno: agendaDraft.turno || null,
         })
         navigate(location.pathname, { replace: true, state: {} })
@@ -3806,6 +4126,7 @@ function PacientesSection() {
                 await api.put(`/clinica/agenda/${modalPaciente.sourceAgendaTurno.id}`, {
                     paciente_id: result.id,
                     paciente_nombre_libre: null,
+                    paciente_telefono_libre: null,
                     doctor_id: modalPaciente.sourceAgendaTurno.doctor_id || null,
                     lugar_atencion_id: modalPaciente.sourceAgendaTurno.lugar_atencion_id || null,
                     fecha_hora: modalPaciente.sourceAgendaTurno.fecha_hora,
@@ -3822,13 +4143,10 @@ function PacientesSection() {
             await queryClient.invalidateQueries({ queryKey: ['clinica', 'agenda'] })
             await queryClient.invalidateQueries({ queryKey: ['clinica', 'agenda-recordatorios'] })
             if (sourceAgendaTurno && result?.id) {
-                navigate('/clinica/consulta', {
-                    state: {
-                        selectedPatient: result,
-                        autoOpenConsulta: true,
-                        agendaTurnoId: sourceAgendaTurno.id,
-                    },
-                })
+                const nextState = buildAgendaConsultaState(sourceAgendaTurno, result)
+                if (nextState) {
+                    navigate('/clinica/consulta', { state: nextState })
+                }
             }
         },
     })
@@ -4025,6 +4343,7 @@ function PacientesSection() {
                 <Modal title={modalPaciente.mode === 'edit' ? 'Editar paciente' : 'Nuevo paciente'} onClose={() => setModalPaciente(null)} maxWidth="860px">
                     <PacienteForm
                         initialData={modalPaciente.data}
+                        sourceAgendaTurno={modalPaciente.sourceAgendaTurno}
                         referidorOptions={referidoresQuery.data?.items || []}
                         onSearchReferidor={setReferidorSearch}
                         referidorLoading={referidoresQuery.isFetching}
@@ -4614,12 +4933,14 @@ function NuevaConsultaSection() {
     const [postSaveActions, setPostSaveActions] = useState(null)
     const [consultaSaveError, setConsultaSaveError] = useState('')
     const [agendaTurnoId, setAgendaTurnoId] = useState(null)
+    const [initialConsultaData, setInitialConsultaData] = useState(null)
 
     useEffect(() => {
         const routePatient = location.state?.selectedPatient
         if (routePatient?.id) {
             setSelectedPatient(prev => (prev?.id === routePatient.id ? prev : routePatient))
             setAgendaTurnoId(location.state?.agendaTurnoId || null)
+            setInitialConsultaData(location.state?.initialConsultaData || null)
             setLastCreated(null)
             setLastRecetaCreated(null)
             setConsultaSaveError('')
@@ -4704,7 +5025,7 @@ function NuevaConsultaSection() {
                     type: tipo,
                     patientId: selectedPatient.id,
                     recetaInicial: {
-                        fecha_emision: new Date().toISOString(),
+                        fecha_emision: nowBusinessDateTimeLocalValue(),
                         doctor_nombre: result?.recetaSugerida?.doctor_nombre || data?.doctor_nombre || '',
                         diagnostico: result?.recetaSugerida?.diagnostico || data?.diagnostico || '',
                         observaciones: result?.recetaSugerida?.observaciones || data?.plan_tratamiento || '',
@@ -4858,9 +5179,6 @@ function NuevaConsultaSection() {
                                         setSelectorPacienteOpen(true)
                                         return
                                     }
-                                    if (!location.state?.agendaTurnoId) {
-                                        setAgendaTurnoId(null)
-                                    }
                                     setRecentCreatedMedicamento(null)
                                     setLastCreated(null)
                                     setLastRecetaCreated(null)
@@ -4926,7 +5244,7 @@ function NuevaConsultaSection() {
                         consultaId: lastCreated?.id || null,
                         consultaTipo: tipo,
                         initialData: postSaveActions?.recetaInicial || {
-                            fecha_emision: new Date().toISOString(),
+                            fecha_emision: nowBusinessDateTimeLocalValue(),
                             doctor_nombre: lastCreated?.doctor_nombre || '',
                             diagnostico: lastCreated?.diagnostico || '',
                             observaciones: lastCreated?.plan_tratamiento || '',
@@ -4936,6 +5254,7 @@ function NuevaConsultaSection() {
                 }}
                 initialAnamnesis={anamnesisQuery.data || null}
                 anamnesisLoading={anamnesisQuery.isLoading}
+                initialConsultaData={initialConsultaData}
             />
 
             {recetaModal && (
@@ -5025,6 +5344,7 @@ function NuevaConsultaSection() {
                                                     onClick={() => {
                                                         setSelectedPatient(item)
                                                         setAgendaTurnoId(null)
+                                                        setInitialConsultaData(null)
                                                         setLastCreated(null)
                                                         setSelectorPacienteOpen(false)
                                                     }}
@@ -5058,15 +5378,8 @@ function NuevaConsultaSection() {
 function HistorialClinicoGeneralSection() {
     const { user } = useAuth()
     const queryClient = useQueryClient()
-    const today = useMemo(() => new Date(), [])
-    const monthStart = useMemo(() => {
-        const base = new Date(today.getFullYear(), today.getMonth(), 1)
-        return base.toISOString().slice(0, 10)
-    }, [today])
-    const todayValue = useMemo(() => today.toISOString().slice(0, 10), [today])
-
-    const [fechaDesde, setFechaDesde] = useState(monthStart)
-    const [fechaHasta, setFechaHasta] = useState(todayValue)
+    const [fechaDesde, setFechaDesde] = useState('')
+    const [fechaHasta, setFechaHasta] = useState('')
     const [buscarInput, setBuscarInput] = useState('')
     const [selectedPacienteFilter, setSelectedPacienteFilter] = useState(null)
     const [doctorId, setDoctorId] = useState('')
@@ -5074,8 +5387,8 @@ function HistorialClinicoGeneralSection() {
     const [page, setPage] = useState(1)
     const [pageSize, setPageSize] = useState(25)
     const [appliedFilters, setAppliedFilters] = useState({
-        fecha_desde: monthStart,
-        fecha_hasta: todayValue,
+        fecha_desde: '',
+        fecha_hasta: '',
         buscar: '',
         paciente_id: '',
         doctor_id: '',
@@ -5089,7 +5402,7 @@ function HistorialClinicoGeneralSection() {
     const [recentCreatedMedicamento, setRecentCreatedMedicamento] = useState(null)
     const [medicamentoSearch, setMedicamentoSearch] = useState('')
     const [actionError, setActionError] = useState('')
-    const [documentosMenuOpen, setDocumentosMenuOpen] = useState(false)
+    const [rowActionsMenu, setRowActionsMenu] = useState({ open: false, item: null, top: 0, left: 0 })
     const [consultaSavePhase, setConsultaSavePhase] = useState('idle')
 
     const pacientesFilterQuery = useQuery({
@@ -5159,15 +5472,15 @@ function HistorialClinicoGeneralSection() {
     }, [pageSize])
 
     useEffect(() => {
-        if (!documentosMenuOpen) return undefined
-        const close = () => setDocumentosMenuOpen(false)
+        if (!rowActionsMenu.open) return undefined
+        const close = () => setRowActionsMenu({ open: false, item: null, top: 0, left: 0 })
         window.addEventListener('click', close)
         window.addEventListener('resize', close)
         return () => {
             window.removeEventListener('click', close)
             window.removeEventListener('resize', close)
         }
-    }, [documentosMenuOpen])
+    }, [rowActionsMenu.open])
 
     const canView = hasActionAccess(user, 'clinica.consultas_ver', 'clinica')
     const canEdit = hasActionAccess(user, 'clinica.consultas_editar', 'clinica')
@@ -5263,17 +5576,19 @@ function HistorialClinicoGeneralSection() {
         },
     })
 
-    const openConsultaModal = async mode => {
-        if (!selectedEntry?.id || selectedEntry.tipo === 'RECETA_MEDICAMENTOS') return
+    const openConsultaModal = async (mode, entryOverride = null) => {
+        const targetEntry = entryOverride || selectedEntry
+        if (!targetEntry?.id || targetEntry.tipo === 'RECETA_MEDICAMENTOS') return
         try {
             setActionError('')
-            const tipoRuta = selectedEntry.tipo === 'OFTALMOLOGIA' ? 'oftalmologia' : 'contactologia'
-            const response = await api.get(`/clinica/consultas/${tipoRuta}/${selectedEntry.id}`)
+            setSelectedEntry(targetEntry)
+            const tipoRuta = targetEntry.tipo === 'OFTALMOLOGIA' ? 'oftalmologia' : 'contactologia'
+            const response = await api.get(`/clinica/consultas/${tipoRuta}/${targetEntry.id}`)
             setConsultaModal({
                 mode,
-                id: selectedEntry.id,
-                type: selectedEntry.tipo,
-                patientId: selectedEntry.paciente_id,
+                id: targetEntry.id,
+                type: targetEntry.tipo,
+                patientId: targetEntry.paciente_id,
                 initialData: response.data,
             })
         } catch (error) {
@@ -5281,16 +5596,18 @@ function HistorialClinicoGeneralSection() {
         }
     }
 
-    const openRecetaModal = async mode => {
-        if (!selectedEntry?.id || selectedEntry.tipo !== 'RECETA_MEDICAMENTOS') return
+    const openRecetaModal = async (mode, entryOverride = null) => {
+        const targetEntry = entryOverride || selectedEntry
+        if (!targetEntry?.id || targetEntry.tipo !== 'RECETA_MEDICAMENTOS') return
         try {
             setActionError('')
             setRecentCreatedMedicamento(null)
-            const response = await api.get(`/clinica/recetas-medicamentos/${selectedEntry.id}`)
+            setSelectedEntry(targetEntry)
+            const response = await api.get(`/clinica/recetas-medicamentos/${targetEntry.id}`)
             setRecetaModal({
                 mode,
-                id: selectedEntry.id,
-                patientId: selectedEntry.paciente_id,
+                id: targetEntry.id,
+                patientId: targetEntry.paciente_id,
                 initialData: response.data,
             })
         } catch (error) {
@@ -5298,13 +5615,15 @@ function HistorialClinicoGeneralSection() {
         }
     }
 
-    const openPdf = async () => {
-        if (!selectedEntry?.id) return
+    const openPdf = async (entryOverride = null) => {
+        const targetEntry = entryOverride || selectedEntry
+        if (!targetEntry?.id) return
         try {
             setActionError('')
-            const endpoint = selectedEntry.tipo === 'RECETA_MEDICAMENTOS'
-                ? `/clinica/recetas-medicamentos/${selectedEntry.id}/pdf`
-                : `/clinica/consultas/${selectedEntry.tipo === 'OFTALMOLOGIA' ? 'oftalmologia' : 'contactologia'}/${selectedEntry.id}/pdf`
+            setSelectedEntry(targetEntry)
+            const endpoint = targetEntry.tipo === 'RECETA_MEDICAMENTOS'
+                ? `/clinica/recetas-medicamentos/${targetEntry.id}/pdf`
+                : `/clinica/consultas/${targetEntry.tipo === 'OFTALMOLOGIA' ? 'oftalmologia' : 'contactologia'}/${targetEntry.id}/pdf`
             const response = await api.get(endpoint, { responseType: 'blob' })
             const blob = new Blob([response.data], { type: 'application/pdf' })
             const url = window.URL.createObjectURL(blob)
@@ -5315,121 +5634,179 @@ function HistorialClinicoGeneralSection() {
         }
     }
 
-    const latestLinkedReceta = Array.isArray(detalleQuery.data?.recetas_medicamentos_relacionadas)
-        ? detalleQuery.data.recetas_medicamentos_relacionadas[0] || null
-        : null
-    const hasRecetaMedicamentos = Boolean(latestLinkedReceta?.id)
-    const hasRecetaLentes = Boolean(
-        selectedEntry?.tipo === 'OFTALMOLOGIA' && (
-            detalleQuery.data?.av_cc_lejos_od ||
-            detalleQuery.data?.av_cc_lejos_oi ||
-            detalleQuery.data?.ref_od_esfera ||
-            detalleQuery.data?.ref_od_cilindro ||
-            detalleQuery.data?.ref_od_eje ||
-            detalleQuery.data?.ref_od_adicion ||
-            detalleQuery.data?.ref_oi_esfera ||
-            detalleQuery.data?.ref_oi_cilindro ||
-            detalleQuery.data?.ref_oi_eje ||
-            detalleQuery.data?.ref_oi_adicion
-        )
-    )
-
     const handleUnavailableDocument = message => {
         setActionError(message)
-        setDocumentosMenuOpen(false)
+        setRowActionsMenu({ open: false, item: null, top: 0, left: 0 })
     }
 
-    const openConsultaIndicacionesPdf = async () => {
-        if (!selectedEntry?.id || selectedEntry.tipo === 'RECETA_MEDICAMENTOS') return
+    const resolveConsultaDetail = async targetEntry => {
+        if (!targetEntry?.id || targetEntry.tipo === 'RECETA_MEDICAMENTOS') return null
+        if (selectedEntry?.id === targetEntry.id && selectedEntry?.tipo === targetEntry.tipo && detalleQuery.data) {
+            return detalleQuery.data
+        }
+        const tipoRuta = targetEntry.tipo === 'OFTALMOLOGIA' ? 'oftalmologia' : 'contactologia'
+        return (await api.get(`/clinica/consultas/${tipoRuta}/${targetEntry.id}`)).data
+    }
+
+    const openConsultaIndicacionesPdf = async (entryOverride = null) => {
+        const targetEntry = entryOverride || selectedEntry
+        if (!targetEntry?.id || targetEntry.tipo === 'RECETA_MEDICAMENTOS') return
         try {
             setActionError('')
-            const tipoRuta = selectedEntry.tipo === 'OFTALMOLOGIA' ? 'oftalmologia' : 'contactologia'
-            const response = await api.get(`/clinica/consultas/${tipoRuta}/${selectedEntry.id}/indicaciones-pdf`, { responseType: 'blob' })
+            setSelectedEntry(targetEntry)
+            const tipoRuta = targetEntry.tipo === 'OFTALMOLOGIA' ? 'oftalmologia' : 'contactologia'
+            const response = await api.get(`/clinica/consultas/${tipoRuta}/${targetEntry.id}/indicaciones-pdf`, { responseType: 'blob' })
             const blob = new Blob([response.data], { type: 'application/pdf' })
             const url = window.URL.createObjectURL(blob)
             window.open(url, '_blank', 'noopener,noreferrer')
             setTimeout(() => window.URL.revokeObjectURL(url), 1500)
-            setDocumentosMenuOpen(false)
+            setRowActionsMenu({ open: false, item: null, top: 0, left: 0 })
         } catch (error) {
             setActionError(formatError(error, 'No se pudo generar el PDF de indicaciones.'))
         }
     }
 
-    const openLinkedRecetaCompraPdf = async () => {
-        if (!latestLinkedReceta?.id) {
+    const openLinkedRecetaCompraPdf = async (entryOverride = null) => {
+        const targetEntry = entryOverride || selectedEntry
+        if (!targetEntry?.id || targetEntry.tipo === 'RECETA_MEDICAMENTOS') return
+        const detalle = await resolveConsultaDetail(targetEntry)
+        const linkedReceta = Array.isArray(detalle?.recetas_medicamentos_relacionadas)
+            ? detalle.recetas_medicamentos_relacionadas[0] || null
+            : null
+        if (!linkedReceta?.id) {
             handleUnavailableDocument('No hay receta de medicamentos vinculada a esta consulta.')
             return
         }
         try {
             setActionError('')
-            const response = await api.get(`/clinica/recetas-medicamentos/${latestLinkedReceta.id}/compra-pdf`, { responseType: 'blob' })
+            setSelectedEntry(targetEntry)
+            const response = await api.get(`/clinica/recetas-medicamentos/${linkedReceta.id}/compra-pdf`, { responseType: 'blob' })
             const blob = new Blob([response.data], { type: 'application/pdf' })
             const url = window.URL.createObjectURL(blob)
             window.open(url, '_blank', 'noopener,noreferrer')
             setTimeout(() => window.URL.revokeObjectURL(url), 1500)
-            setDocumentosMenuOpen(false)
+            setRowActionsMenu({ open: false, item: null, top: 0, left: 0 })
         } catch (error) {
             setActionError(formatError(error, 'No se pudo generar el PDF de la receta de medicamentos.'))
         }
     }
 
-    const openLinkedRecetaIndicacionesPdf = async () => {
-        if (!latestLinkedReceta?.id) {
+    const openLinkedRecetaIndicacionesPdf = async (entryOverride = null) => {
+        const targetEntry = entryOverride || selectedEntry
+        if (!targetEntry?.id) return
+        if (targetEntry.tipo === 'RECETA_MEDICAMENTOS') {
+            try {
+                setActionError('')
+                setSelectedEntry(targetEntry)
+                const response = await api.get(`/clinica/recetas-medicamentos/${targetEntry.id}/indicaciones-pdf`, { responseType: 'blob' })
+                const blob = new Blob([response.data], { type: 'application/pdf' })
+                const url = window.URL.createObjectURL(blob)
+                window.open(url, '_blank', 'noopener,noreferrer')
+                setTimeout(() => window.URL.revokeObjectURL(url), 1500)
+                setRowActionsMenu({ open: false, item: null, top: 0, left: 0 })
+            } catch (error) {
+                setActionError(formatError(error, 'No se pudo generar el PDF de indicaciones de medicamentos.'))
+            }
+            return
+        }
+        const detalle = await resolveConsultaDetail(targetEntry)
+        const linkedReceta = Array.isArray(detalle?.recetas_medicamentos_relacionadas)
+            ? detalle.recetas_medicamentos_relacionadas[0] || null
+            : null
+        if (!linkedReceta?.id) {
             handleUnavailableDocument('No hay receta de medicamentos vinculada a esta consulta.')
             return
         }
         try {
             setActionError('')
-            const response = await api.get(`/clinica/recetas-medicamentos/${latestLinkedReceta.id}/indicaciones-pdf`, { responseType: 'blob' })
+            setSelectedEntry(targetEntry)
+            const response = await api.get(`/clinica/recetas-medicamentos/${linkedReceta.id}/indicaciones-pdf`, { responseType: 'blob' })
             const blob = new Blob([response.data], { type: 'application/pdf' })
             const url = window.URL.createObjectURL(blob)
             window.open(url, '_blank', 'noopener,noreferrer')
             setTimeout(() => window.URL.revokeObjectURL(url), 1500)
-            setDocumentosMenuOpen(false)
+            setRowActionsMenu({ open: false, item: null, top: 0, left: 0 })
         } catch (error) {
             setActionError(formatError(error, 'No se pudo generar el PDF de indicaciones de medicamentos.'))
         }
     }
 
+    const openHistoryRowActions = (event, item) => {
+        event.stopPropagation()
+        const rect = event.currentTarget.getBoundingClientRect()
+        const menuWidth = 260
+        const viewportWidth = window.innerWidth
+        const viewportHeight = window.innerHeight
+        const estimatedHeight = item.tipo === 'RECETA_MEDICAMENTOS' ? 220 : 300
+
+        let left = rect.right - menuWidth
+        let top = rect.bottom + 6
+
+        if (left < 8) left = 8
+        if (left + menuWidth > viewportWidth - 8) left = viewportWidth - menuWidth - 8
+        if (top + estimatedHeight > viewportHeight - 8) top = rect.top - estimatedHeight - 6
+        if (top < 8) top = 8
+
+        setSelectedEntry(item)
+        setRowActionsMenu({ open: true, item, top, left })
+    }
+
+    const closeHistoryRowActions = () => {
+        setRowActionsMenu({ open: false, item: null, top: 0, left: 0 })
+    }
+
     const items = historialQuery.data?.items || []
+    const compactStats = [
+        { label: 'Total', value: fmtNumber(historialQuery.data?.total || 0) },
+        { label: 'Oftalmologia', value: fmtNumber(historialQuery.data?.total_oftalmologia || 0) },
+        { label: 'Contactologia', value: fmtNumber(historialQuery.data?.total_contactologia || 0) },
+        { label: 'Recetas', value: fmtNumber(historialQuery.data?.total_recetas || 0) },
+    ]
 
     return (
         <>
-            <div className="card" style={{ marginTop: 22, overflow: 'visible' }}>
+            <div
+                className="card"
+                style={{
+                    marginTop: 22,
+                    overflow: 'hidden',
+                    display: 'grid',
+                    gridTemplateRows: 'auto 1fr auto',
+                    minHeight: 'calc(100vh - 150px)',
+                }}
+            >
                 <div
                     style={{
-                        position: 'sticky',
-                        top: 0,
-                        zIndex: 4,
-                        background: 'var(--bg-card)',
-                        paddingBottom: 14,
-                        marginBottom: 18,
+                        paddingBottom: 12,
+                        marginBottom: 14,
                         borderBottom: '1px solid rgba(255,255,255,0.06)',
                     }}
                 >
                     <SectionHeader
                         title="Historial clinico general"
-                        subtitle="Consultas y recetas del modulo clinico con filtros por paciente, doctor, tipo y fechas."
+                        subtitle="Vista compacta para buscar rapido y trabajar con el preview sin perder espacio."
                         actions={<button type="button" className="btn btn-primary" onClick={applyFilters}><Search size={16} /> Aplicar filtros</button>}
                     />
 
-                    <div
-                        className="dashboard-stats"
-                        style={{
-                            marginBottom: 18,
-                            display: 'grid',
-                            gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
-                            gap: 12,
-                            alignItems: 'stretch',
-                        }}
-                    >
-                        <StatCard label="Total" value={fmtNumber(historialQuery.data?.total || 0)} detail="registros filtrados" accent={CLINICA_PALETTE.accent} />
-                        <StatCard label="Oftalmologia" value={fmtNumber(historialQuery.data?.total_oftalmologia || 0)} detail="consultas" accent={CLINICA_PALETTE.accentAlt} />
-                        <StatCard label="Contactologia" value={fmtNumber(historialQuery.data?.total_contactologia || 0)} detail="consultas" accent="#60a5fa" />
-                        <StatCard label="Recetas" value={fmtNumber(historialQuery.data?.total_recetas || 0)} detail="medicamentos" accent="#f59e0b" />
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 14 }}>
+                        {compactStats.map(item => (
+                            <div
+                                key={item.label}
+                                style={{
+                                    padding: '8px 12px',
+                                    borderRadius: 999,
+                                    background: 'rgba(255,255,255,0.04)',
+                                    border: '1px solid rgba(255,255,255,0.08)',
+                                    fontSize: '0.82rem',
+                                    color: 'var(--text-secondary)',
+                                }}
+                            >
+                                <strong style={{ color: 'var(--text-primary)' }}>{item.value}</strong> {item.label}
+                            </div>
+                        ))}
                     </div>
 
-                    <div className="filters-bar" style={{ marginBottom: 18 }}>
+                    <div className="filters-bar" style={{ marginBottom: 0, alignItems: 'end' }}>
                         <input className="form-input" type="date" value={fechaDesde} onChange={event => setFechaDesde(event.target.value)} style={{ width: 170 }} />
                         <input className="form-input" type="date" value={fechaHasta} onChange={event => setFechaHasta(event.target.value)} style={{ width: 170 }} />
                         <div style={{ minWidth: 260, flex: 1 }}>
@@ -5473,133 +5850,6 @@ function HistorialClinicoGeneralSection() {
                         </select>
                     </div>
 
-                    <div className="flex gap-12" style={{ flexWrap: 'wrap' }}>
-                    {selectedEntry?.tipo !== 'RECETA_MEDICAMENTOS' && canView && <button type="button" className="btn btn-secondary" onClick={() => openConsultaModal('view')} disabled={!selectedEntry}><Eye size={16} /> Ver consulta</button>}
-                    {selectedEntry?.tipo === 'RECETA_MEDICAMENTOS' && canView && <button type="button" className="btn btn-secondary" onClick={() => openRecetaModal('view')} disabled={!selectedEntry}><Eye size={16} /> Ver receta</button>}
-                    {selectedEntry?.tipo !== 'RECETA_MEDICAMENTOS' && canEdit && <button type="button" className="btn btn-warning" onClick={() => openConsultaModal('edit')} disabled={!selectedEntry}><Pencil size={16} /> Editar</button>}
-                    {selectedEntry?.tipo === 'RECETA_MEDICAMENTOS' && canEdit && <button type="button" className="btn btn-warning" onClick={() => openRecetaModal('edit')} disabled={!selectedEntry}><Pencil size={16} /> Editar</button>}
-                    {canExport && (
-                        <div style={{ position: 'relative' }}>
-                            <button
-                                type="button"
-                                className="btn btn-secondary"
-                                onClick={event => {
-                                    event.stopPropagation()
-                                    setDocumentosMenuOpen(prev => !prev)
-                                }}
-                                disabled={!selectedEntry}
-                            >
-                                <FileText size={16} /> Documentos v
-                            </button>
-                            {documentosMenuOpen && selectedEntry && (
-                                <div
-                                    style={{
-                                        position: 'absolute',
-                                        top: 'calc(100% + 8px)',
-                                        left: 0,
-                                        minWidth: 280,
-                                        zIndex: 9999,
-                                        background: '#202633',
-                                        border: '1px solid rgba(255,255,255,0.08)',
-                                        borderRadius: 12,
-                                        boxShadow: '0 20px 45px rgba(0,0,0,0.35)',
-                                        padding: 8,
-                                        display: 'grid',
-                                        gap: 6,
-                                    }}
-                                    onClick={event => event.stopPropagation()}
-                                >
-                                    {selectedEntry.tipo === 'RECETA_MEDICAMENTOS' ? (
-                                        <>
-                                            <button type="button" className="dropdown-item" style={{ background: '#242b3a', color: 'var(--text-primary)', borderRadius: 10 }} onClick={openPdf}>
-                                                <FileText size={14} style={{ marginRight: 8 }} /> PDF de receta de medicamentos
-                                            </button>
-                                            <button type="button" className="dropdown-item" style={{ background: '#242b3a', color: 'var(--text-primary)', borderRadius: 10 }} onClick={async () => {
-                                                try {
-                                                    setActionError('')
-                                                    const response = await api.get(`/clinica/recetas-medicamentos/${selectedEntry.id}/indicaciones-pdf`, { responseType: 'blob' })
-                                                    const blob = new Blob([response.data], { type: 'application/pdf' })
-                                                    const url = window.URL.createObjectURL(blob)
-                                                    window.open(url, '_blank', 'noopener,noreferrer')
-                                                    setTimeout(() => window.URL.revokeObjectURL(url), 1500)
-                                                    setDocumentosMenuOpen(false)
-                                                } catch (error) {
-                                                    setActionError(formatError(error, 'No se pudo generar el PDF de indicaciones de medicamentos.'))
-                                                }
-                                            }}>
-                                                <FileText size={14} style={{ marginRight: 8 }} /> Indicaciones de medicamentos
-                                            </button>
-                                        </>
-                                    ) : (
-                                        <>
-                                            <button type="button" className="dropdown-item" style={{ background: '#242b3a', color: 'var(--text-primary)', borderRadius: 10 }} onClick={openPdf}>
-                                                <FileText size={14} style={{ marginRight: 8 }} /> PDF de consulta
-                                            </button>
-                                            <button
-                                                type="button"
-                                                className="dropdown-item"
-                                                style={{ background: hasRecetaLentes ? '#242b3a' : '#2b303d', color: hasRecetaLentes ? 'var(--text-primary)' : 'var(--text-muted)', borderRadius: 10 }}
-                                                onClick={() => {
-                                                    if (!hasRecetaLentes) {
-                                                        handleUnavailableDocument('No hay datos de refraccion cargados para generar receta de lentes.')
-                                                        return
-                                                    }
-                                                    openPdf()
-                                                }}
-                                            >
-                                                <FileText size={14} style={{ marginRight: 8 }} /> Receta de lentes PDF
-                                            </button>
-                                            <button
-                                                type="button"
-                                                className="dropdown-item"
-                                                style={{ background: hasRecetaMedicamentos ? '#242b3a' : '#2b303d', color: hasRecetaMedicamentos ? 'var(--text-primary)' : 'var(--text-muted)', borderRadius: 10 }}
-                                                onClick={openLinkedRecetaCompraPdf}
-                                            >
-                                                <FileText size={14} style={{ marginRight: 8 }} /> Receta de medicamentos PDF
-                                            </button>
-                                            <button
-                                                type="button"
-                                                className="dropdown-item"
-                                                style={{ background: hasRecetaMedicamentos ? '#242b3a' : '#2b303d', color: hasRecetaMedicamentos ? 'var(--text-primary)' : 'var(--text-muted)', borderRadius: 10 }}
-                                                onClick={openLinkedRecetaIndicacionesPdf}
-                                            >
-                                                <FileText size={14} style={{ marginRight: 8 }} /> Indicaciones de medicamentos
-                                            </button>
-                                        </>
-                                    )}
-                                </div>
-                            )}
-                        </div>
-                    )}
-                    {selectedEntry?.tipo !== 'RECETA_MEDICAMENTOS' && canEdit && (
-                        <button
-                            type="button"
-                            className="btn btn-danger"
-                            disabled={!selectedEntry || deleteConsultaMutation.isPending}
-                            onClick={() => {
-                                if (!selectedEntry) return
-                                if (!window.confirm('Se eliminara esta consulta. Desea continuar?')) return
-                                deleteConsultaMutation.mutate(selectedEntry)
-                            }}
-                        >
-                            <Trash2 size={16} /> Eliminar
-                        </button>
-                    )}
-                    {selectedEntry?.tipo === 'RECETA_MEDICAMENTOS' && canEdit && (
-                        <button
-                            type="button"
-                            className="btn btn-danger"
-                            disabled={!selectedEntry || deleteRecetaMutation.isPending}
-                            onClick={() => {
-                                if (!selectedEntry) return
-                                if (!window.confirm('Se eliminara esta receta. Desea continuar?')) return
-                                deleteRecetaMutation.mutate(selectedEntry.id)
-                            }}
-                        >
-                            <Trash2 size={16} /> Eliminar
-                        </button>
-                    )}
-                    </div>
                 </div>
 
                 {actionError ? (
@@ -5614,38 +5864,39 @@ function HistorialClinicoGeneralSection() {
                     <div className="alert alert-error">{formatError(historialQuery.error, 'No se pudo cargar el historial clinico general.')}</div>
                 ) : (
                     <>
-                        <div className="grid-2" style={{ alignItems: 'start' }}>
-                            <div className="card" style={{ overflow: 'hidden', minWidth: 0 }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.45fr) minmax(320px, 0.95fr)', gap: 16, alignItems: 'stretch' }}>
+                            <div className="card" style={{ overflow: 'hidden', minWidth: 0, height: 'calc(100vh - 265px)', display: 'flex', flexDirection: 'column' }}>
                                 <div
                                     className="table-container"
                                     style={{
                                         width: '100%',
                                         maxWidth: '100%',
-                                        overflowX: 'auto',
-                                        maxHeight: 'calc(100vh - 250px)',
-                                        minHeight: 560,
+                                        overflowX: 'hidden',
+                                        height: '100%',
                                         overflowY: 'auto'
                                     }}
                                 >
-                                    <table style={{ minWidth: 980, tableLayout: 'fixed' }}>
+                                    <table style={{ width: '100%', tableLayout: 'fixed' }}>
                                         <thead>
                                             <tr>
-                                                <th style={{ width: 150 }}>Fecha</th>
-                                                <th style={{ width: 150 }}>Tipo</th>
-                                                <th style={{ width: 220 }}>Paciente</th>
-                                                <th style={{ width: 180 }}>Doctor</th>
-                                                <th style={{ width: 180 }}>Lugar</th>
-                                                <th style={{ width: 280 }}>Diagnostico / resumen</th>
+                                                <th style={{ width: 120 }}>Fecha</th>
+                                                <th style={{ width: 110 }}>Tipo</th>
+                                                <th style={{ width: 190 }}>Paciente</th>
+                                                <th>Atendido por</th>
+                                                <th style={{ width: 120, textAlign: 'right', position: 'sticky', right: 0, background: 'var(--bg-card)' }}>Acciones</th>
                                             </tr>
                                         </thead>
                                         <tbody>
                                             {items.length ? items.map(item => (
                                                 <tr
                                                     key={`${item.tipo}-${item.id}`}
-                                                    onClick={() => setSelectedEntry(item)}
+                                                    onClick={() => {
+                                                        setSelectedEntry(item)
+                                                        closeHistoryRowActions()
+                                                    }}
                                                     style={{ cursor: 'pointer', background: selectedEntry?.id === item.id && selectedEntry?.tipo === item.tipo ? CLINICA_PALETTE.accentSoft : 'transparent' }}
                                                 >
-                                                    <td>{fmtDateTime(item.fecha)}</td>
+                                                    <td style={{ whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: 1.35 }}>{fmtDateTime(item.fecha)}</td>
                                                     <td>
                                                         <span className={`badge ${item.tipo === 'OFTALMOLOGIA' ? 'badge-blue' : item.tipo === 'CONTACTOLOGIA' ? 'badge-success' : 'badge-warning'}`}>
                                                             {item.tipo === 'RECETA_MEDICAMENTOS' ? 'RECETA' : item.tipo}
@@ -5655,17 +5906,117 @@ function HistorialClinicoGeneralSection() {
                                                         <div style={{ fontWeight: 700 }}>{item.paciente_nombre}</div>
                                                         <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem' }}>{item.paciente_ci || '-'}</div>
                                                     </td>
-                                                    <td style={{ whiteSpace: 'normal', wordBreak: 'break-word' }}>{item.doctor_nombre || '-'}</td>
-                                                    <td style={{ whiteSpace: 'normal', wordBreak: 'break-word' }}>{item.lugar_nombre || '-'}</td>
-                                                    <td style={{ whiteSpace: 'normal', wordBreak: 'break-word' }}>{item.diagnostico || item.resumen || item.motivo || item.observaciones || '-'}</td>
+                                                    <td style={{ whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: 1.35 }}>
+                                                        <div style={{ fontWeight: 700 }}>{item.doctor_nombre || 'Sin doctor'}</div>
+                                                        <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem', marginTop: 6 }}>
+                                                            {item.lugar_nombre || 'Sin lugar'}
+                                                        </div>
+                                                    </td>
+                                                    <td style={{ textAlign: 'right', position: 'sticky', right: 0, background: selectedEntry?.id === item.id && selectedEntry?.tipo === item.tipo ? CLINICA_PALETTE.accentSoft : 'var(--bg-card)' }} onClick={event => event.stopPropagation()}>
+                                                        <button type="button" className="btn btn-secondary btn-sm" onClick={event => openHistoryRowActions(event, item)}>
+                                                            Acciones v
+                                                        </button>
+                                                    </td>
                                                 </tr>
-                                            )) : <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No hay registros para los filtros seleccionados.</td></tr>}
+                                            )) : <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-muted)' }}>No hay registros para los filtros seleccionados.</td></tr>}
                                         </tbody>
                                     </table>
                                 </div>
                             </div>
+                            {rowActionsMenu.open && rowActionsMenu.item && (
+                                <>
+                                    <div style={{ position: 'fixed', inset: 0, zIndex: 90 }} onClick={closeHistoryRowActions} />
+                                    <div
+                                        style={{
+                                            position: 'fixed',
+                                            top: rowActionsMenu.top,
+                                            left: rowActionsMenu.left,
+                                            width: 260,
+                                            background: '#1b2130',
+                                            border: '1px solid rgba(255,255,255,0.12)',
+                                            borderRadius: 12,
+                                            boxShadow: '0 20px 40px rgba(0,0,0,0.35)',
+                                            padding: 8,
+                                            zIndex: 100,
+                                            display: 'grid',
+                                            gap: 6,
+                                        }}
+                                        onClick={event => event.stopPropagation()}
+                                    >
+                                        {canView && (
+                                            <button type="button" className="dropdown-item" onClick={() => {
+                                                closeHistoryRowActions()
+                                                if (rowActionsMenu.item.tipo === 'RECETA_MEDICAMENTOS') {
+                                                    openRecetaModal('view', rowActionsMenu.item)
+                                                    return
+                                                }
+                                                openConsultaModal('view', rowActionsMenu.item)
+                                            }}>
+                                                <Eye size={14} style={{ marginRight: 8 }} /> {rowActionsMenu.item.tipo === 'RECETA_MEDICAMENTOS' ? 'Ver receta' : 'Ver consulta'}
+                                            </button>
+                                        )}
+                                        {canEdit && (
+                                            <button type="button" className="dropdown-item" onClick={() => {
+                                                closeHistoryRowActions()
+                                                if (rowActionsMenu.item.tipo === 'RECETA_MEDICAMENTOS') {
+                                                    openRecetaModal('edit', rowActionsMenu.item)
+                                                    return
+                                                }
+                                                openConsultaModal('edit', rowActionsMenu.item)
+                                            }}>
+                                                <Pencil size={14} style={{ marginRight: 8 }} /> Editar
+                                            </button>
+                                        )}
+                                        {canExport && (
+                                            <button type="button" className="dropdown-item" onClick={() => {
+                                                closeHistoryRowActions()
+                                                openPdf(rowActionsMenu.item)
+                                            }}>
+                                                <FileText size={14} style={{ marginRight: 8 }} /> {rowActionsMenu.item.tipo === 'RECETA_MEDICAMENTOS' ? 'PDF de receta de medicamentos' : 'PDF de consulta'}
+                                            </button>
+                                        )}
+                                        {canExport && rowActionsMenu.item.tipo === 'OFTALMOLOGIA' && (
+                                            <button type="button" className="dropdown-item" onClick={() => {
+                                                closeHistoryRowActions()
+                                                openPdf(rowActionsMenu.item)
+                                            }}>
+                                                <FileText size={14} style={{ marginRight: 8 }} /> Receta de lentes PDF
+                                            </button>
+                                        )}
+                                        {canExport && rowActionsMenu.item.tipo !== 'RECETA_MEDICAMENTOS' && (
+                                            <button type="button" className="dropdown-item" onClick={() => openLinkedRecetaCompraPdf(rowActionsMenu.item)}>
+                                                <FileText size={14} style={{ marginRight: 8 }} /> Receta de medicamentos PDF
+                                            </button>
+                                        )}
+                                        {canExport && (
+                                            <button type="button" className="dropdown-item" onClick={() => openLinkedRecetaIndicacionesPdf(rowActionsMenu.item)}>
+                                                <FileText size={14} style={{ marginRight: 8 }} /> Indicaciones de medicamentos
+                                            </button>
+                                        )}
+                                        {canEdit && (
+                                            <button
+                                                type="button"
+                                                className="dropdown-item"
+                                                style={{ color: '#ff8e8e' }}
+                                                onClick={() => {
+                                                    closeHistoryRowActions()
+                                                    if (rowActionsMenu.item.tipo === 'RECETA_MEDICAMENTOS') {
+                                                        if (!window.confirm('Se eliminara esta receta. Desea continuar?')) return
+                                                        deleteRecetaMutation.mutate(rowActionsMenu.item.id)
+                                                        return
+                                                    }
+                                                    if (!window.confirm('Se eliminara esta consulta. Desea continuar?')) return
+                                                    deleteConsultaMutation.mutate(rowActionsMenu.item)
+                                                }}
+                                            >
+                                                <Trash2 size={14} style={{ marginRight: 8 }} /> Eliminar
+                                            </button>
+                                        )}
+                                    </div>
+                                </>
+                            )}
 
-                            <div className="card" style={{ minWidth: 0 }}>
+                            <div className="card" style={{ minWidth: 0, height: 'calc(100vh - 265px)', display: 'flex', flexDirection: 'column' }}>
                                 {!selectedEntry ? (
                                     <div style={{ color: 'var(--text-muted)' }}>Seleccione un registro para ver su detalle.</div>
                                 ) : detalleQuery.isLoading ? (
@@ -5673,7 +6024,11 @@ function HistorialClinicoGeneralSection() {
                                 ) : detalleQuery.isError ? (
                                     <div className="alert alert-error">{formatError(detalleQuery.error, 'No se pudo cargar el detalle del registro clinico.')}</div>
                                 ) : selectedEntry.tipo === 'RECETA_MEDICAMENTOS' ? (
-                                    <div style={{ display: 'grid', gap: 12 }}>
+                                    <div style={{ display: 'grid', gap: 12, overflowY: 'auto', height: '100%', paddingRight: 4 }}>
+                                        <div>
+                                            <div style={{ fontWeight: 800 }}>Preview de la receta</div>
+                                            <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem' }}>Seleccion actual: {selectedEntry.paciente_nombre}</div>
+                                        </div>
                                         <div><strong>Paciente:</strong> {selectedEntry.paciente_nombre}</div>
                                         <div><strong>Fecha:</strong> {fmtDateTime(detalleQuery.data?.fecha_emision || selectedEntry.fecha)}</div>
                                         <div><strong>Doctor:</strong> {detalleQuery.data?.doctor_nombre || selectedEntry.doctor_nombre || '-'}</div>
@@ -5696,7 +6051,11 @@ function HistorialClinicoGeneralSection() {
                                     (() => {
                                         const detalle = detalleQuery.data || {}
                                         return (
-                                            <div style={{ display: 'grid', gap: 12 }}>
+                                            <div style={{ display: 'grid', gap: 12, overflowY: 'auto', height: '100%', paddingRight: 4 }}>
+                                                <div>
+                                                    <div style={{ fontWeight: 800 }}>Preview de la consulta</div>
+                                                    <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem' }}>Seleccion actual: {selectedEntry.paciente_nombre}</div>
+                                                </div>
                                                 <div><strong>Paciente:</strong> {selectedEntry.paciente_nombre}</div>
                                                 <div><strong>Fecha:</strong> {fmtDateTime(detalle.fecha || selectedEntry.fecha)}</div>
                                                 <div><strong>Doctor:</strong> {detalle.doctor_nombre || selectedEntry.doctor_nombre || '-'}</div>
@@ -6325,6 +6684,12 @@ export default function ClinicaPage() {
     const location = useLocation()
     const navigate = useNavigate()
     const { user } = useAuth()
+    const { data: whatsappTemplates = [] } = useWhatsappTemplatesCatalog()
+
+    useEffect(() => {
+        const clinicaTemplate = getWhatsappTemplateByCode(whatsappTemplates, CLINICA_TEMPLATE_CODE, DEFAULT_WHATSAPP_TEMPLATE)
+        localStorage.setItem(WHATSAPP_TEMPLATE_KEY, clinicaTemplate)
+    }, [whatsappTemplates])
 
     const sectionKey = useMemo(() => {
         const found = CLINICA_TABS.find(tab => location.pathname === tab.path)

@@ -2,10 +2,16 @@ import { useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../context/AuthContext'
 import Modal from '../components/Modal'
+import FinancialJornadaNotice from '../components/FinancialJornadaNotice'
 import { ArrowDownCircle, ArrowUpCircle, CreditCard, DollarSign, Eye, Pencil, Plus, Trash2 } from 'lucide-react'
+import { invalidateJornadaLiveData, useFinancialJornadaStatus } from '../hooks/useFinancialJornada'
+import { parseBackendDateTime } from '../utils/formatters'
 
 const fmt = v => new Intl.NumberFormat('es-PY').format(v ?? 0)
-const fmtDate = d => d ? new Date(d).toLocaleDateString('es-PY', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'
+const fmtDate = d => {
+    const date = parseBackendDateTime(d)
+    return date ? date.toLocaleDateString('es-PY', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-'
+}
 
 function tipoBadge(tipo) {
     if (['INGRESO', 'VENTA'].includes(tipo)) return <span className="badge badge-green">{tipo}</span>
@@ -37,6 +43,7 @@ function TransferenciaInternaModal({ onClose }) {
             qc.invalidateQueries({ queryKey: ['saldo-caja'] })
             qc.invalidateQueries({ queryKey: ['movimientos-caja'] })
             qc.invalidateQueries({ queryKey: ['reportes-finanzas'] })
+            invalidateJornadaLiveData(qc)
             onClose()
         },
     })
@@ -573,7 +580,9 @@ function BancoRowActions({ banco, onVerMovimientos, onEditar, onEliminar }) {
 
     const handleAction = callback => {
         setOpen(false)
-        callback()
+        window.setTimeout(() => {
+            callback()
+        }, 0)
     }
 
     const toggleMenu = () => {
@@ -651,6 +660,8 @@ export default function CajaPage() {
     const [bancoForm, setBancoForm] = useState(null)
     const [monto, setMonto] = useState('')
     const [concepto, setConcepto] = useState('')
+    const { data: jornadaEstado } = useFinancialJornadaStatus()
+    const jornadaAbierta = Boolean(jornadaEstado?.abierta)
 
     const { data: saldoCaja } = useQuery({ queryKey: ['saldo-caja'], queryFn: () => api.get('/caja/saldo').then(r => r.data), retry: false })
     const { data: movCaja = [] } = useQuery({ queryKey: ['movimientos-caja'], queryFn: () => api.get('/caja/movimientos?limit=50').then(r => r.data), retry: false })
@@ -661,6 +672,7 @@ export default function CajaPage() {
         onSuccess: () => {
             qc.invalidateQueries({ queryKey: ['saldo-caja'] })
             qc.invalidateQueries({ queryKey: ['movimientos-caja'] })
+            invalidateJornadaLiveData(qc)
             setModalAjuste(false)
             setMonto('')
             setConcepto('')
@@ -700,13 +712,14 @@ export default function CajaPage() {
 
     return (
         <div className="page-body">
+            <FinancialJornadaNotice compact />
             <div className="flex-between mb-24">
                 <div>
                     <h2 style={{ fontSize: '1.25rem', fontWeight: 700 }}>Centro Financiero</h2>
                     <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>Caja y bancos en una sola vista, con pestañas internas para cada area</p>
                 </div>
                 <div style={{ display: 'flex', gap: 8 }}>
-                    <button className="btn btn-secondary" onClick={() => setModalTransferencia(true)}>
+                    <button className="btn btn-secondary" onClick={() => setModalTransferencia(true)} disabled={!jornadaAbierta}>
                         <ArrowUpCircle size={16} /> Transferencia interna
                     </button>
                     {tabBtn('caja', 'Caja', <DollarSign size={16} />)}
@@ -730,7 +743,7 @@ export default function CajaPage() {
                             </div>
                         </div>
                         <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
-                            <button className="btn btn-primary" onClick={() => { setMonto(''); setConcepto(''); setModalAjuste(true) }}>
+                            <button className="btn btn-primary" onClick={() => { setMonto(''); setConcepto(''); setModalAjuste(true) }} disabled={!jornadaAbierta}>
                                 <Plus size={16} /> Ajuste de Caja
                             </button>
                         </div>
@@ -851,7 +864,7 @@ export default function CajaPage() {
                         </div>
                         <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
                             <button type="button" className="btn btn-secondary" onClick={() => setModalAjuste(false)}>Cancelar</button>
-                            <button type="submit" className="btn btn-primary" disabled={ajustar.isPending}>Aplicar Ajuste</button>
+                            <button type="submit" className="btn btn-primary" disabled={ajustar.isPending || !jornadaAbierta}>Aplicar Ajuste</button>
                         </div>
                     </form>
                 </Modal>
@@ -877,3 +890,4 @@ export default function CajaPage() {
         </div>
     )
 }
+

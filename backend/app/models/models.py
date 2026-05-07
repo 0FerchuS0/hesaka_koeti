@@ -10,6 +10,11 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.database import Base
+from app.utils.timezone import ahora_desde_config
+
+
+def _business_now() -> datetime:
+    return ahora_desde_config()
 
 
 class TimestampMixin:
@@ -154,7 +159,8 @@ class Cliente(TimestampMixin, Base):
     telefono = Column(String(20))
     email = Column(String(100))
     direccion = Column(Text)
-    fecha_registro = Column(DateTime, default=datetime.now)
+    fecha_nacimiento = Column(Date)
+    fecha_registro = Column(DateTime, default=_business_now)
     notas = Column(Text)
     referidor_id = Column(Integer, ForeignKey('referidores.id'), nullable=True)
     referidor_rel = relationship("Referidor", back_populates="clientes", lazy='selectin')
@@ -166,7 +172,7 @@ class PresupuestoGrupo(TimestampMixin, Base):
     __tablename__ = 'presupuesto_grupos'
     id = Column(Integer, primary_key=True, autoincrement=True)
     nombre = Column(String(100), nullable=False)
-    fecha_creacion = Column(DateTime, default=datetime.now)
+    fecha_creacion = Column(DateTime, default=_business_now)
     estado = Column(String(20), default='PENDIENTE')
     total = Column(Float, default=0.0)
     venta_id = Column(Integer, ForeignKey('ventas.id'), nullable=True)
@@ -185,7 +191,7 @@ class Presupuesto(TimestampMixin, Base):
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
     codigo = Column(String(50), unique=True, nullable=False)
-    fecha = Column(DateTime, default=datetime.now)
+    fecha = Column(DateTime, default=_business_now)
     estado = Column(String(20), default='BORRADOR')
     cliente_id = Column(Integer, ForeignKey('clientes.id'), nullable=False)
     cliente_rel = relationship("Cliente", lazy='selectin')
@@ -248,7 +254,7 @@ class Venta(TimestampMixin, Base):
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
     codigo = Column(String(50), unique=True, nullable=False)
-    fecha = Column(DateTime, default=datetime.now)
+    fecha = Column(DateTime, default=_business_now)
     cliente_id = Column(Integer, ForeignKey('clientes.id'), nullable=False)
     cliente_rel = relationship("Cliente", lazy='selectin')
     presupuesto_id = Column(Integer, ForeignKey('presupuestos.id'), nullable=True)
@@ -282,7 +288,7 @@ class Pago(TimestampMixin, Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     venta_id = Column(Integer, ForeignKey('ventas.id'), nullable=False)
     venta_rel = relationship("Venta", back_populates="pagos", lazy='selectin')
-    fecha = Column(DateTime, default=datetime.now)
+    fecha = Column(DateTime, default=_business_now)
     monto = Column(Float, nullable=False)
     metodo_pago = Column(String(50))
     nota = Column(String(255), nullable=True)
@@ -296,7 +302,7 @@ class AjusteVenta(TimestampMixin, Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     venta_id = Column(Integer, ForeignKey('ventas.id'), nullable=False)
     venta_rel = relationship("Venta", back_populates="ajustes", lazy='selectin')
-    fecha = Column(DateTime, default=datetime.now)
+    fecha = Column(DateTime, default=_business_now)
     monto = Column(Float, nullable=False)
     motivo = Column(Text, nullable=False)
     tipo = Column(String(50), default='DESCUENTO')
@@ -326,7 +332,7 @@ class Comision(TimestampMixin, Base):
     referidor_id = Column(Integer, ForeignKey('referidores.id'), nullable=False)
     referidor_rel = relationship("Referidor", back_populates="comisiones", lazy='selectin')
     monto = Column(Float, nullable=False)
-    fecha = Column(DateTime, default=datetime.now)
+    fecha = Column(DateTime, default=_business_now)
     estado = Column(String(20), default='PENDIENTE')
     descripcion = Column(Text)
     venta_id = Column(Integer, ForeignKey('ventas.id'), nullable=True)
@@ -362,18 +368,19 @@ class MovimientoBanco(TimestampMixin, Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     banco_id = Column(Integer, ForeignKey('bancos.id'), nullable=False)
     banco_rel = relationship("Banco", back_populates="movimientos", lazy='selectin')
-    fecha = Column(DateTime, default=datetime.now)
+    fecha = Column(DateTime, default=_business_now)
     tipo = Column(String(20), nullable=False)
     monto = Column(Float, nullable=False)
     concepto = Column(String(255))
     saldo_anterior = Column(Float, nullable=False)
     saldo_nuevo = Column(Float, nullable=False)
     pago_venta_id = Column(Integer, ForeignKey('pagos.id'), nullable=True)
-    pago_venta_rel = relationship("Pago", lazy='selectin')
+    pago_venta_rel = relationship("Pago", lazy='selectin', foreign_keys=[pago_venta_id])
     pago_compra_id = Column(Integer, ForeignKey('pagos_compras.id'), nullable=True)
-    pago_compra_rel = relationship("PagoCompra", lazy='selectin')
+    pago_compra_rel = relationship("PagoCompra", lazy='selectin', foreign_keys=[pago_compra_id])
     gasto_operativo_id = Column(Integer, ForeignKey('gastos_operativos.id'), nullable=True)
     grupo_pago_id = Column(String(50), nullable=True)
+    jornada_id = Column(Integer, ForeignKey('jornadas_financieras.id'), nullable=True)
 
 
 # ─── Compras ───────────────────────────────────────────────────────────────────
@@ -397,7 +404,7 @@ class Compra(TimestampMixin, Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     proveedor_id = Column(Integer, ForeignKey('proveedores.id'), nullable=True)
     proveedor_rel = relationship("Proveedor", lazy='selectin')
-    fecha = Column(DateTime, default=datetime.now)
+    fecha = Column(DateTime, default=_business_now)
     tipo_documento = Column(String(50), nullable=False)
     nro_factura = Column(String(50), nullable=True)
     tipo_documento_original = Column(String(50), nullable=True)
@@ -445,7 +452,7 @@ class PagoCompra(TimestampMixin, Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     compra_id = Column(Integer, ForeignKey('compras.id'), nullable=False)
     compra_rel = relationship("Compra", back_populates="pagos", lazy='selectin')
-    fecha = Column(DateTime, default=datetime.now)
+    fecha = Column(DateTime, default=_business_now)
     monto = Column(Float, nullable=False)
     metodo_pago = Column(String(50))
     banco_id = Column(Integer, ForeignKey('bancos.id'), nullable=True)
@@ -475,7 +482,7 @@ class GastoOperativo(TimestampMixin, Base):
         Index('idx_gasto_categoria', 'categoria_id'),
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
-    fecha = Column(DateTime, default=datetime.now)
+    fecha = Column(DateTime, default=_business_now)
     categoria_id = Column(Integer, ForeignKey('categorias_gasto.id'), nullable=False)
     categoria_rel = relationship("CategoriaGasto", back_populates="gastos", lazy='selectin')
     monto = Column(Float, nullable=False)
@@ -488,6 +495,98 @@ class GastoOperativo(TimestampMixin, Base):
     banco_rel = relationship("Banco", lazy='selectin')
 
 
+class JornadaFinanciera(TimestampMixin, Base):
+    __tablename__ = 'jornadas_financieras'
+    __table_args__ = (
+        Index('idx_jornada_financiera_fecha', 'fecha'),
+        Index('idx_jornada_financiera_estado', 'estado'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fecha = Column(Date, nullable=False, unique=True)
+    estado = Column(String(20), nullable=False, default='ABIERTA')
+    fecha_hora_apertura = Column(DateTime, default=_business_now, nullable=False)
+    usuario_apertura_id = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    usuario_apertura_nombre = Column(String(100), nullable=True)
+    observacion_apertura = Column(Text, nullable=True)
+
+
+class DestinatarioRendicion(TimestampMixin, Base):
+    """Personas autorizadas a recibir rendiciones de caja (catálogo por tenant)."""
+    __tablename__ = 'destinatarios_rendicion'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    nombre = Column(String(150), unique=True, nullable=False)
+    activo = Column(Boolean, nullable=False, default=True)
+
+
+class PlantillaWhatsapp(TimestampMixin, Base):
+    """Catalogo tenant de plantillas predefinidas para mensajes de WhatsApp."""
+    __tablename__ = 'plantillas_whatsapp'
+    __table_args__ = (
+        Index('idx_plantilla_whatsapp_codigo', 'codigo'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    codigo = Column(String(80), unique=True, nullable=False)
+    nombre = Column(String(150), nullable=False)
+    descripcion = Column(Text, nullable=True)
+    plantilla = Column(Text, nullable=False)
+    activo = Column(Boolean, nullable=False, default=True)
+    editable = Column(Boolean, nullable=False, default=True)
+
+
+class CorteJornadaFinanciera(TimestampMixin, Base):
+    __tablename__ = 'cortes_jornada_financiera'
+    __table_args__ = (
+        Index('idx_corte_jornada_fecha_hora', 'fecha_hora_corte'),
+        Index('idx_corte_jornada_jornada_id', 'jornada_id'),
+        Index('idx_corte_jornada_jornada_fecha', 'jornada_id', 'fecha_hora_corte'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    jornada_id = Column(Integer, ForeignKey('jornadas_financieras.id'), nullable=False)
+    fecha_hora_corte = Column(DateTime, default=_business_now, nullable=False)
+    usuario_id = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    usuario_nombre = Column(String(100), nullable=True)
+    ingresos = Column(Float, default=0.0, nullable=False)
+    egresos = Column(Float, default=0.0, nullable=False)
+    neto = Column(Float, default=0.0, nullable=False)
+    movimientos_caja = Column(Integer, default=0, nullable=False)
+    movimientos_banco = Column(Integer, default=0, nullable=False)
+    movimientos_total = Column(Integer, default=0, nullable=False)
+    saldo_actual_caja = Column(Float, default=0.0, nullable=False)
+    saldo_actual_bancos = Column(Float, default=0.0, nullable=False)
+    saldo_final_total = Column(Float, default=0.0, nullable=False)
+
+
+class RendicionJornadaFinanciera(TimestampMixin, Base):
+    __tablename__ = 'rendiciones_jornada_financiera'
+    __table_args__ = (
+        Index('idx_rendicion_jornada_fecha_hora', 'fecha_hora_rendicion'),
+        Index('idx_rendicion_jornada_jornada_id', 'jornada_id'),
+        Index('idx_rendicion_jornada_estado', 'estado'),
+        Index('idx_rendicion_jornada_jornada_fecha', 'jornada_id', 'fecha_hora_rendicion'),
+        Index('idx_rendicion_destinatario', 'destinatario_rendicion_id'),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    jornada_id = Column(Integer, ForeignKey('jornadas_financieras.id'), nullable=False)
+    fecha_hora_rendicion = Column(DateTime, default=_business_now, nullable=False)
+    usuario_id = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    usuario_nombre = Column(String(100), nullable=True)
+    destinatario_rendicion_id = Column(Integer, ForeignKey('destinatarios_rendicion.id'), nullable=True)
+    rendido_a = Column(String(150), nullable=False)
+    monto_sugerido = Column(Float, default=0.0, nullable=False)
+    monto_rendido = Column(Float, default=0.0, nullable=False)
+    observacion = Column(Text, nullable=True)
+    estado = Column(String(20), default='VIGENTE', nullable=False)
+    rendicion_original_id = Column(Integer, ForeignKey('rendiciones_jornada_financiera.id'), nullable=True)
+    fecha_hora_original = Column(DateTime, nullable=True)
+    rendido_a_original = Column(String(150), nullable=True)
+    monto_rendido_original = Column(Float, nullable=True)
+    observacion_original = Column(Text, nullable=True)
+    fecha_hora_ultima_edicion = Column(DateTime, nullable=True)
+    usuario_ultima_edicion_id = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    usuario_ultima_edicion_nombre = Column(String(100), nullable=True)
+    motivo_ajuste = Column(Text, nullable=True)
+
+
 class MovimientoCaja(TimestampMixin, Base):
     __tablename__ = 'movimientos_caja'
     __table_args__ = (
@@ -495,16 +594,20 @@ class MovimientoCaja(TimestampMixin, Base):
         Index('idx_mov_caja_tipo', 'tipo'),
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
-    fecha = Column(DateTime, default=datetime.now)
+    fecha = Column(DateTime, default=_business_now)
     tipo = Column(String(20), nullable=False)
     monto = Column(Float, nullable=False)
     concepto = Column(String(255))
     saldo_anterior = Column(Float, nullable=False)
     saldo_nuevo = Column(Float, nullable=False)
     pago_venta_id = Column(Integer, ForeignKey('pagos.id'), nullable=True)
+    pago_venta_rel = relationship("Pago", lazy='selectin', foreign_keys=[pago_venta_id])
     pago_compra_id = Column(Integer, ForeignKey('pagos_compras.id'), nullable=True)
+    pago_compra_rel = relationship("PagoCompra", lazy='selectin', foreign_keys=[pago_compra_id])
     deposito_banco_id = Column(Integer, ForeignKey('movimientos_banco.id'), nullable=True)
     gasto_operativo_id = Column(Integer, ForeignKey('gastos_operativos.id'), nullable=True)
+    gasto_operativo_rel = relationship("GastoOperativo", lazy='selectin', foreign_keys=[gasto_operativo_id])
+    jornada_id = Column(Integer, ForeignKey('jornadas_financieras.id'), nullable=True)
 
 
 class ConfiguracionCaja(TimestampMixin, Base):
@@ -522,10 +625,19 @@ class ConfiguracionEmpresa(TimestampMixin, Base):
     telefono = Column(String(50))
     email = Column(String(100))
     logo_path = Column(String(255))
+    business_timezone = Column(String(64), default="America/Asuncion")
     porcentaje_comision_tarjeta = Column(Float, default=3.3)
 
 
 # ─── Usuarios del tenant ───────────────────────────────────────────────────────
+
+class DashboardCache(TimestampMixin, Base):
+    __tablename__ = 'dashboard_cache'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cache_key = Column(String(80), unique=True, nullable=False)
+    business_date = Column(Date, nullable=False)
+    payload_json = Column(Text, nullable=False)
+
 
 class Usuario(TimestampMixin, Base):
     """Usuarios que acceden al sistema web de un cliente específico."""

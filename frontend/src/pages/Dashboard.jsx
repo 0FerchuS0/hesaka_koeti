@@ -3,13 +3,20 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAuth, api } from '../context/AuthContext'
 import {
     TrendingUp, ShoppingCart, Package,
-    DollarSign, AlertCircle, Clock, BarChart3, MessageCircle
+    DollarSign, AlertCircle, Clock, BarChart3, MessageCircle, Gift
 } from 'lucide-react'
 import {
     AreaChart, Area, XAxis, YAxis, CartesianGrid,
     Tooltip, ResponsiveContainer
 } from 'recharts'
 import Modal from '../components/Modal'
+import { getWhatsappTemplateByCode, useWhatsappTemplatesCatalog } from '../hooks/useWhatsappTemplates'
+import { formatCurrentBusinessDate, parseBackendDateTime, todayBusinessInputValue } from '../utils/formatters'
+
+const DEFAULT_DASHBOARD_RECORDATORIO_TEMPLATE = 'Hola {paciente}, te escribimos de {empresa}. Tu ultima consulta fue el {ultima_consulta} y tu proximo control esta previsto para el {proxima_consulta} a las {hora_turno}. Quedamos atentos para ayudarte a confirmar tu cita.'
+const DEFAULT_CUMPLEANOS_TEMPLATE = 'Hola {cliente}, te escribimos de {empresa}. Queremos desearte un muy feliz cumpleaños. Que tengas un excelente dia.'
+const DASHBOARD_RECORDATORIO_TEMPLATE_CODE = 'dashboard_recordatorio'
+const CUMPLEANOS_TEMPLATE_CODE = 'cumpleanos_cliente'
 
 function fmt(value) {
     return new Intl.NumberFormat('es-PY', {
@@ -19,6 +26,10 @@ function fmt(value) {
     }).format(value ?? 0)
 }
 
+function todayInputValue() {
+    return todayBusinessInputValue()
+}
+
 function fmtShortRange(desde, hasta) {
     const start = new Date(desde)
     const end = new Date(hasta)
@@ -26,13 +37,13 @@ function fmtShortRange(desde, hasta) {
     return `${dd(start.getDate())}/${dd(start.getMonth() + 1)} - ${dd(end.getDate())}/${dd(end.getMonth() + 1)}/${end.getFullYear()}`
 }
 
-function StatCard({ icon: Icon, iconClass, label, value, sub }) {
+function StatCard({ icon: Icon, iconClass, label, value, sub, valueClassName = '', cardClassName = '' }) {
     return (
-        <div className="stat-card">
+        <div className={`stat-card ${cardClassName}`.trim()}>
             <div className={`stat-icon ${iconClass}`}><Icon size={22} /></div>
             <div className="stat-info">
                 <div className="stat-label">{label}</div>
-                <div className="stat-value">{value}</div>
+                <div className={`stat-value ${valueClassName}`.trim()}>{value}</div>
                 {sub && <div className="stat-sub">{sub}</div>}
             </div>
         </div>
@@ -53,16 +64,23 @@ function ComparisonCard({ color, title, value, range }) {
 
 function fmtDate(value) {
     if (!value) return '-'
-    const date = new Date(value)
-    if (Number.isNaN(date.getTime())) return '-'
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return '-'
     return date.toLocaleDateString('es-PY')
 }
 
 function fmtDateTime(value) {
     if (!value) return '-'
-    const date = new Date(value)
-    if (Number.isNaN(date.getTime())) return '-'
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return '-'
     return date.toLocaleString('es-PY')
+}
+
+function fmtTime(value) {
+    if (!value) return 'sin hora'
+    const date = parseBackendDateTime(value)
+    if (!date || Number.isNaN(date.getTime())) return 'sin hora'
+    return date.toLocaleTimeString('es-PY', { hour: '2-digit', minute: '2-digit' })
 }
 
 function normalizarTelefonoWhatsapp(value) {
@@ -85,7 +103,11 @@ function normalizarTelefonoWhatsapp(value) {
         return `595${digits.slice(1)}`
     }
 
-    if (digits.startsWith('9') && digits.length === 9) {
+    if (digits.startsWith('0') && digits.length >= 7 && digits.length <= 11) {
+        return `595${digits.slice(1)}`
+    }
+
+    if (digits.startsWith('9') && digits.length >= 8 && digits.length <= 10) {
         return `595${digits}`
     }
 
@@ -93,47 +115,72 @@ function normalizarTelefonoWhatsapp(value) {
         return digits
     }
 
-    return digits.startsWith('595') ? digits : ''
+    return digits.startsWith('595') && digits.length >= 10 ? digits : ''
 }
 
-function buildReminderWhatsappLink(item) {
+function buildReminderWhatsappLink(item, empresa = 'HESAKA', template = DEFAULT_DASHBOARD_RECORDATORIO_TEMPLATE) {
     const telefono = normalizarTelefonoWhatsapp(item?.paciente_telefono)
     if (!telefono) return ''
     const ultimaConsulta = item?.ultima_consulta_fecha ? fmtDate(item.ultima_consulta_fecha) : 'sin registro'
     const proximaConsulta = item?.fecha_hora ? fmtDate(item.fecha_hora) : 'sin fecha'
-    const mensaje = [
-        `Hola ${item?.paciente_nombre || ''}, te escribimos de HESAKA.`,
-        `Tu ultima consulta fue el ${ultimaConsulta} y tu proximo control esta previsto para el ${proximaConsulta}.`,
-        'Quedamos atentos para ayudarte a confirmar tu cita.',
-    ].join(' ')
+    const horaTurno = fmtTime(item?.fecha_hora)
+    const mensaje = (template || DEFAULT_DASHBOARD_RECORDATORIO_TEMPLATE)
+        .replaceAll('{paciente}', item?.paciente_nombre || '')
+        .replaceAll('{ultima_consulta}', ultimaConsulta)
+        .replaceAll('{proxima_consulta}', proximaConsulta)
+        .replaceAll('{hora_turno}', horaTurno)
+        .replaceAll('{empresa}', empresa)
+    return `https://wa.me/${telefono}?text=${encodeURIComponent(mensaje)}`
+}
+
+function buildBirthdayWhatsappLink(cliente, empresa = 'HESAKA', template = DEFAULT_CUMPLEANOS_TEMPLATE) {
+    const telefono = normalizarTelefonoWhatsapp(cliente?.telefono)
+    if (!telefono) return ''
+    const mensaje = (template || DEFAULT_CUMPLEANOS_TEMPLATE)
+        .replaceAll('{cliente}', cliente?.nombre || '')
+        .replaceAll('{empresa}', empresa)
     return `https://wa.me/${telefono}?text=${encodeURIComponent(mensaje)}`
 }
 
 function flattenReminderBuckets(reminderBuckets) {
     return [
         ...(reminderBuckets?.hoy || []),
-        ...(reminderBuckets?.ocho_dias || []),
-        ...(reminderBuckets?.quince_dias || []),
+        ...(reminderBuckets?.tres_dias || []),
     ]
+}
+
+function getReminderBadgeLabel(categoria) {
+    if (categoria === 'hoy') return 'Hoy'
+    if (categoria === '3_dias') return 'En 3 dias'
+    return 'Pendiente'
+}
+
+function getReminderBadgeClass(categoria) {
+    return categoria === 'hoy' ? 'badge-red' : 'badge-yellow'
 }
 
 function getDailyReminderStorageKey(user) {
     const userKey = user?.id || user?.email || user?.nombre || 'anon'
-    return `hesaka-recordatorios-vistos-${userKey}-${new Date().toISOString().slice(0, 10)}`
+    return `hesaka-recordatorios-vistos-${userKey}-${todayInputValue()}`
 }
 
-function ReminderCards({ items, onMarkRemembered, actionPendingId = null }) {
+function ReminderCards({ items, onMarkRemembered, actionPendingId = null, empresaNombre = 'HESAKA', reminderTemplate = DEFAULT_DASHBOARD_RECORDATORIO_TEMPLATE }) {
     return (
         <div style={{ display: 'grid', gap: 12 }}>
             {items.map(item => {
-                const whatsappLink = buildReminderWhatsappLink(item)
+                const whatsappLink = buildReminderWhatsappLink(item, empresaNombre, reminderTemplate)
                 const isPending = actionPendingId === item.id
                 return (
                     <div key={`${item.id}-${item.recordatorio_categoria || 'sin-categoria'}`} className="card" style={{ padding: 14, background: 'rgba(255,255,255,0.02)' }}>
-                        <div style={{ display: 'grid', gap: 6 }}>
-                            <div style={{ fontWeight: 700 }}>{item.paciente_nombre}</div>
-                            <div style={{ color: 'var(--text-muted)', fontSize: '0.86rem' }}>Ultima consulta: {item.ultima_consulta_fecha ? fmtDate(item.ultima_consulta_fecha) : 'Sin registro'}</div>
-                            <div style={{ color: 'var(--text-muted)', fontSize: '0.86rem' }}>Proxima consulta: {fmtDateTime(item.fecha_hora)}</div>
+                        <div className="flex-between" style={{ gap: 12, alignItems: 'flex-start' }}>
+                            <div style={{ display: 'grid', gap: 6 }}>
+                                <div style={{ fontWeight: 700 }}>{item.paciente_nombre}</div>
+                                <div style={{ color: 'var(--text-muted)', fontSize: '0.86rem' }}>Ultima consulta: {item.ultima_consulta_fecha ? fmtDate(item.ultima_consulta_fecha) : 'Sin registro'}</div>
+                                <div style={{ color: 'var(--text-muted)', fontSize: '0.86rem' }}>Proxima consulta: {fmtDateTime(item.fecha_hora)}</div>
+                            </div>
+                            <span className={`badge ${getReminderBadgeClass(item.recordatorio_categoria)}`}>
+                                {getReminderBadgeLabel(item.recordatorio_categoria)}
+                            </span>
                         </div>
                         <div className="flex gap-12" style={{ marginTop: 12, flexWrap: 'wrap' }}>
                             <button type="button" className="btn btn-secondary btn-sm" onClick={() => onMarkRemembered(item)} disabled={isPending}>
@@ -162,21 +209,103 @@ function ReminderCards({ items, onMarkRemembered, actionPendingId = null }) {
     )
 }
 
+function BirthdayCards({ items, empresaNombre = 'HESAKA', template = DEFAULT_CUMPLEANOS_TEMPLATE }) {
+    return (
+        <div style={{ display: 'grid', gap: 12 }}>
+            {items.map(cliente => {
+                const whatsappLink = buildBirthdayWhatsappLink(cliente, empresaNombre, template)
+                return (
+                    <div key={cliente.id} className="card" style={{ padding: 14, background: 'rgba(255,255,255,0.02)' }}>
+                        <div className="flex-between" style={{ gap: 12, alignItems: 'flex-start' }}>
+                            <div style={{ display: 'grid', gap: 6 }}>
+                                <div style={{ fontWeight: 700 }}>{cliente.nombre}</div>
+                                <div style={{ color: 'var(--text-muted)', fontSize: '0.86rem' }}>
+                                    {cliente.edad ? `Cumple ${cliente.edad} anos` : 'Cumpleanos registrado'}
+                                </div>
+                                <div style={{ color: 'var(--text-muted)', fontSize: '0.86rem' }}>
+                                    {cliente.telefono || 'Sin telefono cargado'}
+                                </div>
+                            </div>
+                            <span className="badge badge-yellow">Hoy</span>
+                        </div>
+                        <div className="flex gap-12" style={{ marginTop: 12, flexWrap: 'wrap' }}>
+                            <a
+                                href={whatsappLink || undefined}
+                                target="_blank"
+                                rel="noreferrer"
+                                className={`btn btn-secondary btn-sm ${!whatsappLink ? 'disabled' : ''}`}
+                                onClick={event => {
+                                    if (!whatsappLink) {
+                                        event.preventDefault()
+                                        window.alert('Este cliente no tiene telefono valido para WhatsApp.')
+                                    }
+                                }}
+                                style={!whatsappLink ? { pointerEvents: 'auto', opacity: 0.6 } : undefined}
+                            >
+                                <MessageCircle size={14} /> WhatsApp
+                            </a>
+                        </div>
+                    </div>
+                )
+            })}
+        </div>
+    )
+}
+
 export default function Dashboard() {
     const { user } = useAuth()
     const queryClient = useQueryClient()
     const [showReminderModal, setShowReminderModal] = useState(false)
+    const [showBirthdayModal, setShowBirthdayModal] = useState(false)
+    const [loadSecondarySections, setLoadSecondarySections] = useState(false)
+
+    useEffect(() => {
+        const timerId = window.setTimeout(() => {
+            setLoadSecondarySections(true)
+        }, 150)
+        return () => window.clearTimeout(timerId)
+    }, [])
 
     const { data: dashboard } = useQuery({
         queryKey: ['dashboard-resumen'],
         queryFn: () => api.get('/reportes/dashboard/resumen').then(response => response.data),
         retry: false,
     })
-    const reminderQuery = useQuery({
-        queryKey: ['clinica', 'agenda-recordatorios'],
-        queryFn: async () => (await api.get('/clinica/agenda/recordatorios')).data,
+    const reminderSummaryQuery = useQuery({
+        queryKey: ['clinica', 'agenda-recordatorios-resumen'],
+        queryFn: async () => (await api.get('/clinica/agenda/recordatorios/resumen')).data,
+        enabled: loadSecondarySections,
         staleTime: 60 * 1000,
     })
+    const birthdaySummaryQuery = useQuery({
+        queryKey: ['clientes', 'cumpleanos-resumen', todayInputValue()],
+        queryFn: async () => (await api.get('/clientes/cumpleanos/resumen')).data,
+        enabled: loadSecondarySections,
+        staleTime: 5 * 60 * 1000,
+        retry: false,
+    })
+    const reminderDetailQuery = useQuery({
+        queryKey: ['clinica', 'agenda-recordatorios'],
+        queryFn: async () => (await api.get('/clinica/agenda/recordatorios')).data,
+        enabled: loadSecondarySections && showReminderModal,
+        staleTime: 60 * 1000,
+    })
+    const birthdayDetailQuery = useQuery({
+        queryKey: ['clientes', 'cumpleanos', todayInputValue()],
+        queryFn: async () => (await api.get('/clientes/cumpleanos')).data,
+        enabled: loadSecondarySections && showBirthdayModal,
+        staleTime: 5 * 60 * 1000,
+        retry: false,
+    })
+    const notificationsDetailEnabled = loadSecondarySections && (showReminderModal || showBirthdayModal)
+    const { data: configPublica } = useQuery({
+        queryKey: ['configuracion-general-publica'],
+        queryFn: () => api.get('/configuracion-general/publica').then(response => response.data),
+        enabled: notificationsDetailEnabled,
+        staleTime: 5 * 60 * 1000,
+        retry: false,
+    })
+    const { data: whatsappTemplates = [] } = useWhatsappTemplatesCatalog({ enabled: notificationsDetailEnabled })
 
     const markReminderMutation = useMutation({
         mutationFn: async item => {
@@ -185,21 +314,36 @@ export default function Dashboard() {
         onSuccess: async () => {
             await Promise.all([
                 queryClient.invalidateQueries({ queryKey: ['clinica', 'agenda-recordatorios'] }),
+                queryClient.invalidateQueries({ queryKey: ['clinica', 'agenda-recordatorios-resumen'] }),
                 queryClient.invalidateQueries({ queryKey: ['clinica', 'agenda'] }),
                 queryClient.invalidateQueries({ queryKey: ['clinica', 'dashboard'] }),
             ])
         },
     })
 
-    const reminderItems = flattenReminderBuckets(reminderQuery.data)
+    const reminderSummary = reminderSummaryQuery.data || { total: 0, hoy_count: 0, tres_dias_count: 0, hoy_preview: [], tres_dias_preview: [] }
+    const birthdaySummary = birthdaySummaryQuery.data || { total: 0, preview: [] }
+    const reminderItems = flattenReminderBuckets(reminderDetailQuery.data)
+    const birthdayItems = birthdayDetailQuery.data || []
+    const empresaNombre = (configPublica?.nombre || '').trim() || 'HESAKA'
+    const reminderTemplate = getWhatsappTemplateByCode(
+        whatsappTemplates,
+        DASHBOARD_RECORDATORIO_TEMPLATE_CODE,
+        DEFAULT_DASHBOARD_RECORDATORIO_TEMPLATE,
+    )
+    const cumpleanosTemplate = getWhatsappTemplateByCode(
+        whatsappTemplates,
+        CUMPLEANOS_TEMPLATE_CODE,
+        DEFAULT_CUMPLEANOS_TEMPLATE,
+    )
 
     useEffect(() => {
-        if (!reminderItems.length) return
+        if (!reminderSummary.total) return
         const storageKey = getDailyReminderStorageKey(user)
         if (localStorage.getItem(storageKey) === '1') return
         setShowReminderModal(true)
         localStorage.setItem(storageKey, '1')
-    }, [reminderItems.length, user])
+    }, [reminderSummary.total, user])
 
     const estadoBadge = estado => {
         const map = {
@@ -219,7 +363,7 @@ export default function Dashboard() {
                         Buenos dias, {user?.nombre?.split(' ')[0]} 👋
                     </h2>
                     <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: 4 }}>
-                        {new Date().toLocaleDateString('es-PY', { weekday: 'long', day: 'numeric', month: 'long' })}
+                            {formatCurrentBusinessDate('es-PY', { weekday: 'long', day: 'numeric', month: 'long' })}
                     </p>
                 </div>
             </div>
@@ -230,6 +374,8 @@ export default function Dashboard() {
                     iconClass="green"
                     label="Saldo en Caja"
                     value={fmt(dashboard?.saldo_caja ?? 0)}
+                    valueClassName="stat-value--currency"
+                    cardClassName="stat-card--stacked"
                 />
                 <StatCard
                     icon={TrendingUp}
@@ -251,25 +397,93 @@ export default function Dashboard() {
                     label="Modulo Activo"
                     value="Administrativo"
                     sub="+ Clinico disponible"
+                    valueClassName="stat-value--module"
+                    cardClassName="stat-card--stacked"
                 />
             </div>
 
-            {reminderItems.length ? (
-                <div className="card" style={{ marginBottom: 20, border: '1px solid rgba(56,189,248,0.25)', background: 'rgba(56,189,248,0.08)' }}>
-                    <div className="card-title flex-between">
-                        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                            <AlertCircle size={18} style={{ color: '#38bdf8' }} />
-                            Recordatorios clinicos pendientes
-                        </span>
-                        <button type="button" className="btn btn-secondary btn-sm" onClick={() => setShowReminderModal(true)}>
-                            Ver recordatorios
-                        </button>
+            <div className="dashboard-notifications-grid">
+                    <div className="card dashboard-notification-card dashboard-notification-card--reminder">
+                        <div className="card-title flex-between">
+                            <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                <AlertCircle size={18} style={{ color: '#38bdf8' }} />
+                                Recordatorios de consulta
+                            </span>
+                            <span className={`badge ${reminderSummary.total ? 'badge-red' : 'badge-gray'}`}>{reminderSummary.total}</span>
+                        </div>
+                        <div style={{ color: 'var(--text-muted)', marginBottom: 14 }}>
+                            {reminderSummary.total
+                                ? `${reminderSummary.hoy_count} para hoy y ${reminderSummary.tres_dias_count} para dentro de 3 dias.`
+                                : 'No hay recordatorios pendientes en este momento.'}
+                        </div>
+                        <div style={{ display: 'grid', gap: 10 }}>
+                            {[
+                                { key: 'hoy', title: 'Hoy', items: reminderSummary.hoy_preview || [], badgeClass: 'badge-red', count: reminderSummary.hoy_count },
+                                { key: '3_dias', title: 'En 3 dias', items: reminderSummary.tres_dias_preview || [], badgeClass: 'badge-yellow', count: reminderSummary.tres_dias_count },
+                            ].map(bucket => (
+                                <div key={bucket.key} style={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12, padding: 12, background: 'rgba(255,255,255,0.04)' }}>
+                                    <div className="flex-between" style={{ gap: 8, marginBottom: 8 }}>
+                                        <strong>{bucket.title}</strong>
+                                        <span className={`badge ${bucket.badgeClass}`}>{bucket.count}</span>
+                                    </div>
+                                    {bucket.items.length ? (
+                                        <div style={{ display: 'grid', gap: 8 }}>
+                                            {bucket.items.map(item => (
+                                                <div key={`${bucket.key}-${item.id}`} style={{ padding: '8px 10px', borderRadius: 8, background: 'rgba(15,23,42,0.24)' }}>
+                                                    <div style={{ fontWeight: 700 }}>{item.paciente_nombre}</div>
+                                                    <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem' }}>{fmtDateTime(item.fecha_hora)}</div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>Sin pendientes en esta franja.</div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                        <div className="flex gap-12" style={{ marginTop: 14, flexWrap: 'wrap' }}>
+                            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setShowReminderModal(true)} disabled={!reminderSummary.total}>
+                                Abrir bandeja
+                            </button>
+                        </div>
                     </div>
-                    <div style={{ color: 'var(--text-muted)' }}>
-                        Hay {reminderItems.length} recordatorio(s) pendientes para controles clinicos.
+
+                    <div className="card dashboard-notification-card dashboard-notification-card--birthday">
+                        <div className="card-title flex-between">
+                            <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                <Gift size={18} style={{ color: '#fbbf24' }} />
+                                Cumpleanos de hoy
+                            </span>
+                            <span className={`badge ${birthdaySummary.total ? 'badge-yellow' : 'badge-gray'}`}>{birthdaySummary.total}</span>
+                        </div>
+                        <div style={{ color: 'var(--text-muted)', marginBottom: 14 }}>
+                            {birthdaySummary.total
+                                ? `Hay ${birthdaySummary.total} cliente(s) o paciente(s) para saludar hoy.`
+                                : 'No hay cumpleanos registrados para hoy.'}
+                        </div>
+                        <div style={{ display: 'grid', gap: 8 }}>
+                            {(birthdaySummary.preview || []).length ? birthdaySummary.preview.map(cliente => (
+                                <div key={cliente.id} style={{ padding: '8px 10px', borderRadius: 8, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                                    <div style={{ fontWeight: 700 }}>{cliente.nombre}</div>
+                                    <div style={{ color: 'var(--text-muted)', fontSize: '0.84rem' }}>
+                                        {cliente.edad ? `Cumple ${cliente.edad} anos` : 'Cumpleanos registrado'}
+                                        {cliente.telefono ? ` - ${cliente.telefono}` : ''}
+                                    </div>
+                                </div>
+                            )) : (
+                                <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>Nada pendiente para hoy.</div>
+                            )}
+                        </div>
+                        <div className="flex gap-12" style={{ marginTop: 14, flexWrap: 'wrap' }}>
+                            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setShowBirthdayModal(true)} disabled={!birthdaySummary.total}>
+                                Abrir saludos
+                            </button>
+                            <a href="/clientes/cumpleanos" className="btn btn-secondary btn-sm">
+                                Ver modulo
+                            </a>
+                        </div>
                     </div>
                 </div>
-            ) : null}
 
             <div className="grid-2" style={{ gap: 20 }}>
                 <div className="card" style={{ gridColumn: 'span 1' }}>
@@ -391,7 +605,7 @@ export default function Dashboard() {
                             <tbody>
                                 {dashboard.compras_pendientes.map(compra => (
                                     <tr key={compra.id}>
-                                        <td>{new Date(compra.fecha).toLocaleDateString('es-PY')}</td>
+                                        <td>{parseBackendDateTime(compra.fecha)?.toLocaleDateString('es-PY') || '-'}</td>
                                         <td>{compra.proveedor_nombre || '—'}</td>
                                         <td><span className="badge badge-blue">{compra.tipo_documento}</span></td>
                                         <td>{fmt(compra.total)}</td>
@@ -406,6 +620,23 @@ export default function Dashboard() {
             </div>
 
             <style>{`
+                .dashboard-notifications-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+                    gap: 18px;
+                    margin-bottom: 20px;
+                }
+                .dashboard-notification-card {
+                    min-width: 0;
+                }
+                .dashboard-notification-card--reminder {
+                    border: 1px solid rgba(56,189,248,0.25);
+                    background: rgba(56,189,248,0.08);
+                }
+                .dashboard-notification-card--birthday {
+                    border: 1px solid rgba(251,191,36,0.28);
+                    background: rgba(251,191,36,0.08);
+                }
                 .dashboard-compare-grid {
                     display: grid;
                     grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -416,13 +647,38 @@ export default function Dashboard() {
                     background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
                 }
             `}</style>
-            {showReminderModal && reminderItems.length ? (
+            {showReminderModal ? (
                 <Modal title="Recordatorios clinicos pendientes" onClose={() => setShowReminderModal(false)} maxWidth="920px">
-                    <ReminderCards
-                        items={reminderItems}
-                        onMarkRemembered={item => markReminderMutation.mutate(item)}
-                        actionPendingId={markReminderMutation.variables?.id}
-                    />
+                    {reminderDetailQuery.isLoading ? (
+                        <div className="empty-state" style={{ padding: '32px 20px' }}>
+                            <div className="spinner" style={{ width: 28, height: 28, marginBottom: 12 }} />
+                            <p>Cargando recordatorios...</p>
+                        </div>
+                    ) : (
+                        <ReminderCards
+                            items={reminderItems}
+                            onMarkRemembered={item => markReminderMutation.mutate(item)}
+                            actionPendingId={markReminderMutation.variables?.id}
+                            empresaNombre={empresaNombre}
+                            reminderTemplate={reminderTemplate}
+                        />
+                    )}
+                </Modal>
+            ) : null}
+            {showBirthdayModal ? (
+                <Modal title="Saludos de cumpleanos pendientes" onClose={() => setShowBirthdayModal(false)} maxWidth="920px">
+                    {birthdayDetailQuery.isLoading ? (
+                        <div className="empty-state" style={{ padding: '32px 20px' }}>
+                            <div className="spinner" style={{ width: 28, height: 28, marginBottom: 12 }} />
+                            <p>Cargando cumpleanos...</p>
+                        </div>
+                    ) : (
+                        <BirthdayCards
+                            items={birthdayItems}
+                            empresaNombre={empresaNombre}
+                            template={cumpleanosTemplate}
+                        />
+                    )}
                 </Modal>
             ) : null}
         </div>

@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { NavLink, useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { getNavigationControlState } from '../utils/navigationControl'
 import { hasModuleAccess, normalizeRole } from '../utils/roles'
 import {
     LayoutDashboard,
@@ -23,6 +24,7 @@ import {
     Tag,
     Landmark,
     Shield,
+    MessageCircle,
     PanelLeftClose,
     PanelLeftOpen,
 } from 'lucide-react'
@@ -77,6 +79,7 @@ const navGroups = [
                 label: 'Clientes',
                 subItems: [
                     { to: '/clientes', label: 'Listado de Clientes' },
+                    { to: '/clientes/cumpleanos', label: 'Cumpleaños' },
                     { to: '/clientes/saldos', label: 'Saldos Clientes' },
                 ]
             },
@@ -88,6 +91,8 @@ const navGroups = [
             { to: '/marcas', icon: Tag, label: 'Marcas' },
             { to: '/productos', icon: Package, label: 'Productos' },
             { to: '/proveedores', icon: Building2, label: 'Proveedores' },
+            { to: '/catalogos/destinatarios-rendicion', icon: UserRoundPlus, label: 'Destinatarios rendicion' },
+            { to: '/catalogos/plantillas-whatsapp', icon: MessageCircle, label: 'Plantillas WhatsApp' },
         ]
     },
     {
@@ -95,7 +100,15 @@ const navGroups = [
         accent: '#f472b6',
         tint: 'rgba(244, 114, 182, 0.08)',
         items: [
-            { to: '/caja', icon: Landmark, label: 'Centro Financiero' },
+            {
+                to: '/caja',
+                icon: Landmark,
+                label: 'Centro Financiero',
+                subItems: [
+                    { to: '/caja', label: 'Caja y bancos' },
+                    { to: '/finanzas/jornada', label: 'Jornada y rendiciones' },
+                ]
+            },
             { to: '/gastos', icon: DollarSign, label: 'Gastos' },
             { to: '/cuentas-por-pagar', icon: Landmark, label: 'Cuentas por Pagar' },
         ]
@@ -111,6 +124,7 @@ const navGroups = [
                 label: 'Centro',
                 subItems: [
                     { to: '/reportes/ventas', label: 'Ventas y Rentabilidad' },
+                    { to: '/reportes/ventas-productos', label: 'Ventas por Productos' },
                     { to: '/reportes/comparativo-mensual', label: 'Comparativo Mensual' },
                     { to: '/reportes/compras', label: 'Compras y Proveedores' },
                     { to: '/reportes/laboratorio', label: 'Trabajos Laboratorio' },
@@ -131,6 +145,7 @@ const navGroups = [
                 label: 'Modulo Clinico',
                 subItems: [
                     { to: '/clinica/dashboard', label: 'Dashboard Clinico' },
+                    { to: '/clinica/agenda', label: 'Agenda' },
                     { to: '/clinica/pacientes', label: 'Pacientes' },
                     { to: '/clinica/doctores', label: 'Doctores' },
                     { to: '/clinica/consulta', label: 'Nueva Consulta' },
@@ -161,12 +176,35 @@ export default function Sidebar({ collapsed = false, onToggle }) {
         return initialState
     })
 
+    useEffect(() => {
+        setOpenMenus(prev => {
+            const next = { ...prev }
+            navGroups.forEach(group => {
+                group.items.forEach(item => {
+                    if (!item.subItems) return
+                    const shouldBeOpen = item.subItems.some(
+                        sub => location.pathname === sub.to || location.pathname.startsWith(`${sub.to}/`)
+                    )
+                    if (shouldBeOpen) {
+                        next[item.to] = true
+                    }
+                })
+            })
+            return next
+        })
+    }, [location.pathname])
+
     const toggleMenu = (e, path) => {
         e.preventDefault()
         setOpenMenus(prev => ({ ...prev, [path]: !prev[path] }))
     }
 
     const handleLogout = () => {
+        const navigationState = getNavigationControlState()
+        if (navigationState.hasBlockers) {
+            const shouldLogout = window.confirm(`${navigationState.message || 'Hay datos u operaciones pendientes en esta pantalla.'}\n\nSi cierras sesion ahora, puedes perder cambios no guardados. ¿Deseas continuar?`)
+            if (!shouldLogout) return
+        }
         logout()
         navigate('/login')
     }
@@ -221,10 +259,13 @@ export default function Sidebar({ collapsed = false, onToggle }) {
                         })
                         return { ...item, subItems }
                     }
-                    if (['/referidores', '/vendedores', '/canales-venta', '/categorias', '/atributos', '/marcas', '/productos', '/proveedores'].includes(item.to)) {
+                    if (['/referidores', '/vendedores', '/canales-venta', '/categorias', '/atributos', '/marcas', '/productos', '/proveedores', '/catalogos/destinatarios-rendicion'].includes(item.to)) {
                         return hasModuleAccess(user, 'catalogos') ? item : null
                     }
-                    if (['/caja', '/gastos'].includes(item.to)) {
+                    if (item.to === '/caja') {
+                        return hasModuleAccess(user, 'finanzas') ? item : null
+                    }
+                    if (item.to === '/gastos') {
                         return hasModuleAccess(user, 'finanzas') ? item : null
                     }
                     if (item.to === '/cuentas-por-pagar') {
@@ -232,7 +273,7 @@ export default function Sidebar({ collapsed = false, onToggle }) {
                     }
                     if (item.to === '/reportes') {
                         const subItems = (item.subItems || []).filter(sub => {
-                            if (['/reportes/ventas', '/reportes/comparativo-mensual', '/reportes/compras'].includes(sub.to)) {
+                            if (['/reportes/ventas', '/reportes/ventas-productos', '/reportes/comparativo-mensual', '/reportes/compras'].includes(sub.to)) {
                                 return hasModuleAccess(user, 'reportes_comercial')
                             }
                             if (sub.to === '/reportes/laboratorio') {

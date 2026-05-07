@@ -1,12 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import { Edit, FileText, Plus, Trash2 } from 'lucide-react'
 
+import LoadingButton from '../components/LoadingButton'
 import Modal from '../components/Modal'
 import RemoteSearchSelect from '../components/RemoteSearchSelect'
 import { api } from '../context/AuthContext'
+import { parseBackendDateTime } from '../utils/formatters'
 
 const fmt = value => new Intl.NumberFormat('es-PY').format(value ?? 0)
-const fmtDate = value => (value ? new Date(value).toLocaleString('es-PY') : '-')
+const fmtDate = value => {
+    const date = parseBackendDateTime(value)
+    return date ? date.toLocaleString('es-PY') : '-'
+}
 const getErrorText = (err, fallback) => {
     const detail = err?.response?.data?.detail
     if (typeof detail === 'string' && detail.trim()) return detail
@@ -223,7 +228,9 @@ function AjusteActions({ item, onEdit, onDelete }) {
 
     const handleAction = callback => {
         setOpen(false)
-        callback()
+        window.setTimeout(() => {
+            callback()
+        }, 0)
     }
 
     const toggleMenu = () => {
@@ -446,7 +453,7 @@ export default function ReporteAjustesVentasPage() {
                     </div>
                     <div className="flex gap-12" style={{ justifyContent: 'flex-end', marginTop: 14, flexWrap: 'wrap' }}>
                         <button type="button" className="btn btn-secondary" onClick={limpiarFiltros}>Limpiar</button>
-                        <button type="button" className="btn btn-primary" onClick={aplicarFiltros}>Aplicar filtros</button>
+                        <LoadingButton type="button" className="btn btn-primary" onClick={aplicarFiltros} loading={loading} loadingText="Aplicando filtros...">Aplicar filtros</LoadingButton>
                     </div>
                 </div>
 
