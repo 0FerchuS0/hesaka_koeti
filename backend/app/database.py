@@ -388,6 +388,8 @@ def ensure_tenant_schema(engine, tenant_slug: str):
                 connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN consulta_id INTEGER"))
             if "consulta_tipo" not in turno_columns:
                 connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN consulta_tipo VARCHAR(30)"))
+            if "recordado_15" in turno_columns:
+                connection.execute(text("ALTER TABLE clinica_turnos DROP COLUMN recordado_15"))
             connection.execute(text("UPDATE clinica_turnos SET es_control = COALESCE(es_control, FALSE)"))
             connection.execute(text(
                 """
@@ -439,7 +441,9 @@ def ensure_tenant_schema(engine, tenant_slug: str):
 
                         CREATE TABLE public.marcas (
                             id SERIAL PRIMARY KEY,
-                            nombre VARCHAR(100) NOT NULL UNIQUE
+                            nombre VARCHAR(100) NOT NULL UNIQUE,
+                            created_at TIMESTAMP DEFAULT NOW() NOT NULL,
+                            updated_at TIMESTAMP DEFAULT NOW() NOT NULL
                         );
                     END IF;
                 END
@@ -450,9 +454,16 @@ def ensure_tenant_schema(engine, tenant_slug: str):
         if "marca_id" not in column_names:
             connection.execute(text("ALTER TABLE productos ADD COLUMN marca_id INTEGER REFERENCES marcas(id)"))
 
+        if "marcas" in table_names:
+            marcas_cols = {col["name"] for col in inspector.get_columns("marcas")}
+            if "created_at" not in marcas_cols:
+                connection.execute(text("ALTER TABLE marcas ADD COLUMN created_at TIMESTAMP DEFAULT NOW() NOT NULL"))
+            if "updated_at" not in marcas_cols:
+                connection.execute(text("ALTER TABLE marcas ADD COLUMN updated_at TIMESTAMP DEFAULT NOW() NOT NULL"))
+
         connection.execute(text("""
-            INSERT INTO marcas (nombre)
-            SELECT DISTINCT UPPER(TRIM(marca))
+            INSERT INTO marcas (nombre, created_at, updated_at)
+            SELECT DISTINCT UPPER(TRIM(marca)), NOW(), NOW()
             FROM productos
             WHERE marca IS NOT NULL AND TRIM(marca) <> ''
             ON CONFLICT (nombre) DO NOTHING
