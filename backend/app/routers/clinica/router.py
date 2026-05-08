@@ -571,6 +571,10 @@ def _sincronizar_turno_proximo_control(
     fecha_control_nueva: date | None,
     motivo: str | None,
 ):
+    # Defensive production fix: some Railway databases still carry this
+    # legacy NOT NULL column from an older schema version.
+    session.execute(text("ALTER TABLE IF EXISTS clinica_turnos DROP COLUMN IF EXISTS recordado_15"))
+
     turno = (
         session.query(TurnoClinico)
         .filter(
