@@ -21,6 +21,24 @@ _session_factories: dict = {}
 _tenant_schema_checked: set[str] = set()
 _tenant_init_lock = Lock()
 
+LEGACY_TURNO_RECORDATORIO_COLUMNS_SQL = """
+DO $$
+DECLARE
+    legacy_col text;
+BEGIN
+    FOR legacy_col IN
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'clinica_turnos'
+          AND column_name LIKE 'recordado_%'
+          AND column_name NOT IN ('recordado_3', 'recordado_hoy')
+    LOOP
+        EXECUTE format('ALTER TABLE clinica_turnos DROP COLUMN IF EXISTS %I', legacy_col);
+    END LOOP;
+END $$;
+"""
+
 TIMESTAMP_FALLBACKS = {
     "categorias": None,
     "atributos": None,
@@ -374,6 +392,7 @@ def ensure_tenant_schema(engine, tenant_slug: str):
     if "clinica_turnos" in table_names:
         turno_columns = {column["name"] for column in inspector.get_columns("clinica_turnos")}
         with engine.begin() as connection:
+            connection.execute(text(LEGACY_TURNO_RECORDATORIO_COLUMNS_SQL))
             if "paciente_nombre_libre" not in turno_columns:
                 connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN paciente_nombre_libre VARCHAR(200)"))
             if "paciente_telefono_libre" not in turno_columns:
@@ -388,8 +407,6 @@ def ensure_tenant_schema(engine, tenant_slug: str):
                 connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN consulta_id INTEGER"))
             if "consulta_tipo" not in turno_columns:
                 connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN consulta_tipo VARCHAR(30)"))
-            if "recordado_15" in turno_columns:
-                connection.execute(text("ALTER TABLE clinica_turnos DROP COLUMN recordado_15"))
             connection.execute(text("UPDATE clinica_turnos SET es_control = COALESCE(es_control, FALSE)"))
             connection.execute(text(
                 """

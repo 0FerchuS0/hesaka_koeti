@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, literal, or_, text, union_all
 from sqlalchemy.orm import noload, selectinload
 
-from app.database import get_session_for_tenant
+from app.database import LEGACY_TURNO_RECORDATORIO_COLUMNS_SQL, get_session_for_tenant
 from app.middleware.tenant import get_tenant_slug
 from app.models.clinica_models import (
     ConsultaContactologia,
@@ -571,9 +571,9 @@ def _sincronizar_turno_proximo_control(
     fecha_control_nueva: date | None,
     motivo: str | None,
 ):
-    # Defensive production fix: some Railway databases still carry this
-    # legacy NOT NULL column from an older schema version.
-    session.execute(text("ALTER TABLE IF EXISTS clinica_turnos DROP COLUMN IF EXISTS recordado_15"))
+    # Defensive production fix: some Railway databases still carry legacy
+    # reminder columns from an older schema version.
+    session.execute(text(LEGACY_TURNO_RECORDATORIO_COLUMNS_SQL))
 
     turno = (
         session.query(TurnoClinico)
