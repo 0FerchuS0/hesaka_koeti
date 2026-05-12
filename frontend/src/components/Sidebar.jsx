@@ -158,7 +158,7 @@ const navGroups = [
     },
 ]
 
-export default function Sidebar({ collapsed = false, onToggle }) {
+export default function Sidebar({ collapsed = false, onToggle, mobileOpen = false, onMobileClose, isMobileViewport = false }) {
     const { user, logout } = useAuth()
     const navigate = useNavigate()
     const location = useLocation()
@@ -193,6 +193,19 @@ export default function Sidebar({ collapsed = false, onToggle }) {
             return next
         })
     }, [location.pathname])
+
+    useEffect(() => {
+        if (!mobileOpen) return undefined
+
+        const handleEscape = event => {
+            if (event.key === 'Escape') {
+                onMobileClose?.()
+            }
+        }
+
+        window.addEventListener('keydown', handleEscape)
+        return () => window.removeEventListener('keydown', handleEscape)
+    }, [mobileOpen, onMobileClose])
 
     const toggleMenu = (e, path) => {
         e.preventDefault()
@@ -296,8 +309,29 @@ export default function Sidebar({ collapsed = false, onToggle }) {
     const displayName = user?.nombre_completo || user?.nombre || 'Usuario'
     const initials = displayName.split(' ').map(n => n[0]).slice(0, 2).join('') || 'U'
 
+    const handleNavItemClick = () => {
+        if (mobileOpen) {
+            onMobileClose?.()
+        }
+    }
+
+    const handleSidebarToggle = () => {
+        if (isMobileViewport) {
+            onMobileClose?.()
+            return
+        }
+        onToggle?.()
+    }
+
     return (
-        <aside className={`sidebar ${collapsed ? 'sidebar-collapsed' : ''}`}>
+        <>
+        <button
+            type="button"
+            className={`sidebar-overlay ${mobileOpen ? 'sidebar-overlay-open' : ''}`}
+            onClick={() => onMobileClose?.()}
+            aria-label="Cerrar menu lateral"
+        />
+        <aside className={`sidebar ${collapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'sidebar-mobile-open' : ''}`}>
             <div className="sidebar-logo">
                 <div className="sidebar-logo-icon">H</div>
                 {!collapsed && (
@@ -309,10 +343,10 @@ export default function Sidebar({ collapsed = false, onToggle }) {
                 <button
                     type="button"
                     className="sidebar-toggle"
-                    onClick={onToggle}
-                    title={collapsed ? 'Mostrar menu lateral' : 'Ocultar menu lateral'}
+                    onClick={handleSidebarToggle}
+                    title={isMobileViewport ? 'Cerrar menu lateral' : (collapsed ? 'Mostrar menu lateral' : 'Ocultar menu lateral')}
                 >
-                    {collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+                    {isMobileViewport ? <PanelLeftClose size={16} /> : (collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />)}
                 </button>
             </div>
 
@@ -357,6 +391,7 @@ export default function Sidebar({ collapsed = false, onToggle }) {
                                                         key={sub.to}
                                                         to={sub.to}
                                                         end
+                                                        onClick={handleNavItemClick}
                                                         className={({ isActive }) =>
                                                             `sidebar-item sidebar-subitem ${isActive ? 'active' : ''}`
                                                         }
@@ -373,6 +408,7 @@ export default function Sidebar({ collapsed = false, onToggle }) {
                                     <NavLink
                                         to={item.to}
                                         end={item.to === '/'}
+                                        onClick={handleNavItemClick}
                                         className={({ isActive }) =>
                                             `sidebar-item ${isActive ? 'active' : ''}`
                                         }
@@ -407,5 +443,6 @@ export default function Sidebar({ collapsed = false, onToggle }) {
                 </div>
             </div>
         </aside>
+        </>
     )
 }

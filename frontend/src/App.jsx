@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
+import { PanelLeftOpen } from 'lucide-react'
 import { AuthProvider, useAuth, api } from './context/AuthContext'
 import Modal from './components/Modal'
 import Sidebar from './components/Sidebar'
@@ -106,10 +107,12 @@ function HomeRoute() {
 function AppLayout() {
     const { user, logout } = useAuth()
     const location = useLocation()
+    const [isMobileSidebarViewport, setIsMobileSidebarViewport] = useState(() => window.innerWidth <= 768)
     const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
         const saved = window.localStorage.getItem('hesaka-sidebar-collapsed')
         return saved === 'true'
     })
+    const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
     const [navigationState, setNavigationState] = useState(() => getNavigationControlState())
     const [showIdleBlockedModal, setShowIdleBlockedModal] = useState(false)
     const idleTimerRef = useRef(null)
@@ -162,6 +165,27 @@ function AppLayout() {
     useEffect(() => {
         window.localStorage.setItem('hesaka-sidebar-collapsed', String(sidebarCollapsed))
     }, [sidebarCollapsed])
+
+    useEffect(() => {
+        const mediaQuery = window.matchMedia('(max-width: 768px)')
+        const syncViewport = event => {
+            setIsMobileSidebarViewport(event.matches)
+        }
+
+        setIsMobileSidebarViewport(mediaQuery.matches)
+
+        if (typeof mediaQuery.addEventListener === 'function') {
+            mediaQuery.addEventListener('change', syncViewport)
+            return () => mediaQuery.removeEventListener('change', syncViewport)
+        }
+
+        mediaQuery.addListener(syncViewport)
+        return () => mediaQuery.removeListener(syncViewport)
+    }, [])
+
+    useEffect(() => {
+        setMobileSidebarOpen(false)
+    }, [location.pathname])
 
     useEffect(() => {
         return subscribeNavigationControl(() => {
@@ -286,8 +310,22 @@ function AppLayout() {
     if (configIncomplete && !inConfigRoute && role !== 'ADMIN') {
         return (
             <div className="app-layout">
-                <Sidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(prev => !prev)} />
-                <main className={`main-content ${sidebarCollapsed ? 'main-content--expanded' : ''}`}>
+                <Sidebar
+                    collapsed={isMobileSidebarViewport ? false : sidebarCollapsed}
+                    onToggle={() => setSidebarCollapsed(prev => !prev)}
+                    mobileOpen={mobileSidebarOpen}
+                    onMobileClose={() => setMobileSidebarOpen(false)}
+                    isMobileViewport={isMobileSidebarViewport}
+                />
+                <main className={`main-content ${!isMobileSidebarViewport && sidebarCollapsed ? 'main-content--expanded' : ''}`}>
+                    <button
+                        type="button"
+                        className="mobile-sidebar-trigger"
+                        onClick={() => setMobileSidebarOpen(true)}
+                        aria-label="Abrir menu lateral"
+                    >
+                        <PanelLeftOpen size={18} />
+                    </button>
                     <div className="page-body">
                         <div className="card">
                             <div className="empty-state" style={{ padding: '72px 20px' }}>
@@ -306,8 +344,22 @@ function AppLayout() {
     return (
         <>
             <div className="app-layout">
-                <Sidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(prev => !prev)} />
-                <main className={`main-content ${sidebarCollapsed ? 'main-content--expanded' : ''}`}>
+                <Sidebar
+                    collapsed={isMobileSidebarViewport ? false : sidebarCollapsed}
+                    onToggle={() => setSidebarCollapsed(prev => !prev)}
+                    mobileOpen={mobileSidebarOpen}
+                    onMobileClose={() => setMobileSidebarOpen(false)}
+                    isMobileViewport={isMobileSidebarViewport}
+                />
+                <main className={`main-content ${!isMobileSidebarViewport && sidebarCollapsed ? 'main-content--expanded' : ''}`}>
+                    <button
+                        type="button"
+                        className="mobile-sidebar-trigger"
+                        onClick={() => setMobileSidebarOpen(true)}
+                        aria-label="Abrir menu lateral"
+                    >
+                        <PanelLeftOpen size={18} />
+                    </button>
                     <Suspense fallback={<RouteLoader />}>
                         <Routes>
                             <Route path="/" element={<HomeRoute />} />
