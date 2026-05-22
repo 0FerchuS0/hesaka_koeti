@@ -45,10 +45,20 @@ def _obtener_canal_venta_default(session):
 
 
 def _get_siguiente_codigo(session, modelo, prefijo: str) -> str:
-    """Genera el siguiente código correlativo (PRE0001, VEN0001, etc.)."""
-    from sqlalchemy import func
-    count = session.query(func.count(modelo.id)).scalar() or 0
-    return f"{prefijo}{str(count + 1).zfill(4)}"
+    """Genera el siguiente código correlativo sin reciclar números borrados."""
+    codigos = (
+        session.query(modelo.codigo)
+        .filter(modelo.codigo.like(f"{prefijo}%"))
+        .all()
+    )
+    max_num = 0
+    for (codigo,) in codigos:
+        if not codigo or not codigo.startswith(prefijo):
+            continue
+        sufijo = codigo[len(prefijo):]
+        if sufijo.isdigit():
+            max_num = max(max_num, int(sufijo))
+    return f"{prefijo}{str(max_num + 1).zfill(4)}"
 
 
 def _resolver_fecha_operacion(session, value: Optional[datetime] = None) -> datetime:
@@ -612,6 +622,12 @@ def crear_presupuesto(data: PresupuestoCreate, tenant_slug: str = Depends(get_te
         session.commit()
         session.refresh(presupuesto)
         return _build_presupuesto_out(presupuesto)
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=f"Error al crear presupuesto: {str(e)}")
     finally:
         session.close()
 
