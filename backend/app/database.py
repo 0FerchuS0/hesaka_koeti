@@ -165,10 +165,20 @@ def ensure_tenant_schema(engine, tenant_slug: str):
     if "presupuestos" in table_names:
         presupuesto_columns = {column["name"] for column in inspector.get_columns("presupuestos")}
         with engine.begin() as connection:
+            if "doctor_receta" not in presupuesto_columns:
+                connection.execute(text("ALTER TABLE presupuestos ADD COLUMN doctor_receta VARCHAR(255)"))
+            if "observaciones" not in presupuesto_columns:
+                connection.execute(text("ALTER TABLE presupuestos ADD COLUMN observaciones VARCHAR(255)"))
+            if "fecha_receta" not in presupuesto_columns:
+                connection.execute(text("ALTER TABLE presupuestos ADD COLUMN fecha_receta TIMESTAMP"))
             if "vendedor_id" not in presupuesto_columns and "vendedores" in table_names:
                 connection.execute(text("ALTER TABLE presupuestos ADD COLUMN vendedor_id INTEGER REFERENCES vendedores(id)"))
             if "canal_venta_id" not in presupuesto_columns and "canales_venta" in table_names:
                 connection.execute(text("ALTER TABLE presupuestos ADD COLUMN canal_venta_id INTEGER REFERENCES canales_venta(id)"))
+            if "referidor_id" not in presupuesto_columns and "referidores" in table_names:
+                connection.execute(text("ALTER TABLE presupuestos ADD COLUMN referidor_id INTEGER REFERENCES referidores(id)"))
+            if "comision_monto" not in presupuesto_columns:
+                connection.execute(text("ALTER TABLE presupuestos ADD COLUMN comision_monto DOUBLE PRECISION DEFAULT 0"))
 
     if "ventas" in table_names:
         venta_columns = {column["name"] for column in inspector.get_columns("ventas")}
@@ -236,6 +246,33 @@ def ensure_tenant_schema(engine, tenant_slug: str):
                 """
                 UPDATE presupuestos
                 SET no_requiere_proximo_control = COALESCE(no_requiere_proximo_control, FALSE)
+                """
+            ))
+            connection.execute(text(
+                """
+                UPDATE presupuestos
+                SET comision_monto = COALESCE(comision_monto, 0)
+                """
+            ))
+
+    if "presupuesto_items" in table_names:
+        presupuesto_items_columns = {column["name"] for column in inspector.get_columns("presupuesto_items")}
+        with engine.begin() as connection:
+            if "costo_unitario" not in presupuesto_items_columns:
+                connection.execute(text("ALTER TABLE presupuesto_items ADD COLUMN costo_unitario DOUBLE PRECISION DEFAULT 0"))
+            if "descuento" not in presupuesto_items_columns:
+                connection.execute(text("ALTER TABLE presupuesto_items ADD COLUMN descuento DOUBLE PRECISION DEFAULT 0"))
+            if "descripcion_personalizada" not in presupuesto_items_columns:
+                connection.execute(text("ALTER TABLE presupuesto_items ADD COLUMN descripcion_personalizada TEXT"))
+            if "codigo_armazon" not in presupuesto_items_columns:
+                connection.execute(text("ALTER TABLE presupuesto_items ADD COLUMN codigo_armazon VARCHAR(50)"))
+            if "medidas_armazon" not in presupuesto_items_columns:
+                connection.execute(text("ALTER TABLE presupuesto_items ADD COLUMN medidas_armazon VARCHAR(50)"))
+            connection.execute(text(
+                """
+                UPDATE presupuesto_items
+                SET costo_unitario = COALESCE(costo_unitario, 0),
+                    descuento = COALESCE(descuento, 0)
                 """
             ))
 
