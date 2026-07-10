@@ -68,8 +68,9 @@ export function useAbrirJornada() {
     const queryClient = useQueryClient()
 
     return useMutation({
-        mutationFn: payload => api.post('/caja/jornada/abrir', payload),
-        onSuccess: () => {
+        mutationFn: payload => api.post('/caja/jornada/abrir', payload).then(response => response.data),
+        onSuccess: data => {
+            queryClient.setQueryData(['jornada-financiera-actual'], data)
             queryClient.invalidateQueries({ queryKey: ['jornada-panel-inicial'] })
             queryClient.invalidateQueries({ queryKey: ['jornada-financiera-actual'] })
             queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
@@ -160,6 +161,7 @@ export function useCrearRendicionJornada() {
             queryClient.invalidateQueries({ queryKey: ['jornada-pendiente-rendicion'] })
             queryClient.invalidateQueries({ queryKey: ['jornada-historial-jornadas'] })
             queryClient.invalidateQueries({ queryKey: ['jornada-historial-rendiciones'] })
+            queryClient.invalidateQueries({ queryKey: ['jornada-historial-rendiciones-jornada'] })
         },
     })
 }
@@ -176,7 +178,47 @@ export function useCrearRendicionJornadaHistorial(jornadaId) {
             queryClient.invalidateQueries({ queryKey: ['jornada-pendiente-rendicion'] })
             queryClient.invalidateQueries({ queryKey: ['jornada-historial-jornadas'] })
             queryClient.invalidateQueries({ queryKey: ['jornada-historial-rendiciones'] })
+            queryClient.invalidateQueries({ queryKey: ['jornada-historial-rendiciones-jornada'] })
         },
+    })
+}
+
+export function useCrearRendicionesJornadasMultiplesHistorial() {
+    const queryClient = useQueryClient()
+
+    return useMutation({
+        mutationFn: payload => api.post('/caja/jornada/historial/rendiciones-multiples', payload).then(response => response.data),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['jornada-panel-inicial'] })
+            queryClient.invalidateQueries({ queryKey: ['jornada-financiera-actual'] })
+            queryClient.invalidateQueries({ queryKey: ['jornada-rendiciones'] })
+            queryClient.invalidateQueries({ queryKey: ['jornada-pendiente-rendicion'] })
+            queryClient.invalidateQueries({ queryKey: ['jornada-historial-jornadas'] })
+            queryClient.invalidateQueries({ queryKey: ['jornada-historial-rendiciones'] })
+            queryClient.invalidateQueries({ queryKey: ['jornada-historial-rendiciones-jornada'] })
+        },
+    })
+}
+
+export function useResumenRendicionesJornadasMultiples(jornadaIds = [], options = {}) {
+    const ids = Array.from(new Set((jornadaIds || []).map(item => Number(item)).filter(item => Number.isFinite(item) && item > 0)))
+    return useQuery({
+        queryKey: ['jornada-historial-rendiciones-multiples-resumen', ids.join(',')],
+        queryFn: () => api.post('/caja/jornada/historial/rendiciones-multiples/resumen', { jornada_ids: ids }).then(response => response.data),
+        enabled: (options.enabled ?? true) && ids.length > 0,
+        retry: false,
+        staleTime: 15000,
+    })
+}
+
+export function usePendienteRendicionJornadasMultiples(jornadaIds = [], options = {}) {
+    const ids = Array.from(new Set((jornadaIds || []).map(item => Number(item)).filter(item => Number.isFinite(item) && item > 0)))
+    return useQuery({
+        queryKey: ['jornada-historial-rendiciones-multiples-pendiente', ids.join(',')],
+        queryFn: () => api.post('/caja/jornada/historial/rendiciones-multiples/pendiente', { jornada_ids: ids }).then(response => response.data),
+        enabled: (options.enabled ?? true) && ids.length > 0,
+        retry: false,
+        staleTime: 15000,
     })
 }
 
@@ -202,6 +244,7 @@ export function useEditarRendicionJornada() {
             queryClient.invalidateQueries({ queryKey: ['jornada-pendiente-rendicion'] })
             queryClient.invalidateQueries({ queryKey: ['jornada-historial-jornadas'] })
             queryClient.invalidateQueries({ queryKey: ['jornada-historial-rendiciones'] })
+            queryClient.invalidateQueries({ queryKey: ['jornada-historial-rendiciones-jornada'] })
         },
     })
 }
@@ -235,6 +278,16 @@ export function useRendicionDetalle(rendicionId) {
         queryKey: ['jornada-rendicion-detalle', rendicionId],
         queryFn: () => api.get(`/caja/jornada/rendiciones/${rendicionId}`).then(response => response.data),
         enabled: !!rendicionId,
+        retry: false,
+        staleTime: 30000,
+    })
+}
+
+export function useRendicionesJornadaHistorica(jornadaId, options = {}) {
+    return useQuery({
+        queryKey: ['jornada-historial-rendiciones-jornada', jornadaId],
+        queryFn: () => api.get(`/caja/jornada/historial/jornadas/${jornadaId}/rendiciones`).then(response => response.data),
+        enabled: (options.enabled ?? true) && !!jornadaId,
         retry: false,
         staleTime: 30000,
     })
