@@ -398,7 +398,7 @@ function AppLayout() {
                             <Route path="/atributos" element={<RoleRoute allowedRoles="catalogos"><AtributosPage /></RoleRoute>} />
                             <Route path="/marcas" element={<RoleRoute allowedRoles="catalogos"><MarcasPage /></RoleRoute>} />
                             <Route path="/productos" element={<RoleRoute allowedRoles="catalogos"><ProductosPage /></RoleRoute>} />
-                            <Route path="/proveedores" element={<RoleRoute allowedRoles="catalogos"><ProveedoresPage /></RoleRoute>} />
+                            <Route path="/proveedores" element={<RoleRoute allowedRoles="proveedores"><ProveedoresPage /></RoleRoute>} />
                             <Route path="/catalogos/destinatarios-rendicion" element={<RoleRoute allowedRoles="catalogos"><DestinatariosRendicionPage /></RoleRoute>} />
                             <Route path="/catalogos/plantillas-whatsapp" element={<RoleRoute allowedRoles="catalogos"><PlantillasWhatsappPage /></RoleRoute>} />
                             <Route path="/presupuestos" element={<RoleRoute allowedRoles="presupuestos"><PresupuestosPage /></RoleRoute>} />

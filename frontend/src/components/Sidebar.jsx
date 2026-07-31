@@ -272,7 +272,10 @@ export default function Sidebar({ collapsed = false, onToggle, mobileOpen = fals
                         })
                         return { ...item, subItems }
                     }
-                    if (['/referidores', '/vendedores', '/canales-venta', '/categorias', '/atributos', '/marcas', '/productos', '/proveedores', '/catalogos/destinatarios-rendicion'].includes(item.to)) {
+                    if (item.to === '/proveedores') {
+                        return hasModuleAccess(user, 'proveedores') ? item : null
+                    }
+                    if (['/referidores', '/vendedores', '/canales-venta', '/categorias', '/atributos', '/marcas', '/productos', '/catalogos/destinatarios-rendicion', '/catalogos/plantillas-whatsapp'].includes(item.to)) {
                         return hasModuleAccess(user, 'catalogos') ? item : null
                     }
                     if (item.to === '/caja') {
