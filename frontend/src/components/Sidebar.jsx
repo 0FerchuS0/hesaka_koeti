@@ -221,7 +221,10 @@ export default function Sidebar({ collapsed = false, onToggle }) {
                         })
                         return { ...item, subItems }
                     }
-                    if (['/referidores', '/vendedores', '/canales-venta', '/categorias', '/atributos', '/marcas', '/productos', '/proveedores'].includes(item.to)) {
+                    if (item.to === '/proveedores') {
+                        return hasModuleAccess(user, 'proveedores') ? item : null
+                    }
+                    if (['/referidores', '/vendedores', '/canales-venta', '/categorias', '/atributos', '/marcas', '/productos'].includes(item.to)) {
                         return hasModuleAccess(user, 'catalogos') ? item : null
                     }
                     if (['/caja', '/gastos'].includes(item.to)) {
