@@ -16,13 +16,6 @@ from app.utils.auth import hash_password
 logger = logging.getLogger(__name__)
 
 
-PROTECTED_HESAKA_ADMIN = {
-    "email": "admin@hesaka.com",
-    "password": "admin123",
-    "name": "Administrador HESAKA",
-}
-
-
 def _seed_categoria(
     session: Session,
     nombre: str,
@@ -197,39 +190,64 @@ def _database_exists(cursor, db_name: str) -> bool:
     return cursor.fetchone() is not None
 
 
+def _ensure_single_admin(tenant_session: Session, email: str | None, password: str | None, name: str) -> None:
+    if not email or not password:
+        return
+    email = email.strip().lower()
+    existing = tenant_session.query(Usuario).filter(Usuario.email == email).first()
+    if existing:
+        return
+    tenant_session.add(
+        Usuario(
+            email=email,
+            hashed_password=hash_password(password),
+            nombre_completo=name,
+            rol="ADMIN",
+            activo=True,
+        )
+    )
+
+
 def ensure_tenant_admin_users(tenant_slug: str) -> None:
-    tenant_admin = {
-        "email": os.getenv("HESAKA_ADMIN_EMAIL", "admin@hesaka.com"),
-        "password": os.getenv("HESAKA_ADMIN_PASSWORD", "admin123"),
-        "name": os.getenv("HESAKA_ADMIN_NAME", "Administrador del cliente"),
-    }
-    protected_admins: list[dict[str, str]] = [PROTECTED_HESAKA_ADMIN]
-    if tenant_admin["email"].strip().lower() != PROTECTED_HESAKA_ADMIN["email"]:
-        protected_admins.append(tenant_admin)
+    """
+    Crea (si hace falta) hasta dos cuentas admin independientes para este tenant:
+
+    - HESAKA_ADMIN_EMAIL / HESAKA_ADMIN_PASSWORD: la cuenta del cliente, la que usa
+      dia a dia.
+    - HESAKA_SUPPORT_EMAIL / HESAKA_SUPPORT_PASSWORD: cuenta de soporte, exclusiva
+      para uso interno, separada de la del cliente.
+
+    Ninguna tiene contrasena por defecto: si un par no esta definido, esa cuenta
+    simplemente no se crea. Si una cuenta ya existe, no se toca (una contrasena
+    cambiada a mano, o el usuario desactivado, no se revierte en el proximo
+    arranque/restore).
+    """
+    admin_email = os.getenv("HESAKA_ADMIN_EMAIL")
+    admin_password = os.getenv("HESAKA_ADMIN_PASSWORD")
+    admin_name = os.getenv("HESAKA_ADMIN_NAME", "Administrador")
+
+    support_email = os.getenv("HESAKA_SUPPORT_EMAIL")
+    support_password = os.getenv("HESAKA_SUPPORT_PASSWORD")
+    support_name = os.getenv("HESAKA_SUPPORT_NAME", "Soporte HESAKA")
+
+    if not admin_email or not admin_password:
+        logger.warning(
+            "HESAKA_ADMIN_EMAIL/HESAKA_ADMIN_PASSWORD no definidas: no se crea admin del cliente para '%s'.",
+            tenant_slug,
+        )
+    if not support_email or not support_password:
+        logger.warning(
+            "HESAKA_SUPPORT_EMAIL/HESAKA_SUPPORT_PASSWORD no definidas: no se crea cuenta de soporte para '%s'.",
+            tenant_slug,
+        )
+    if not (admin_email and admin_password) and not (support_email and support_password):
+        return
 
     tenant_session = None
     try:
         tenant_session = get_session_for_tenant(tenant_slug)
-        for admin_data in protected_admins:
-            admin_email = admin_data["email"].strip().lower()
-            admin_user = tenant_session.query(Usuario).filter(Usuario.email == admin_email).first()
-
-            if not admin_user:
-                admin_user = Usuario(
-                    email=admin_email,
-                    hashed_password=hash_password(admin_data["password"]),
-                    nombre_completo=admin_data["name"],
-                    rol="ADMIN",
-                    activo=True,
-                )
-                tenant_session.add(admin_user)
-                continue
-
-            admin_user.nombre_completo = admin_data["name"]
-            admin_user.rol = "ADMIN"
-            admin_user.activo = True
-            admin_user.hashed_password = hash_password(admin_data["password"])
-
+        _ensure_single_admin(tenant_session, admin_email, admin_password, admin_name)
+        _ensure_single_admin(tenant_session, support_email, support_password, support_name)
         tenant_session.commit()
     finally:
         if tenant_session:

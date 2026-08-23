@@ -248,11 +248,17 @@ export default function UsuariosPage() {
             qc.invalidateQueries({ queryKey: ['usuarios'] })
             setUsuarioPassword(null)
         },
+        onError: error => {
+            window.alert(error?.response?.data?.detail || 'No se pudo actualizar la contrasena.')
+        },
     })
 
     const cambiarEstado = useMutation({
         mutationFn: ({ id, activo }) => api.put(`/auth/usuarios/${id}/estado`, { activo }),
         onSuccess: () => qc.invalidateQueries({ queryKey: ['usuarios'] }),
+        onError: error => {
+            window.alert(error?.response?.data?.detail || 'No se pudo cambiar el estado del usuario.')
+        },
     })
 
     const cambiarPermisos = useMutation({
