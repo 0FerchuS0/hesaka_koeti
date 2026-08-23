@@ -132,6 +132,9 @@ export default function GastosPage() {
             queryClient.invalidateQueries({ queryKey: ['gastos-categorias'] })
             queryClient.invalidateQueries({ queryKey: ['gastos'] })
         },
+        onError: error => {
+            window.alert(error?.response?.data?.detail || 'No se pudo eliminar la categoria.')
+        },
     })
 
     const crearGasto = useMutation({
@@ -175,6 +178,9 @@ export default function GastosPage() {
             queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
             queryClient.invalidateQueries({ queryKey: ['bancos'] })
             invalidateJornadaLiveData(queryClient)
+        },
+        onError: error => {
+            window.alert(error?.response?.data?.detail || 'No se pudo eliminar el gasto.')
         },
     })
 
