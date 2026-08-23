@@ -275,6 +275,8 @@ class ProductoOut(BaseModel):
     descripcion: Optional[str]
     activo: bool
     bajo_pedido: bool
+    requiere_laboratorio: bool = True
+    controla_stock: bool = True
     atributos: List[AtributoOut] = []
     class Config:
         from_attributes = True
@@ -296,6 +298,8 @@ class ProductoListItemOut(BaseModel):
     impuesto: Optional[int] = 10
     activo: bool
     bajo_pedido: bool
+    requiere_laboratorio: bool = True
+    controla_stock: bool = True
 
 
 class ProductoListResponseOut(BaseModel):
@@ -321,6 +325,8 @@ class ProductoCreate(BaseModel):
     descripcion: Optional[str] = None
     activo: bool = True
     bajo_pedido: bool = False
+    requiere_laboratorio: bool = True
+    controla_stock: bool = True
     atributos_ids: List[int] = []
 
     @field_validator("nombre")
@@ -632,6 +638,26 @@ class PresupuestoItemOut(BaseModel):
     class Config:
         from_attributes = True
 
+class PaqueteVentaProductoRefOut(BaseModel):
+    id: int
+    nombre: str
+    precio_venta: float
+    costo: Optional[float] = None
+    costo_variable: bool
+    class Config:
+        from_attributes = True
+
+class PaqueteVentaIn(BaseModel):
+    nombre: str
+    activo: bool = True
+    producto_ids: List[int]
+
+class PaqueteVentaOut(BaseModel):
+    id: int
+    nombre: str
+    activo: bool
+    items: List[PaqueteVentaProductoRefOut]
+
 class PresupuestoCreate(BaseModel):
     cliente_id: int
     fecha: Optional[datetime] = None
@@ -713,6 +739,7 @@ class PagoOut(BaseModel):
     monto: float = 0.0
     metodo_pago: Optional[str] = "EFECTIVO"
     banco_id: Optional[int] = None
+    banco_nombre: Optional[str] = None
     nota: Optional[str] = None
     grupo_pago_id: Optional[str] = None
     class Config:
@@ -752,6 +779,20 @@ class VentaCreate(BaseModel):
     es_credito: bool = False
     pagos: List[PagoCreate] = []
 
+class VentaItemOut(BaseModel):
+    id: int
+    producto_id: Optional[int] = None
+    producto_nombre: Optional[str] = None
+    cantidad: int = 1
+    precio_unitario: float = 0.0
+    costo_unitario: float = 0.0
+    descuento: float = 0.0
+    subtotal: float = 0.0
+    descripcion_personalizada: Optional[str] = None
+    iva: Optional[int] = None
+    class Config:
+        from_attributes = True
+
 class VentaOut(BaseModel):
     id: int
     codigo: Optional[str] = "N/A"
@@ -771,6 +812,19 @@ class VentaOut(BaseModel):
     referidor_id: Optional[int] = None
     comision_monto: float = 0.0
     pagos: List[PagoOut] = []
+    items: List[VentaItemOut] = []
+    observaciones: Optional[str] = None
+    doctor_receta: Optional[str] = None
+    fecha_receta: Optional[datetime] = None
+    fecha_proximo_control: Optional[date] = None
+    graduacion_od_esfera: Optional[str] = None
+    graduacion_od_cilindro: Optional[str] = None
+    graduacion_od_eje: Optional[str] = None
+    graduacion_od_adicion: Optional[str] = None
+    graduacion_oi_esfera: Optional[str] = None
+    graduacion_oi_cilindro: Optional[str] = None
+    graduacion_oi_eje: Optional[str] = None
+    graduacion_oi_adicion: Optional[str] = None
     class Config:
         from_attributes = True
 
@@ -841,6 +895,7 @@ class PresupuestoListResponseOut(BaseModel):
     page_size: int
     total: int
     total_pages: int
+    version: Optional[str] = None
 
 
 class PresupuestoAsignacionComercialIn(BaseModel):
@@ -852,6 +907,7 @@ class VentaListItemOut(BaseModel):
     id: int
     codigo: Optional[str] = "N/A"
     fecha: Optional[datetime] = None
+    presupuesto_id: Optional[int] = None
     cliente_id: Optional[int] = None
     cliente_nombre: Optional[str] = None
     vendedor_nombre: Optional[str] = None
@@ -868,6 +924,7 @@ class VentaListResponseOut(BaseModel):
     page_size: int
     total: int
     total_pages: int
+    version: Optional[str] = None
 
 
 class AjusteVentaCreate(BaseModel):
@@ -934,6 +991,43 @@ class AjusteVentaListResponseOut(BaseModel):
     page_size: int
     total: int
     total_pages: int
+
+
+class CorreccionVentaCerradaCreate(BaseModel):
+    motivo: str
+    observacion: Optional[str] = None
+    devolver_stock_original: bool = True
+
+    @field_validator("motivo")
+    @classmethod
+    def validar_motivo_correccion(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("motivo es obligatorio")
+        return value
+
+    @field_validator("observacion")
+    @classmethod
+    def limpiar_observacion_correccion(cls, value: Optional[str]) -> Optional[str]:
+        value = (value or "").strip()
+        return value or None
+
+
+class CorreccionVentaCerradaOut(BaseModel):
+    id: int
+    fecha: datetime
+    estado: str
+    venta_origen_id: int
+    venta_origen_codigo: str
+    presupuesto_nuevo_id: int
+    presupuesto_nuevo_codigo: str
+    cliente_nombre: Optional[str] = None
+    motivo: str
+    observacion: Optional[str] = None
+    devolver_stock_original: bool = True
+    monto_cobrado_original: float = 0.0
+    saldo_original: float = 0.0
+    usuario: Optional[str] = None
 
 
 class VentasPdfMultipleRequest(BaseModel):
@@ -1091,6 +1185,11 @@ class PagoProveedorCreate(BaseModel):
     usar_factura_generica: bool = False
 
 
+class PagoProveedorFacturaUpdate(BaseModel):
+    factura_global: Optional[str] = None
+    usar_factura_generica: bool = False
+
+
 class PagoProveedorAplicacionOut(BaseModel):
     compra_id: int
     documento: str
@@ -1123,6 +1222,14 @@ class HistorialPagoProveedorOut(BaseModel):
     estado: str = "ACTIVO"
 
 
+class HistorialPagoProveedorListResponseOut(BaseModel):
+    items: List[HistorialPagoProveedorOut]
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
 class HistorialPagoProveedorDetalleOut(BaseModel):
     grupo_id: str
     lote_pago_id: Optional[str] = None
@@ -1138,6 +1245,18 @@ class HistorialPagoProveedorDetalleOut(BaseModel):
     puede_usar_factura_global: bool = False
     factura_global: Optional[str] = None
     metodos_pago: List[PagoProveedorMetodoOut] = []
+    documentos_detalle: List["HistorialPagoProveedorDocumentoDetalleOut"] = []
+
+
+class HistorialPagoProveedorDocumentoDetalleOut(BaseModel):
+    compra_id: int
+    documento: str
+    os_origen: Optional[str] = None
+    factura: Optional[str] = None
+    cliente: Optional[str] = None
+    metodo: Optional[str] = None
+    comprobante: Optional[str] = None
+    monto: float = 0.0
 
 
 class VentaPendienteCompraItemOut(BaseModel):
@@ -1307,6 +1426,54 @@ class PendienteRendicionOut(BaseModel):
     ventas_pendientes: List[dict] = Field(default_factory=list)
 
 
+class RendicionJornadasMultiplesResumenRequest(BaseModel):
+    jornada_ids: List[int]
+
+    @field_validator("jornada_ids")
+    @classmethod
+    def validar_jornada_ids_resumen(cls, value: List[int]) -> List[int]:
+        ids = [int(item) for item in (value or []) if int(item) > 0]
+        if not ids:
+            raise ValueError("Debes seleccionar al menos una jornada valida")
+        return list(dict.fromkeys(ids))
+
+
+class RendicionJornadasMultiplesCreate(BaseModel):
+    jornada_ids: List[int]
+    destinatario_id: int
+    observacion: Optional[str] = None
+
+    @field_validator("jornada_ids")
+    @classmethod
+    def validar_jornada_ids_create(cls, value: List[int]) -> List[int]:
+        ids = [int(item) for item in (value or []) if int(item) > 0]
+        if not ids:
+            raise ValueError("Debes seleccionar al menos una jornada valida")
+        return list(dict.fromkeys(ids))
+
+    @field_validator("destinatario_id")
+    @classmethod
+    def validar_destinatario_id_multiple(cls, value: int) -> int:
+        if value is None or int(value) <= 0:
+            raise ValueError("Debe elegir un destinatario valido")
+        return int(value)
+
+    @field_validator("observacion")
+    @classmethod
+    def normalizar_observacion_multiple(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip() if value else value
+
+
+class RendicionJornadasMultiplesResumenOut(BaseModel):
+    cantidad_jornadas: int = 0
+    total_pendiente_rendicion: float = 0.0
+    total_ingresos: float = 0.0
+    total_egresos: float = 0.0
+    cantidad_movimientos: int = 0
+    desglose_medios: List[dict] = Field(default_factory=list)
+    cuentas_por_cobrar_dia: JornadaCuentasCobrarOut = Field(default_factory=JornadaCuentasCobrarOut)
+
+
 class DestinatarioRendicionCreate(BaseModel):
     nombre: str
 
@@ -1431,6 +1598,7 @@ class RendicionJornadaOut(BaseModel):
     fecha_hora_ultima_edicion: Optional[datetime] = None
     usuario_ultima_edicion_nombre: Optional[str] = None
     motivo_ajuste: Optional[str] = None
+    movimientos_post_rendicion: List[dict] = Field(default_factory=list)
 
 
 class JornadaHistorialOut(BaseModel):
@@ -1801,6 +1969,8 @@ class ClinicaConsultaHistorialOut(BaseModel):
     material_lente: Optional[str] = None
     marca_recomendada: Optional[str] = None
     fecha_control: Optional[date] = None
+    anamnesis_id: Optional[int] = None
+    anamnesis_resumen: Optional[str] = None
 
 
 class ClinicaRecetaMedicamentoDetalleHistorialOut(BaseModel):
@@ -1971,6 +2141,13 @@ class ClinicaHistorialGeneralOut(BaseModel):
     page: int
     page_size: int
     total_pages: int
+    total_oftalmologia: int = 0
+    total_contactologia: int = 0
+    total_recetas: int = 0
+
+
+class ClinicaHistorialGeneralResumenOut(BaseModel):
+    total: int
     total_oftalmologia: int = 0
     total_contactologia: int = 0
     total_recetas: int = 0
@@ -2197,6 +2374,7 @@ class ClinicaConsultaOftalmologicaIn(BaseModel):
     doctor_id: Optional[int] = None
     lugar_atencion_id: Optional[int] = None
     agenda_turno_id: Optional[int] = None
+    anamnesis_id: Optional[int] = None
     fecha: Optional[datetime] = None
     motivo: Optional[str] = None
     diagnostico: Optional[str] = None
@@ -2269,6 +2447,7 @@ class ClinicaConsultaContactologiaIn(BaseModel):
     doctor_id: Optional[int] = None
     lugar_atencion_id: Optional[int] = None
     agenda_turno_id: Optional[int] = None
+    anamnesis_id: Optional[int] = None
     fecha: Optional[datetime] = None
     tipo_lente: Optional[str] = None
     diseno: Optional[str] = None
@@ -2286,6 +2465,7 @@ class ClinicaConsultaDetalleOut(BaseModel):
     tipo: str
     fecha: datetime
     agenda_turno_id: Optional[int] = None
+    anamnesis_id: Optional[int] = None
     doctor_id: Optional[int] = None
     doctor_nombre: Optional[str] = None
     lugar_atencion_id: Optional[int] = None
@@ -2361,3 +2541,4 @@ class ClinicaConsultaDetalleOut(BaseModel):
     tiene_receta_lentes_pdf: bool = False
     tiene_indicaciones_pdf: bool = False
     recetas_medicamentos_relacionadas: List[ClinicaRecetaRelacionadaOut] = []
+    anamnesis: Optional[ClinicaCuestionarioOut] = None

@@ -4,6 +4,7 @@ import { AlertCircle, CheckSquare, Eye, FileText, MessageCircle, PackagePlus, Pe
 import { createPortal } from 'react-dom'
 
 import Modal from '../components/Modal'
+import DetalleCompraContent from '../components/DetalleCompraContent'
 import FinancialJornadaNotice from '../components/FinancialJornadaNotice'
 import { api, useAuth } from '../context/AuthContext'
 import { exportReportBlob } from '../utils/reportExports'
@@ -12,6 +13,7 @@ import { invalidateJornadaLiveData, useFinancialJornadaStatus } from '../hooks/u
 import { getWhatsappTemplateByCode, useActualizarWhatsappTemplate, useWhatsappTemplatesCatalog } from '../hooks/useWhatsappTemplates'
 import { parseBackendDateTime, toDateInputValue } from '../utils/formatters'
 import { formatGsAmount, normalizeGsInput, parseGsInput } from '../utils/currencyInputs'
+import { completeTrackedFlow, failTrackedFlow, markFlowStep, startTrackedFlow, waitForNextPaint } from '../utils/performanceMonitor'
 
 const fmt = value => new Intl.NumberFormat('es-PY').format(value ?? 0)
 const fmtDate = value => {
@@ -23,6 +25,7 @@ const fmtDateTime = value => {
     return date ? date.toLocaleString('es-PY') : '-'
 }
 const formatDateInputValue = toDateInputValue
+const isJornadaClosedError = error => String(error?.response?.data?.detail || '').toLowerCase().includes('jornada')
 const RETIRO_WHATSAPP_TEMPLATE_KEY = 'hesaka-retiro-whatsapp-template'
 const DEFAULT_RETIRO_WHATSAPP_TEMPLATE = 'Hola {cliente}, te escribimos de {empresa}. Tu trabajo{venta} ya esta disponible para retiro. Cuando gustes, puedes pasar por la optica. Quedamos atentos.'
 const RETIRO_TEMPLATE_CODE = 'venta_aviso_retiro'
@@ -93,35 +96,50 @@ function getRetiroWhatsappTemplate() {
     return localStorage.getItem(RETIRO_WHATSAPP_TEMPLATE_KEY) || DEFAULT_RETIRO_WHATSAPP_TEMPLATE
 }
 
-function buildRetiroWhatsappMessage(context, template = DEFAULT_RETIRO_WHATSAPP_TEMPLATE) {
+function buildRetiroWhatsappMessage(context, template = DEFAULT_RETIRO_WHATSAPP_TEMPLATE, empresa = 'HESAKA') {
     const ventaTexto = context?.venta_codigo ? ` correspondiente a la venta ${context.venta_codigo}` : ''
     return (template || DEFAULT_RETIRO_WHATSAPP_TEMPLATE)
         .replaceAll('{cliente}', context?.cliente_nombre || '')
         .replaceAll('{venta}', ventaTexto)
-        .replaceAll('{empresa}', 'HESAKA')
+        .replaceAll('{empresa}', empresa || 'HESAKA')
 }
 
-function buildRetiroWhatsappLink(context, message = '') {
+function buildRetiroTemplateFromMessage(message, context, empresa = 'HESAKA') {
+    let template = message || ''
+    const ventaTexto = context?.venta_codigo ? ` correspondiente a la venta ${context.venta_codigo}` : ''
+    const replacements = [
+        [context?.cliente_nombre || '', '{cliente}'],
+        [ventaTexto, '{venta}'],
+        [empresa || '', '{empresa}'],
+    ]
+    replacements.forEach(([value, placeholder]) => {
+        if (!value) return
+        template = template.replaceAll(value, placeholder)
+    })
+    return template
+}
+
+function buildRetiroWhatsappLink(context, message = '', empresa = 'HESAKA') {
     const telefono = normalizarTelefonoWhatsapp(context?.cliente_telefono)
     if (!telefono) return ''
-    const finalMessage = message || buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate())
+    const finalMessage = message || buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate(), empresa)
     return `https://wa.me/${telefono}?text=${encodeURIComponent(finalMessage)}`
 }
 
-function WhatsappRetiroModal({ context, onClose, onGuardarPlantilla = null, guardandoPlantilla = false }) {
-    const [message, setMessage] = useState(() => buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate()))
-    const whatsappLink = buildRetiroWhatsappLink(context, message)
+function WhatsappRetiroModal({ context, onClose, empresaNombre = 'HESAKA', onGuardarPlantilla = null, guardandoPlantilla = false }) {
+    const [message, setMessage] = useState(() => buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate(), empresaNombre))
+    const whatsappLink = buildRetiroWhatsappLink(context, message, empresaNombre)
 
     useEffect(() => {
-        setMessage(buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate()))
-    }, [context])
+        setMessage(buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate(), empresaNombre))
+    }, [context, empresaNombre])
 
     const restoreSuggested = () => {
-        setMessage(buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate()))
+        setMessage(buildRetiroWhatsappMessage(context, getRetiroWhatsappTemplate(), empresaNombre))
     }
 
     const saveTemplate = () => {
-        const template = message
+        const template = buildRetiroTemplateFromMessage(message, context, empresaNombre)
         if (onGuardarPlantilla) {
             onGuardarPlantilla(template)
         }
@@ -225,7 +243,11 @@ function recalcItem(item) {
     const cantidad = Math.max(1, parseInt(item.cantidad, 10) || 1)
     const costo = Math.max(0, Math.trunc(Number(item.costo_unitario || 0)))
     const bruto = costo * cantidad
-    const descuento = Math.min(Math.max(0, Math.trunc(Number(item.descuento || 0))), bruto)
+    // El descuento no se recorta aca mientras el usuario esta cargando datos (ver
+    // onBlur en el input, que recien ahi lo ajusta al bruto) — solo se evita negativo.
+    // El subtotal si queda a salvo con el piso en 0 aunque el descuento este temporalmente
+    // por encima del bruto.
+    const descuento = Math.max(0, Math.trunc(Number(item.descuento || 0)))
     return { ...item, cantidad, costo_unitario: costo, descuento, subtotal: Math.max(0, bruto - descuento) }
 }
 
@@ -320,10 +342,32 @@ function ActionButton({ title, danger = false, onClick, children }) {
 function RemoteProveedorSelect({ value, proveedorNombre = '', onChange }) {
     const [buscar, setBuscar] = useState(proveedorNombre)
     const [showList, setShowList] = useState(false)
+    const containerRef = useRef(null)
+    const menuRef = useRef(null)
 
     useEffect(() => {
         setBuscar(proveedorNombre || '')
     }, [proveedorNombre])
+
+    useEffect(() => {
+        if (!showList) return undefined
+
+        const handlePointerDown = event => {
+            if (containerRef.current?.contains(event.target) || menuRef.current?.contains(event.target)) {
+                return
+            }
+            const submitButton = event.target instanceof Element
+                ? event.target.closest('[data-compra-submit="true"]')
+                : null
+            setShowList(false)
+            if (submitButton instanceof HTMLButtonElement) {
+                window.setTimeout(() => submitButton.click(), 0)
+            }
+        }
+
+        document.addEventListener('mousedown', handlePointerDown)
+        return () => document.removeEventListener('mousedown', handlePointerDown)
+    }, [showList])
 
     const { data: proveedores = [] } = useQuery({
         queryKey: ['proveedores-select', buscar],
@@ -337,7 +381,7 @@ function RemoteProveedorSelect({ value, proveedorNombre = '', onChange }) {
     })
 
     return (
-        <div style={{ position: 'relative' }}>
+        <div ref={containerRef} style={{ position: 'relative' }}>
             <input
                 className="form-input"
                 value={buscar}
@@ -352,6 +396,7 @@ function RemoteProveedorSelect({ value, proveedorNombre = '', onChange }) {
             />
             {showList && (
                 <div
+                    ref={menuRef}
                     style={{ position: 'absolute', zIndex: 90, top: '100%', left: 0, right: 0, marginTop: 4, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 10, maxHeight: 260, overflowY: 'auto', boxShadow: '0 12px 30px rgba(0,0,0,0.45)' }}
                     onMouseDown={event => event.preventDefault()}
                 >
@@ -388,10 +433,31 @@ function CompraProductoSelect({ item, index, onUpdateItem }) {
     const [showList, setShowList] = useState(false)
     const [menuPosition, setMenuPosition] = useState(null)
     const inputRef = useRef(null)
+    const menuRef = useRef(null)
 
     useEffect(() => {
         setBuscar(item.descripcion || '')
     }, [item.descripcion])
+
+    useEffect(() => {
+        if (!showList) return undefined
+
+        const handlePointerDown = event => {
+            if (inputRef.current?.contains(event.target) || menuRef.current?.contains(event.target)) {
+                return
+            }
+            const submitButton = event.target instanceof Element
+                ? event.target.closest('[data-compra-submit="true"]')
+                : null
+            setShowList(false)
+            if (submitButton instanceof HTMLButtonElement) {
+                window.setTimeout(() => submitButton.click(), 0)
+            }
+        }
+
+        document.addEventListener('mousedown', handlePointerDown)
+        return () => document.removeEventListener('mousedown', handlePointerDown)
+    }, [showList])
 
     const { data: productos = [] } = useQuery({
         queryKey: ['compras-productos-select', buscar],
@@ -462,8 +528,8 @@ function CompraProductoSelect({ item, index, onUpdateItem }) {
             />
             {showList && (
                 <>
-                    <div style={{ position: 'fixed', inset: 0, zIndex: 95 }} onClick={() => setShowList(false)} />
                     <div
+                        ref={menuRef}
                         style={{
                             position: 'fixed',
                             top: menuPosition?.top ?? 0,
@@ -638,6 +704,7 @@ function CompraTipoSelectorModal({ onSelect, onClose }) {
 
 function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null, initialTipoCompra = 'ORIGINAL', startWithVentas = false }) {
     const queryClient = useQueryClient()
+    const traceRef = useRef(null)
     const editando = Boolean(compraId)
     const [proveedor, setProveedor] = useState('')
     const [tipoDocumento, setTipoDocumento] = useState('FACTURA')
@@ -693,16 +760,71 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null, ini
 
     const total = useMemo(() => items.reduce((sum, item) => sum + (item.subtotal || 0), 0), [items])
 
+    const startCompraTracking = metadata => {
+        try {
+            traceRef.current = startTrackedFlow({
+                flowKey: 'nueva_compra',
+                label: 'Nueva Compra',
+                metadata,
+            })
+            markFlowStep(traceRef.current, 'envio_formulario', 'Formulario de compra enviado')
+        } catch (error) {
+            traceRef.current = null
+            console.error('No se pudo iniciar el tracking de compra:', error)
+        }
+    }
+
     const mutation = useMutation({
         mutationFn: payload => editando ? api.put(`/compras/${compraId}`, payload) : api.post('/compras/', payload),
-        onSuccess: (response) => {
-            queryClient.invalidateQueries({ queryKey: ['compras'] })
-            queryClient.invalidateQueries({ queryKey: ['compras-optimizado'] })
-            if (editando) queryClient.invalidateQueries({ queryKey: ['compra-detalle', compraId] })
+        onSuccess: async (response) => {
+            const trace = traceRef.current
+            if (!editando) {
+                try {
+                    markFlowStep(trace, 'compra_guardada', 'Compra guardada en backend', {
+                        compra_id: response?.data?.id ?? null,
+                    })
+                } catch (error) {
+                    console.error('No se pudo registrar el paso de tracking de compra guardada:', error)
+                }
+            }
+            await queryClient.invalidateQueries({ queryKey: ['compras'] })
+            await queryClient.invalidateQueries({ queryKey: ['compras-optimizado'] })
+            if (editando) await queryClient.invalidateQueries({ queryKey: ['compra-detalle', compraId] })
             onClose()
             const whatsappContext = response?.data?.whatsapp_retiro
             if (!editando && estadoEntrega === 'RECIBIDO' && whatsappContext?.cliente_telefono) {
                 onWhatsappReady?.(whatsappContext)
+            }
+            if (!editando) {
+                try {
+                    markFlowStep(trace, 'listado_actualizado', 'Listado de compras actualizado')
+                } catch (error) {
+                    console.error('No se pudo registrar el paso de tracking del listado actualizado:', error)
+                }
+                await waitForNextPaint()
+                try {
+                    completeTrackedFlow(trace, {
+                        metadata: {
+                            compra_id: response?.data?.id ?? null,
+                            compra_total: response?.data?.total ?? total,
+                            tipo_compra: tipoCompra,
+                            ventas_asociadas: ventasSeleccionadas.length,
+                        },
+                    })
+                } catch (error) {
+                    console.error('No se pudo completar el tracking de compra:', error)
+                }
+                traceRef.current = null
+            }
+        },
+        onError: error => {
+            if (!editando) {
+                try {
+                    failTrackedFlow(traceRef.current, { error })
+                } catch (trackingError) {
+                    console.error('No se pudo registrar el error de tracking de compra:', trackingError)
+                }
+                traceRef.current = null
             }
         },
     })
@@ -756,7 +878,21 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null, ini
                 presupuesto_item_id: item.presupuesto_item_id || null,
             }))
 
-        mutation.mutate({
+        if (itemsValidos.length === 0) {
+            window.alert('Debes agregar al menos un item valido antes de guardar la compra.')
+            return
+        }
+
+        if (!editando) {
+            startCompraTracking({
+                tipo_compra: tipoCompra,
+                condicion_pago: condicionPago,
+                ventas_asociadas: ventasSeleccionadas.length,
+                cantidad_items: itemsValidos.length,
+            })
+        }
+        try {
+            mutation.mutate({
             proveedor_id: proveedor ? parseInt(proveedor, 10) : null,
             tipo_documento: tipoDocumento,
             nro_factura: nroDoc,
@@ -768,7 +904,11 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null, ini
             tipo_compra: tipoCompra,
             ventas_ids: ventasSeleccionadas.map(venta => venta.venta_id),
             items: itemsValidos,
-        })
+            })
+        } catch (error) {
+            console.error('Error disparando el guardado de compra:', error)
+            window.alert('Ocurrio un error al intentar guardar la compra. Revisa la consola del navegador.')
+        }
     }
 
     if (editando && loadingCompra) {
@@ -835,6 +975,7 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null, ini
                                             style={{ width: 100, padding: '6px 8px' }}
                                             value={formatGsAmount(item.descuento)}
                                             onChange={event => updateItem(index, 'descuento', normalizeGsInput(event.target.value).amount)}
+                                            onBlur={event => updateItem(index, 'descuento', normalizeGsInput(event.target.value, Math.max(0, (parseInt(item.cantidad, 10) || 1) * (Number(item.costo_unitario) || 0))).amount)}
                                             onFocus={event => event.target.select()}
                                         /></td>
                                         <td style={{ fontWeight: 700, color: 'var(--primary-light)' }}>Gs. {fmt(item.subtotal)}</td>
@@ -849,7 +990,7 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null, ini
                 <div className="form-group"><label className="form-label">Observaciones</label><textarea className="form-input" rows={2} value={observaciones} onChange={event => setObservaciones(event.target.value)} style={{ resize: 'vertical' }} /></div>
                 <div style={{ background: 'rgba(26,86,219,0.08)', border: '1px solid rgba(26,86,219,0.2)', borderRadius: 10, padding: '14px 20px', marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}><span style={{ fontWeight: 600, color: 'var(--text-secondary)' }}>TOTAL</span><span style={{ fontSize: '1.3rem', fontWeight: 800, color: 'var(--primary-light)' }}>Gs. {fmt(total)}</span></div>
                 {mutation.isError && <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: '0.82rem', color: '#f87171', display: 'flex', gap: 8 }}><AlertCircle size={16} /> {mutation.error?.response?.data?.detail || 'Error al guardar la compra.'}</div>}
-                <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}><button type="button" className="btn btn-secondary" onClick={onClose}>Cancelar</button><button type="submit" className="btn btn-primary" disabled={mutation.isPending}>{mutation.isPending ? <span className="spinner" style={{ width: 16, height: 16 }} /> : <><ShoppingCart size={15} /> {editando ? 'Guardar Cambios' : 'Guardar Compra'}</>}</button></div>
+                <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}><button type="button" className="btn btn-secondary" onClick={onClose}>Cancelar</button><button type="submit" data-compra-submit="true" className="btn btn-primary" disabled={mutation.isPending} onClick={handleSubmit}>{mutation.isPending ? <span className="spinner" style={{ width: 16, height: 16 }} /> : <><ShoppingCart size={15} /> {editando ? 'Guardar Cambios' : 'Guardar Compra'}</>}</button></div>
             </form>
             {showVentasModal && <VentaSelectorModal proveedorId={proveedor} tipoCompra={tipoCompra} selectedVentas={ventasSeleccionadas} onConfirm={handleVentasConfirm} onClose={() => setShowVentasModal(false)} />}
         </>
@@ -858,10 +999,12 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null, ini
 
 function PagoCompraModal({ compra, onClose }) {
     const queryClient = useQueryClient()
+    const traceRef = useRef(null)
     const [monto, setMonto] = useState(() => formatGsAmount(compra.saldo || 0))
     const [metodoPago, setMetodoPago] = useState('EFECTIVO')
     const [bancoId, setBancoId] = useState('')
     const [nroComprobante, setNroComprobante] = useState('')
+    const [showJornadaRecovery, setShowJornadaRecovery] = useState(false)
     const { data: jornadaEstado } = useFinancialJornadaStatus()
     const jornadaAbierta = Boolean(jornadaEstado?.abierta)
     const saldoPendiente = Math.max(0, Math.trunc(Number(compra?.saldo || 0)))
@@ -880,15 +1023,36 @@ function PagoCompraModal({ compra, onClose }) {
 
     const registrarPago = useMutation({
         mutationFn: payload => api.post(`/compras/${compra.id}/pagos`, payload),
-        onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['compras'] })
-            queryClient.invalidateQueries({ queryKey: ['compras-optimizado'] })
-            queryClient.invalidateQueries({ queryKey: ['compra-pagos', compra.id] })
-            queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
-            queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
-            queryClient.invalidateQueries({ queryKey: ['bancos'] })
+        onSuccess: async () => {
+            const trace = traceRef.current
+            markFlowStep(trace, 'pago_registrado', 'Pago de compra registrado')
+            await queryClient.invalidateQueries({ queryKey: ['compras'] })
+            await queryClient.invalidateQueries({ queryKey: ['compras-optimizado'] })
+            await queryClient.invalidateQueries({ queryKey: ['compra-pagos', compra.id] })
+            await queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
+            await queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
+            await queryClient.invalidateQueries({ queryKey: ['bancos'] })
             invalidateJornadaLiveData(queryClient)
             onClose()
+            markFlowStep(trace, 'saldo_actualizado', 'Saldo y movimientos actualizados')
+            await waitForNextPaint()
+            completeTrackedFlow(trace, {
+                metadata: {
+                    compra_id: compra?.id ?? null,
+                    compra_documento: compra?.nro_factura || null,
+                    monto_pagado: montoPago,
+                    metodo_pago: metodoPago,
+                },
+            })
+            traceRef.current = null
+        },
+        onError: error => {
+            failTrackedFlow(traceRef.current, { error })
+            traceRef.current = null
+            if (isJornadaClosedError(error)) {
+                setShowJornadaRecovery(true)
+                queryClient.invalidateQueries({ queryKey: ['jornada-financiera-actual'] })
+            }
         },
     })
     const eliminarPago = useMutation({
@@ -915,6 +1079,17 @@ function PagoCompraModal({ compra, onClose }) {
             window.alert('El monto a pagar no puede superar el saldo pendiente de la compra.')
             return
         }
+        traceRef.current = startTrackedFlow({
+            flowKey: 'pagar_compra',
+            label: 'Pagar Compra',
+            metadata: {
+                compra_id: compra?.id ?? null,
+                compra_documento: compra?.nro_factura || null,
+            },
+        })
+        markFlowStep(traceRef.current, 'envio_pago', 'Solicitud de pago enviada', {
+            monto: montoPago,
+        })
         registrarPago.mutate({
             monto: montoPago,
             metodo_pago: metodoPago,
@@ -923,9 +1098,13 @@ function PagoCompraModal({ compra, onClose }) {
         })
     }
 
+    useEffect(() => {
+        if (jornadaAbierta) setShowJornadaRecovery(false)
+    }, [jornadaAbierta])
+
     return (
         <form onSubmit={handleSubmit}>
-            <FinancialJornadaNotice compact />
+            <FinancialJornadaNotice compact forceVisible={showJornadaRecovery} />
             <div className="card mb-16" style={{ padding: '14px 16px' }}>
                 <div style={{ display: 'grid', gap: 6 }}>
                     <div style={{ fontWeight: 700 }}>{compra.proveedor_nombre || 'Sin proveedor'}</div>
@@ -980,79 +1159,7 @@ function PagoCompraModal({ compra, onClose }) {
 }
 
 function DetalleCompraModal({ compraId, onClose }) {
-    const { data: compra, isLoading } = useQuery({
-        queryKey: ['compra-detalle', compraId],
-        queryFn: () => api.get(`/compras/${compraId}`).then(response => response.data),
-        retry: false,
-    })
-    const { data: pagos = [] } = useQuery({
-        queryKey: ['compra-pagos', compraId],
-        queryFn: () => api.get(`/compras/${compraId}/pagos`).then(response => response.data),
-        retry: false,
-    })
-
-    if (isLoading || !compra) return <div className="flex-center" style={{ padding: 50 }}><div className="spinner" style={{ width: 26, height: 26 }} /></div>
-
-    return (
-        <div style={{ display: 'grid', gap: 18 }}>
-            <div className="grid-2">
-                <div className="card" style={{ marginBottom: 0 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 10 }}>Resumen</div>
-                    <div style={{ display: 'grid', gap: 6, fontSize: '0.86rem' }}>
-                        <div>Proveedor: <strong>{compra.proveedor_nombre || 'Sin proveedor'}</strong></div>
-                        <div>Documento: <strong>{compra.tipo_documento} {compra.nro_factura || 'S/N'}</strong></div>
-                        {((((compra.tipo_documento_original || '').toUpperCase() === 'ORDEN_SERVICIO') || ((compra.tipo_documento || '').toUpperCase() === 'ORDEN_SERVICIO') || (compra.nro_documento_original && compra.nro_documento_original !== compra.nro_factura))) && (
-                            <div>OS origen: <strong>{compra.nro_documento_original || compra.nro_factura || 'S/N'}</strong></div>
-                        )}
-                        <div>Tipo compra: <strong>{compra.tipo_compra}</strong></div>
-                        <div>Condicion: {estadoBadge(compra.condicion_pago)}</div>
-                        <div>Estado: {estadoBadge(compra.estado)}</div>
-                        <div>Entrega: {estadoBadge(compra.estado_entrega)}</div>
-                    </div>
-                </div>
-                <div className="card" style={{ marginBottom: 0 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 10 }}>Totales</div>
-                    <div style={{ display: 'grid', gap: 8 }}>
-                        <div style={{ fontSize: '1rem', fontWeight: 700 }}>Total: Gs. {fmt(compra.total)}</div>
-                        <div style={{ color: compra.saldo > 0 ? 'var(--warning)' : 'var(--success)', fontWeight: 700 }}>Saldo: Gs. {fmt(compra.saldo)}</div>
-                        <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>Fecha: {fmtDateTime(compra.fecha)}</div>
-                        {compra.fecha_vencimiento && <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>Vence: {fmtDate(compra.fecha_vencimiento)}</div>}
-                    </div>
-                </div>
-            </div>
-
-            <div className="card" style={{ marginBottom: 0 }}>
-                <div style={{ fontWeight: 700, marginBottom: 10 }}>Ventas y Clientes Asociados</div>
-                <div style={{ color: 'var(--text-secondary)', fontSize: '0.84rem' }}>Ventas: {compra.ventas_codigos?.length ? compra.ventas_codigos.join(', ') : '-'}</div>
-                <div style={{ color: 'var(--text-secondary)', fontSize: '0.84rem', marginTop: 4 }}>Clientes: {compra.clientes_nombres?.length ? compra.clientes_nombres.join(', ') : '-'}</div>
-            </div>
-
-            <div className="card" style={{ padding: 0, marginBottom: 0 }}>
-                <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', fontWeight: 700 }}>Items</div>
-                <div className="table-container">
-                    <table>
-                        <thead><tr><th>Descripcion</th><th>Cant.</th><th>Costo Unit.</th><th>Desc.</th><th>Subtotal</th></tr></thead>
-                        <tbody>{compra.items.map(item => <tr key={item.id}><td>{item.descripcion}</td><td>{item.cantidad}</td><td>Gs. {fmt(item.costo_unitario)}</td><td>Gs. {fmt(item.descuento)}</td><td style={{ fontWeight: 700 }}>Gs. {fmt(item.subtotal)}</td></tr>)}</tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div className="card" style={{ padding: 0, marginBottom: 0 }}>
-                <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', fontWeight: 700 }}>Pagos</div>
-                {pagos.length === 0 ? <div style={{ padding: '16px 20px', color: 'var(--text-muted)', fontSize: '0.84rem' }}>No hay pagos registrados.</div> : (
-                    <div className="table-container">
-                        <table>
-                            <thead><tr><th>Fecha</th><th>Metodo</th><th>Banco</th><th>Comprobante</th><th>Monto</th></tr></thead>
-                            <tbody>{pagos.map(pago => <tr key={pago.id}><td>{fmtDateTime(pago.fecha)}</td><td>{pago.metodo_pago}</td><td>{pago.banco_nombre || '-'}</td><td>{pago.nro_comprobante || '-'}</td><td style={{ fontWeight: 700, color: 'var(--success)' }}>Gs. {fmt(pago.monto)}</td></tr>)}</tbody>
-                        </table>
-                    </div>
-                )}
-            </div>
-
-            {compra.observaciones && <div className="card" style={{ marginBottom: 0 }}><div style={{ fontWeight: 700, marginBottom: 8 }}>Observaciones</div><div style={{ color: 'var(--text-secondary)', fontSize: '0.84rem' }}>{compra.observaciones}</div></div>}
-            <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}><button type="button" className="btn btn-secondary" onClick={onClose}>Cerrar</button></div>
-        </div>
-    )
+    return <DetalleCompraContent compraId={compraId} onClose={onClose} />
 }
 
 function EstadoEntregaModal({ compra, onClose, onWhatsappReady = null, onProcessingChange = null }) {
@@ -1228,8 +1335,24 @@ export default function ComprasPage() {
     const [deletingId, setDeletingId] = useState(null)
     const [entregaProcessing, setEntregaProcessing] = useState(false)
     const [whatsappRetiro, setWhatsappRetiro] = useState(null)
-    const { data: whatsappTemplates = [] } = useWhatsappTemplatesCatalog()
+    const [loadSecondaryCatalogs, setLoadSecondaryCatalogs] = useState(false)
+    const { data: whatsappTemplates = [] } = useWhatsappTemplatesCatalog({
+        enabled: loadSecondaryCatalogs,
+    })
     const actualizarWhatsappTemplate = useActualizarWhatsappTemplate()
+    const { data: configPublica } = useQuery({
+        queryKey: ['configuracion-general-publica'],
+        queryFn: () => api.get('/configuracion-general/publica').then(response => response.data),
+        enabled: loadSecondaryCatalogs,
+        staleTime: 5 * 60 * 1000,
+        retry: false,
+    })
+    const empresaNombre = (configPublica?.nombre || '').trim() || 'HESAKA'
+
+    useEffect(() => {
+        const timer = window.setTimeout(() => setLoadSecondaryCatalogs(true), 180)
+        return () => window.clearTimeout(timer)
+    }, [])
 
     useEffect(() => {
         const retiroTemplate = getWhatsappTemplateByCode(whatsappTemplates, RETIRO_TEMPLATE_CODE, DEFAULT_RETIRO_WHATSAPP_TEMPLATE)
@@ -1256,6 +1379,7 @@ export default function ComprasPage() {
             return api.get(`/compras/listado-optimizado?${params.toString()}`).then(response => response.data)
         },
         retry: false,
+        staleTime: 30000,
     })
 
     const compras = data?.items || []
@@ -1517,6 +1641,7 @@ export default function ComprasPage() {
                     <WhatsappRetiroModal
                         context={whatsappRetiro}
                         onClose={() => setWhatsappRetiro(null)}
+                        empresaNombre={empresaNombre}
                         guardandoPlantilla={actualizarWhatsappTemplate.isPending}
                         onGuardarPlantilla={plantilla => {
                             actualizarWhatsappTemplate.mutate({

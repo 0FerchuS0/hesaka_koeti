@@ -1,11 +1,13 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { PanelLeftOpen } from 'lucide-react'
 import { AuthProvider, useAuth, api } from './context/AuthContext'
 import Modal from './components/Modal'
 import Sidebar from './components/Sidebar'
 import RouteErrorBoundary from './components/RouteErrorBoundary'
+import { applyModuleFreshnessSnapshot } from './utils/moduleFreshness'
+import { completeTrackedFlow, consumePendingTrackedFlow, markFlowStep, waitForNextPaint } from './utils/performanceMonitor'
 import { hasActionAccess, hasModuleAccess, normalizeRole } from './utils/roles'
 import {
     consumeBeforeUnloadSuppression,
@@ -35,6 +37,7 @@ const ProductosPage = lazy(() => import('./pages/ProductosPage'))
 const ProveedoresPage = lazy(() => import('./pages/ProveedoresPage'))
 const DestinatariosRendicionPage = lazy(() => import('./pages/DestinatariosRendicionPage'))
 const PlantillasWhatsappPage = lazy(() => import('./pages/PlantillasWhatsappPage'))
+const PaquetesVentaPage = lazy(() => import('./pages/PaquetesVentaPage'))
 const PresupuestosPage = lazy(() => import('./pages/PresupuestosPage'))
 const VentasPage = lazy(() => import('./pages/VentasPage'))
 const ComprasPage = lazy(() => import('./pages/ComprasPage'))
@@ -54,6 +57,7 @@ const ReporteAjustesVentasPage = lazy(() => import('./pages/ReporteAjustesVentas
 const CobroMultiplePage = lazy(() => import('./pages/CobroMultiplePage'))
 const HistorialCobrosMultiplesPage = lazy(() => import('./pages/HistorialCobrosMultiplesPage'))
 const ClinicaPage = lazy(() => import('./pages/ClinicaPage'))
+const PerformanceReportPage = lazy(() => import('./pages/PerformanceReportPage'))
 
 const RouteLoader = () => (
     <div className="page-body">
@@ -128,6 +132,7 @@ function ClinicaIndexRoute() {
 
 function AppLayout() {
     const { user, logout } = useAuth()
+    const queryClient = useQueryClient()
     const location = useLocation()
     const [isMobileSidebarViewport, setIsMobileSidebarViewport] = useState(() => window.innerWidth <= 768)
     const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
@@ -147,6 +152,38 @@ function AppLayout() {
         retry: false,
         staleTime: 60000,
     })
+
+    const { data: moduleFreshness } = useQuery({
+        queryKey: ['module-freshness-poll'],
+        queryFn: () => api.get('/ventas/module-freshness').then(response => response.data),
+        enabled: Boolean(user),
+        retry: false,
+        staleTime: 0,
+        refetchInterval: 30000,
+        refetchIntervalInBackground: true,
+    })
+
+    useEffect(() => {
+        if (!moduleFreshness) return
+        const changedModules = applyModuleFreshnessSnapshot(moduleFreshness)
+        if (!changedModules.length) return
+
+        if (changedModules.includes('ventas') && location.pathname.startsWith('/ventas')) {
+            void queryClient.invalidateQueries({ queryKey: ['ventas-optimizado'], refetchType: 'active' })
+        }
+        if (changedModules.includes('presupuestos') && location.pathname.startsWith('/presupuestos')) {
+            void queryClient.invalidateQueries({ queryKey: ['presupuestos'], refetchType: 'active' })
+        }
+    }, [location.pathname, moduleFreshness, queryClient])
+
+    useEffect(() => {
+        const pendingLogin = consumePendingTrackedFlow('login')
+        if (!pendingLogin) return
+        markFlowStep(pendingLogin, 'pantalla_principal', 'Pantalla principal visible', { ruta: location.pathname })
+        void waitForNextPaint().then(() => {
+            completeTrackedFlow(pendingLogin, { metadata: { ruta_final: location.pathname } })
+        })
+    }, [location.pathname])
 
     const performIdleLogout = useCallback(() => {
         if (idleTimerRef.current) {
@@ -401,6 +438,7 @@ function AppLayout() {
                             <Route path="/proveedores" element={<RoleRoute allowedRoles="proveedores"><ProveedoresPage /></RoleRoute>} />
                             <Route path="/catalogos/destinatarios-rendicion" element={<RoleRoute allowedRoles="catalogos"><DestinatariosRendicionPage /></RoleRoute>} />
                             <Route path="/catalogos/plantillas-whatsapp" element={<RoleRoute allowedRoles="catalogos"><PlantillasWhatsappPage /></RoleRoute>} />
+                            <Route path="/catalogos/paquetes-venta" element={<RoleRoute allowedRoles="catalogos"><PaquetesVentaPage /></RoleRoute>} />
                             <Route path="/presupuestos" element={<RoleRoute allowedRoles="presupuestos"><PresupuestosPage /></RoleRoute>} />
                             <Route path="/ventas" element={<RoleRoute allowedRoles="ventas"><RouteErrorBoundary><VentasPage /></RouteErrorBoundary></RoleRoute>} />
                             <Route path="/ventas/ajustes" element={<RoleRoute allowedRoles="ventas"><RouteErrorBoundary><ReporteAjustesVentasPage /></RouteErrorBoundary></RoleRoute>} />
@@ -412,6 +450,7 @@ function AppLayout() {
                             <Route path="/ventas/historial-cobros-multiples" element={<RoleRoute allowedRoles="cobros"><HistorialCobrosMultiplesPage /></RoleRoute>} />
                             <Route path="/cuentas-por-pagar" element={<RoleRoute allowedRoles="cuentas_por_pagar"><CuentasPorPagarPage /></RoleRoute>} />
                             <Route path="/gastos" element={<RoleRoute allowedRoles="finanzas"><GastosPage /></RoleRoute>} />
+                            <Route path="/rendimiento" element={<PerformanceReportPage />} />
 
                             <Route path="/reportes" element={<Navigate to="/reportes/ventas" replace />} />
                             <Route path="/reportes/ventas" element={<RoleRoute allowedRoles="reportes_comercial"><ReporteVentasPage /></RoleRoute>} />

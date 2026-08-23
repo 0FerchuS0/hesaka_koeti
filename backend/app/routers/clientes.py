@@ -104,8 +104,8 @@ WHATSAPP_TEMPLATE_DEFAULTS = [
     },
     {
         "codigo": "clinica_recordatorio_turno",
-        "nombre": "Clinica - Recordatorio de turno",
-        "descripcion": "Recordatorio de turno/control para pacientes de clinica.",
+        "nombre": "Clinica - Recordatorio de consulta",
+        "descripcion": "Recordatorio de turno/control para pacientes de clinica. Se usa tanto en la Agenda como en los avisos del Dashboard.",
         "plantilla": "Hola {paciente}, te escribimos de {empresa}. Te recordamos tu turno para el {proxima_consulta} a las {hora_turno}. Te esperamos. Si no podras asistir, por favor avisanos para reprogramar.",
     },
     {
@@ -114,18 +114,21 @@ WHATSAPP_TEMPLATE_DEFAULTS = [
         "descripcion": "Mensaje de saludo para clientes en su cumpleanos.",
         "plantilla": "Hola {cliente}, te escribimos de {empresa}. Queremos desearte un muy feliz cumpleaños. Que tengas un excelente dia.",
     },
-    {
-        "codigo": "dashboard_recordatorio",
-        "nombre": "Dashboard - Recordatorio rapido",
-        "descripcion": "Mensaje rapido desde dashboard para recordar proximas consultas.",
-        "plantilla": "Hola {paciente}, te escribimos de {empresa}. Tu ultima consulta fue el {ultima_consulta} y tu proximo control esta previsto para el {proxima_consulta} a las {hora_turno}. Quedamos atentos para ayudarte a confirmar tu cita.",
-    },
 ]
+
+# Codigos retirados del catalogo: se unificaron con otro codigo vigente.
+# 'dashboard_recordatorio' -> fusionado con 'clinica_recordatorio_turno' (mismo proposito: recordatorio de consulta).
+WHATSAPP_TEMPLATE_CODIGOS_RETIRADOS = ["dashboard_recordatorio"]
 
 
 def _asegurar_catalogo_plantillas_whatsapp(session):
     existentes = {row.codigo: row for row in session.query(PlantillaWhatsapp).all()}
     cambios = False
+    for codigo_retirado in WHATSAPP_TEMPLATE_CODIGOS_RETIRADOS:
+        row_retirado = existentes.pop(codigo_retirado, None)
+        if row_retirado is not None:
+            session.delete(row_retirado)
+            cambios = True
     for item in WHATSAPP_TEMPLATE_DEFAULTS:
         row = existentes.get(item["codigo"])
         if not row:
@@ -166,6 +169,7 @@ class MovimientoFichaOut(BaseModel):
     debito: float
     credito: float
     saldo_acumulado: float
+    venta_id: Optional[int] = None
 
 
 class VentaPendienteFichaOut(BaseModel):
@@ -660,6 +664,7 @@ def _build_cliente_ficha(session, cliente: Cliente):
             "debito": float(venta.total or 0.0),
             "credito": 0.0,
             "orden": 0,
+            "venta_id": venta.id,
         })
     for pago in pagos:
         codigo = pago.venta_rel.codigo if pago.venta_rel else f"#{pago.venta_id}"
@@ -671,6 +676,7 @@ def _build_cliente_ficha(session, cliente: Cliente):
             "debito": 0.0,
             "credito": float(pago.monto or 0.0),
             "orden": 1,
+            "venta_id": pago.venta_id,
         })
 
     # Orden logico para lectura de estado de cuenta:
@@ -687,6 +693,7 @@ def _build_cliente_ficha(session, cliente: Cliente):
             debito=item["debito"],
             credito=item["credito"],
             saldo_acumulado=saldo,
+            venta_id=item.get("venta_id"),
         ))
 
     ventas_pendientes = [
@@ -1004,27 +1011,60 @@ def listar_clientes_optimizado(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        query = _construir_query_clientes(session, buscar, referidor_id)
-        total = query.count()
+        query = (
+            session.query(
+                Cliente.id,
+                Cliente.nombre,
+                Cliente.ci,
+                Cliente.telefono,
+                Cliente.email,
+                Cliente.direccion,
+                Cliente.fecha_nacimiento,
+                Cliente.fecha_registro,
+                Cliente.notas,
+                Cliente.referidor_id,
+                Referidor.nombre.label("referidor_nombre"),
+            )
+            .outerjoin(Referidor, Referidor.id == Cliente.referidor_id)
+        )
+        if referidor_id:
+            query = query.filter(Cliente.referidor_id == referidor_id)
+        if buscar and buscar.strip():
+            term = f"%{buscar.strip()}%"
+            query = query.filter(
+                or_(
+                    Cliente.nombre.ilike(term),
+                    Cliente.ci.ilike(term),
+                    Cliente.telefono.ilike(term),
+                )
+            )
+
+        total = query.order_by(None).count()
         total_pages = ceil(total / page_size) if total else 1
         offset = (page - 1) * page_size
-        clientes = query.order_by(Cliente.nombre.asc()).offset(offset).limit(page_size).all()
+        rows = (
+            query
+            .order_by(Cliente.nombre.asc(), Cliente.id.asc())
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
 
         items = [
             ClienteListItemOut(
-                id=cliente.id,
-                nombre=cliente.nombre,
-                ci=cliente.ci,
-                telefono=cliente.telefono,
-                email=cliente.email,
-                direccion=cliente.direccion,
-                fecha_nacimiento=cliente.fecha_nacimiento,
-                fecha_registro=cliente.fecha_registro,
-                notas=cliente.notas,
-                referidor_id=cliente.referidor_id,
-                referidor_nombre=cliente.referidor_rel.nombre if cliente.referidor_rel else None,
+                id=row.id,
+                nombre=row.nombre,
+                ci=row.ci,
+                telefono=row.telefono,
+                email=row.email,
+                direccion=row.direccion,
+                fecha_nacimiento=row.fecha_nacimiento,
+                fecha_registro=row.fecha_registro,
+                notas=row.notas,
+                referidor_id=row.referidor_id,
+                referidor_nombre=row.referidor_nombre,
             )
-            for cliente in clientes
+            for row in rows
         ]
 
         return ClienteListResponseOut(

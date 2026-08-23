@@ -5,25 +5,30 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from typing import List, Optional
 from datetime import date, datetime
 from math import ceil
-from sqlalchemy import or_
+import re
+from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from app.database import get_session_for_tenant
 from app.models.models import (
     Venta, Presupuesto, PresupuestoItem, Pago,
     Cliente, ConfiguracionCaja, MovimientoCaja, MovimientoBanco,
     Banco, Comision, Referidor, Producto, CompraDetalle, AjusteVenta,
-    Vendedor, CanalVenta, ConfiguracionEmpresa
+    Vendedor, CanalVenta, ConfiguracionEmpresa, CorreccionVentaCerrada,
+    PaqueteVenta, PaqueteVentaItem
 )
 from app.utils.auth import get_current_user, require_action
 from app.utils.configuracion_general import obtener_canal_principal
 from app.middleware.tenant import get_tenant_slug
 from app.schemas.schemas import (
     VentaOut, VentaCreate, PresupuestoOut, PresupuestoCreate,
-    PagoCreate, PagoOut, PagoMultipleCreate, PagoMultipleItem, GrupoPagoOut,
+    PagoCreate, PagoOut, PagoMultipleCreate, PagoMultipleItem, GrupoPagoOut, VentaItemOut,
     VentaListItemOut, VentaListResponseOut,
     PresupuestoListItemOut, PresupuestoListResponseOut,
     VentasPdfMultipleRequest, AjusteVentaCreate, AjusteVentaUpdate,
     AjusteVentaOut, AjusteVentaListResponseOut, PresupuestoAsignacionComercialIn,
-    PresupuestoFechaUpdate, VentaFechaUpdate,
+    PresupuestoFechaUpdate, VentaFechaUpdate, CorreccionVentaCerradaCreate,
+    CorreccionVentaCerradaOut,
+    PaqueteVentaIn, PaqueteVentaOut, PaqueteVentaProductoRefOut,
 )
 from fastapi.responses import StreamingResponse
 from app.utils.pdf_recibos_venta import (
@@ -33,7 +38,12 @@ from app.utils.pdf_recibos_venta import (
 )
 from app.utils.pdf_presupuestos import generar_pdf_presupuesto
 from app.utils.filename_utils import sanitize_filename_component
-from app.utils.jornada import normalizar_fecha_negocio, require_jornada_abierta, require_jornada_abierta_para_fecha
+from app.utils.jornada import (
+    aplicar_autorizacion_post_rendicion,
+    normalizar_fecha_negocio,
+    require_jornada_abierta,
+    require_jornada_abierta_para_fecha,
+)
 from app.utils.timezone import ahora_negocio
 
 router = APIRouter(prefix="/api/ventas", tags=["Ventas"])
@@ -44,21 +54,142 @@ def _obtener_canal_venta_default(session):
     return obtener_canal_principal(session)
 
 
-def _get_siguiente_codigo(session, modelo, prefijo: str) -> str:
-    """Genera el siguiente código correlativo sin reciclar números borrados."""
-    codigos = (
-        session.query(modelo.codigo)
-        .filter(modelo.codigo.like(f"{prefijo}%"))
-        .all()
+# ─── Paquetes de venta (kits rápidos para armar presupuestos) ──────────────────
+
+def _build_paquete_venta_out(paquete: PaqueteVenta) -> PaqueteVentaOut:
+    return PaqueteVentaOut(
+        id=paquete.id,
+        nombre=paquete.nombre,
+        activo=paquete.activo,
+        items=[PaqueteVentaProductoRefOut.model_validate(item.producto_rel) for item in paquete.items],
     )
-    max_num = 0
-    for (codigo,) in codigos:
-        if not codigo or not codigo.startswith(prefijo):
+
+
+@pre_router.get("/paquetes-venta", response_model=List[PaqueteVentaOut])
+def listar_paquetes_venta(
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+    buscar: Optional[str] = Query(None),
+    activo: Optional[bool] = Query(None),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        query = session.query(PaqueteVenta)
+        if activo is not None:
+            query = query.filter(PaqueteVenta.activo == activo)
+        if buscar and buscar.strip():
+            query = query.filter(PaqueteVenta.nombre.ilike(f"%{buscar.strip()}%"))
+        paquetes = query.order_by(PaqueteVenta.nombre).all()
+        return [_build_paquete_venta_out(p) for p in paquetes]
+    finally:
+        session.close()
+
+
+@pre_router.post("/paquetes-venta", response_model=PaqueteVentaOut)
+def crear_paquete_venta(
+    payload: PaqueteVentaIn,
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    if not payload.producto_ids:
+        raise HTTPException(status_code=422, detail="El paquete debe tener al menos un producto.")
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        paquete = PaqueteVenta(nombre=payload.nombre, activo=payload.activo)
+        paquete.items = [PaqueteVentaItem(producto_id=pid) for pid in payload.producto_ids]
+        session.add(paquete)
+        session.commit()
+        session.refresh(paquete)
+        return _build_paquete_venta_out(paquete)
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="Ya existe un paquete de venta con ese nombre.")
+    finally:
+        session.close()
+
+
+@pre_router.put("/paquetes-venta/{paquete_id}", response_model=PaqueteVentaOut)
+def actualizar_paquete_venta(
+    paquete_id: int,
+    payload: PaqueteVentaIn,
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    if not payload.producto_ids:
+        raise HTTPException(status_code=422, detail="El paquete debe tener al menos un producto.")
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        paquete = session.query(PaqueteVenta).filter(PaqueteVenta.id == paquete_id).first()
+        if not paquete:
+            raise HTTPException(status_code=404, detail="Paquete de venta no encontrado.")
+        paquete.nombre = payload.nombre
+        paquete.activo = payload.activo
+        paquete.items = [PaqueteVentaItem(producto_id=pid) for pid in payload.producto_ids]
+        session.commit()
+        session.refresh(paquete)
+        return _build_paquete_venta_out(paquete)
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="Ya existe un paquete de venta con ese nombre.")
+    finally:
+        session.close()
+
+
+@pre_router.delete("/paquetes-venta/{paquete_id}")
+def eliminar_paquete_venta(
+    paquete_id: int,
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        paquete = session.query(PaqueteVenta).filter(PaqueteVenta.id == paquete_id).first()
+        if not paquete:
+            raise HTTPException(status_code=404, detail="Paquete de venta no encontrado.")
+        session.delete(paquete)
+        session.commit()
+        return {"detail": "Paquete de venta eliminado."}
+    finally:
+        session.close()
+
+
+def _descontar_stock_venta(session, items) -> None:
+    """Al concretarse una venta, resta del stock lo vendido (puede quedar negativo,
+    indicando que se debe reponer con una compra). anular_venta / la correccion de
+    venta cerrada ya devuelven este stock, asi que este descuento es lo que las
+    vuelve simetricas."""
+    for item in items:
+        if not item.producto_id:
             continue
-        sufijo = codigo[len(prefijo):]
-        if sufijo.isdigit():
-            max_num = max(max_num, int(sufijo))
-    return f"{prefijo}{str(max_num + 1).zfill(4)}"
+        producto = item.producto_rel or session.query(Producto).filter(Producto.id == item.producto_id).first()
+        if producto and producto.controla_stock:
+            producto.stock_actual = (producto.stock_actual or 0) - int(item.cantidad or 0)
+
+
+def _estado_entrega_inicial(items) -> str:
+    """Si ningún ítem del presupuesto requiere laboratorio (ej. un armazón solo,
+    sin cristal ni adaptación), la venta nace directamente ENTREGADO en vez de
+    pasar por el flujo de laboratorio."""
+    requiere_lab = any(
+        getattr(item.producto_rel, "requiere_laboratorio", True)
+        for item in items
+        if item.producto_rel is not None
+    )
+    return "EN_LABORATORIO" if requiere_lab else "ENTREGADO"
+
+
+def _get_siguiente_codigo(session, modelo, prefijo: str) -> str:
+    """Genera el siguiente código correlativo según el mayor código existente."""
+    pattern = re.compile(rf"^{re.escape(prefijo)}(\d+)$")
+    max_num = 0
+
+    for (codigo_actual,) in session.query(modelo.codigo).filter(modelo.codigo.like(f"{prefijo}%")).all():
+        match = pattern.match(str(codigo_actual or "").strip())
+        if not match:
+            continue
+        max_num = max(max_num, int(match.group(1)))
+
+    return f"{prefijo}{max_num + 1:04d}"
 
 
 def _resolver_fecha_operacion(session, value: Optional[datetime] = None) -> datetime:
@@ -66,6 +197,35 @@ def _resolver_fecha_operacion(session, value: Optional[datetime] = None) -> date
     if value is None:
         return ahora_negocio(session)
     return normalizar_fecha_negocio(session, value)
+
+
+def _serializar_version_modulo(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def _obtener_version_ventas(session) -> Optional[str]:
+    latest = session.query(func.max(Venta.updated_at)).scalar()
+    return _serializar_version_modulo(latest)
+
+
+def _obtener_version_presupuestos(session) -> Optional[str]:
+    latest = session.query(func.max(Presupuesto.updated_at)).scalar()
+    return _serializar_version_modulo(latest)
+
+
+@router.get("/module-freshness")
+def obtener_frescura_modulos_comerciales(
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        return {
+            "ventas_version": _obtener_version_ventas(session),
+            "presupuestos_version": _obtener_version_presupuestos(session),
+        }
+    finally:
+        session.close()
 
 
 # ─── Helpers financieros ───────────────────────────────────────────────────────
@@ -77,9 +237,10 @@ def _registrar_en_caja(
     pago_venta_id: Optional[int] = None,
     grupo_pago_id: Optional[str] = None,
     fecha: Optional[datetime] = None,
+    current_user=None,
 ):
     """Registra un ingreso de efectivo en caja, actualizando el saldo."""
-    jornada = require_jornada_abierta_para_fecha(session, fecha, accion="registrar un cobro")
+    jornada = require_jornada_abierta_para_fecha(session, fecha, accion="registrar un cobro", current_user=current_user)
     caja = session.query(ConfiguracionCaja).first()
     if not caja:
         caja = ConfiguracionCaja(id=1, saldo_actual=0.0)
@@ -97,6 +258,7 @@ def _registrar_en_caja(
         pago_venta_id=pago_venta_id,
         jornada_id=jornada.id,
     )
+    aplicar_autorizacion_post_rendicion(jornada, mov)
     session.add(mov)
     return mov
 
@@ -110,9 +272,10 @@ def _registrar_en_banco(
     pago_venta_id: Optional[int] = None,
     grupo_pago_id: Optional[str] = None,
     fecha: Optional[datetime] = None,
+    current_user=None,
 ):
     """Registra un movimiento bancario (ingreso o egreso), actualizando el saldo del banco."""
-    jornada = require_jornada_abierta_para_fecha(session, fecha, accion="registrar un cobro")
+    jornada = require_jornada_abierta_para_fecha(session, fecha, accion="registrar un cobro", current_user=current_user)
     banco = session.query(Banco).filter(Banco.id == banco_id).first()
     if not banco:
         raise HTTPException(status_code=404, detail=f"Banco ID {banco_id} no encontrado.")
@@ -133,6 +296,7 @@ def _registrar_en_banco(
         grupo_pago_id=grupo_pago_id,
         jornada_id=jornada.id,
     )
+    aplicar_autorizacion_post_rendicion(jornada, mov)
     session.add(mov)
     session.flush()
     return mov
@@ -145,13 +309,17 @@ def _registrar_comision_tarjeta(
     codigo_venta: str,
     pago_id: int,
     fecha: Optional[datetime] = None,
+    current_user=None,
 ):
-    """Crea un GastoOperativo automático por comisión de tarjeta y lo descuenta del banco."""
-    from app.models.models import GastoOperativo, CategoriaGasto, ConfiguracionEmpresa
-    config = session.query(ConfiguracionEmpresa).first()
-    if not config or not config.porcentaje_comision_tarjeta:
+    """Crea un GastoOperativo automático por comisión de tarjeta y lo descuenta del banco.
+    El porcentaje es el propio de ESE banco (Banco.porcentaje_comision, configurable en
+    Caja > Bancos) — cada banco cobra distinto, no existe un porcentaje unico valido
+    para todos."""
+    from app.models.models import GastoOperativo, CategoriaGasto, Banco
+    banco_comision = session.query(Banco).filter(Banco.id == banco_id).first()
+    if not banco_comision or not banco_comision.porcentaje_comision:
         return
-    pct = config.porcentaje_comision_tarjeta
+    pct = banco_comision.porcentaje_comision
     monto_comision = round(monto_pago * pct / 100, 2)
     if monto_comision <= 0:
         return
@@ -181,18 +349,19 @@ def _registrar_comision_tarjeta(
         tipo="EGRESO",
         pago_venta_id=pago_id,
         fecha=gasto.fecha,
+        current_user=current_user,
     )
     gasto.movimiento_banco_id = mov.id
 
 
-def _procesar_pago(session, pago: Pago, venta_codigo: str):
+def _procesar_pago(session, pago: Pago, venta_codigo: str, current_user=None):
     """Aplica los efectos financieros de un pago (caja / banco / comisión tarjeta)."""
     pago.fecha = normalizar_fecha_negocio(session, pago.fecha)
     if pago.metodo_pago == "EFECTIVO":
         concepto = f"Pago venta {venta_codigo}"
         if pago.nota:
             concepto += f" ({pago.nota})"
-        _registrar_en_caja(session, pago.monto, concepto, pago_venta_id=pago.id, fecha=pago.fecha)
+        _registrar_en_caja(session, pago.monto, concepto, pago_venta_id=pago.id, fecha=pago.fecha, current_user=current_user)
 
     elif pago.metodo_pago in ("TRANSFERENCIA", "TARJETA"):
         if not pago.banco_id:
@@ -200,10 +369,10 @@ def _procesar_pago(session, pago: Pago, venta_codigo: str):
         concepto = f"Cobro venta {venta_codigo} - {pago.metodo_pago}"
         if pago.nota:
             concepto += f" ({pago.nota})"
-        _registrar_en_banco(session, pago.banco_id, pago.monto, concepto, pago_venta_id=pago.id, fecha=pago.fecha)
+        _registrar_en_banco(session, pago.banco_id, pago.monto, concepto, pago_venta_id=pago.id, fecha=pago.fecha, current_user=current_user)
 
         if pago.metodo_pago == "TARJETA":
-            _registrar_comision_tarjeta(session, pago.banco_id, pago.monto, venta_codigo, pago.id, fecha=pago.fecha)
+            _registrar_comision_tarjeta(session, pago.banco_id, pago.monto, venta_codigo, pago.id, fecha=pago.fecha, current_user=current_user)
 
 
 def _revertir_pago(session, pago: Pago, venta_codigo: str):
@@ -270,6 +439,112 @@ def _serializar_ajuste(ajuste: AjusteVenta) -> AjusteVentaOut:
         motivo=ajuste.motivo or "",
         usuario=ajuste.usuario or "Sistema",
     )
+
+
+def _serializar_correccion_venta(correccion: CorreccionVentaCerrada) -> CorreccionVentaCerradaOut:
+    venta = correccion.venta_origen_rel
+    presupuesto = correccion.presupuesto_nuevo_rel
+    cliente = venta.cliente_rel if venta else None
+    return CorreccionVentaCerradaOut(
+        id=correccion.id,
+        fecha=correccion.fecha,
+        estado=correccion.estado or "ACTIVA",
+        venta_origen_id=correccion.venta_origen_id,
+        venta_origen_codigo=venta.codigo if venta else "N/A",
+        presupuesto_nuevo_id=correccion.presupuesto_nuevo_id,
+        presupuesto_nuevo_codigo=presupuesto.codigo if presupuesto else "N/A",
+        cliente_nombre=cliente.nombre if cliente else None,
+        motivo=correccion.motivo or "",
+        observacion=correccion.observacion,
+        devolver_stock_original=bool(correccion.devolver_stock_original),
+        monto_cobrado_original=float(correccion.monto_cobrado_original or 0.0),
+        saldo_original=float(correccion.saldo_original or 0.0),
+        usuario=correccion.usuario,
+    )
+
+
+def _clonar_presupuesto_para_correccion(
+    session,
+    venta: Venta,
+    *,
+    motivo: str,
+    observacion: Optional[str],
+    monto_cobrado_original: float,
+) -> Presupuesto:
+    presupuesto_origen = venta.presupuesto_rel
+    if not presupuesto_origen:
+        raise HTTPException(status_code=422, detail="La venta no tiene un presupuesto asociado para generar una correccion.")
+
+    codigo_nuevo = _get_siguiente_codigo(session, Presupuesto, "PRE")
+    fecha_nueva = _resolver_fecha_operacion(session)
+    referencia = (
+        f"Presupuesto de correccion generado desde venta {venta.codigo} "
+        f"el {fecha_nueva.strftime('%d/%m/%Y %H:%M')}."
+    )
+    nota_credito = None
+    if monto_cobrado_original > 0:
+        monto_legible = f"{int(round(monto_cobrado_original)):,}".replace(",", ".")
+        nota_credito = f"Credito a favor ya cobrado en venta original: Gs. {monto_legible}"
+    observaciones = " | ".join(
+        part for part in [
+            referencia,
+            f"Motivo: {motivo}",
+            observacion,
+            nota_credito,
+            presupuesto_origen.observaciones,
+        ] if part
+    )
+
+    nuevo_presupuesto = Presupuesto(
+        codigo=codigo_nuevo,
+        fecha=fecha_nueva,
+        estado="BORRADOR",
+        cliente_id=presupuesto_origen.cliente_id,
+        total=float(presupuesto_origen.total or 0.0),
+        graduacion_od_esfera=presupuesto_origen.graduacion_od_esfera,
+        graduacion_od_cilindro=presupuesto_origen.graduacion_od_cilindro,
+        graduacion_od_eje=presupuesto_origen.graduacion_od_eje,
+        graduacion_od_adicion=presupuesto_origen.graduacion_od_adicion,
+        graduacion_oi_esfera=presupuesto_origen.graduacion_oi_esfera,
+        graduacion_oi_cilindro=presupuesto_origen.graduacion_oi_cilindro,
+        graduacion_oi_eje=presupuesto_origen.graduacion_oi_eje,
+        graduacion_oi_adicion=presupuesto_origen.graduacion_oi_adicion,
+        doctor_receta=presupuesto_origen.doctor_receta,
+        observaciones=observaciones,
+        fecha_receta=presupuesto_origen.fecha_receta,
+        fecha_proximo_control=presupuesto_origen.fecha_proximo_control,
+        no_requiere_proximo_control=bool(presupuesto_origen.no_requiere_proximo_control),
+        consulta_clinica_id=presupuesto_origen.consulta_clinica_id,
+        consulta_clinica_tipo=presupuesto_origen.consulta_clinica_tipo,
+        vendedor_id=presupuesto_origen.vendedor_id,
+        canal_venta_id=presupuesto_origen.canal_venta_id,
+        referidor_id=presupuesto_origen.referidor_id,
+        comision_monto=float(presupuesto_origen.comision_monto or 0.0),
+        grupo_id=presupuesto_origen.grupo_id,
+    )
+    session.add(nuevo_presupuesto)
+    session.flush()
+
+    total_nuevo = 0.0
+    for item in presupuesto_origen.items or []:
+        subtotal = float(item.subtotal or 0.0)
+        total_nuevo += subtotal
+        session.add(PresupuestoItem(
+            presupuesto_id=nuevo_presupuesto.id,
+            producto_id=item.producto_id,
+            cantidad=int(item.cantidad or 0),
+            precio_unitario=float(item.precio_unitario or 0.0),
+            costo_unitario=float(item.costo_unitario or 0.0),
+            descuento=float(item.descuento or 0.0),
+            subtotal=subtotal,
+            descripcion_personalizada=item.descripcion_personalizada,
+            codigo_armazon=item.codigo_armazon,
+            medidas_armazon=item.medidas_armazon,
+        ))
+
+    nuevo_presupuesto.total = total_nuevo
+    session.flush()
+    return nuevo_presupuesto
 
 
 # ─── Presupuestos ──────────────────────────────────────────────────────────────
@@ -476,6 +751,7 @@ def listar_presupuestos_optimizado(
             page_size=page_size,
             total=total,
             total_pages=total_pages,
+            version=_obtener_version_presupuestos(session),
         )
     finally:
         session.close()
@@ -490,10 +766,11 @@ def convertir_presupuesto_a_venta(
 ):
     """
     Convierte un Presupuesto en Venta con todos los efectos automáticos:
-    - Estado de entrega: EN_LABORATORIO
+    - Estado de entrega: EN_LABORATORIO, salvo que ningún ítem requiera laboratorio (ahí nace ENTREGADO).
     - Crea comisión automática si el presupuesto tiene referidor
     - Procesa los pagos iniciales con efectos en caja/banco
     """
+
     session = get_session_for_tenant(tenant_slug)
     try:
         pre = session.query(Presupuesto).filter(Presupuesto.id == pre_id).first()
@@ -521,7 +798,7 @@ def convertir_presupuesto_a_venta(
             total=pre.total,
             saldo=saldo_inicial,
             estado="PAGADO" if saldo_inicial == 0 else "PENDIENTE",
-            estado_entrega="EN_LABORATORIO",
+            estado_entrega=_estado_entrega_inicial(pre.items),
             referidor_id=pre.referidor_id,
             vendedor_id=pre.vendedor_id,
             canal_venta_id=canal_venta_id,
@@ -533,6 +810,7 @@ def convertir_presupuesto_a_venta(
         session.flush()
 
         pre.estado = "VENDIDO"
+        _descontar_stock_venta(session, pre.items)
 
         if pre.referidor_id and pre.comision_monto and pre.comision_monto > 0:
             comision = Comision(
@@ -550,7 +828,7 @@ def convertir_presupuesto_a_venta(
             pago = Pago(venta_id=venta.id, **pago_dict)
             session.add(pago)
             session.flush()
-            _procesar_pago(session, pago, codigo)
+            _procesar_pago(session, pago, codigo, current_user=current_user)
 
         session.commit()
         session.refresh(venta)
@@ -625,6 +903,12 @@ def crear_presupuesto(data: PresupuestoCreate, tenant_slug: str = Depends(get_te
     except HTTPException:
         session.rollback()
         raise
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="No se pudo guardar el presupuesto porque el código generado ya existe. Vuelve a intentar.",
+        )
     except Exception as e:
         session.rollback()
         raise HTTPException(status_code=500, detail=f"Error al crear presupuesto: {str(e)}")
@@ -791,19 +1075,43 @@ def get_ventas_pendientes_cobro(
     """Obtiene todas las ventas con saldo pendiente (> 0)."""
     session = get_session_for_tenant(tenant_slug)
     try:
-        ventas = session.query(Venta).filter(Venta.saldo > 0).order_by(Venta.fecha.desc()).all()
-        print(f"DEBUG: Found {len(ventas)} pending sales for tenant {tenant_slug}")
-        result = []
-        for v in ventas:
-            vo = VentaOut.model_validate(v)
-            if v.cliente_rel:
-                vo.cliente_nombre = str(v.cliente_rel.nombre)
-            else:
-                vo.cliente_nombre = "N/A"
-            vo.vendedor_nombre = v.vendedor_rel.nombre if getattr(v, "vendedor_rel", None) else None
-            vo.canal_venta_nombre = v.canal_venta_rel.nombre if getattr(v, "canal_venta_rel", None) else None
-            result.append(vo)
-        return result
+        rows = (
+            session.query(
+                Venta.id,
+                Venta.codigo,
+                Venta.fecha,
+                Venta.cliente_id,
+                Cliente.nombre.label("cliente_nombre"),
+                Venta.total,
+                Venta.saldo,
+                Venta.estado,
+                Venta.estado_entrega,
+                Vendedor.nombre.label("vendedor_nombre"),
+                CanalVenta.nombre.label("canal_venta_nombre"),
+            )
+            .outerjoin(Cliente, Venta.cliente_id == Cliente.id)
+            .outerjoin(Vendedor, Venta.vendedor_id == Vendedor.id)
+            .outerjoin(CanalVenta, Venta.canal_venta_id == CanalVenta.id)
+            .filter(Venta.saldo > 0, Venta.estado != "ANULADA")
+            .order_by(Venta.fecha.desc(), Venta.id.desc())
+            .all()
+        )
+        return [
+            VentaOut(
+                id=row.id,
+                codigo=row.codigo,
+                fecha=row.fecha,
+                cliente_id=row.cliente_id,
+                cliente_nombre=row.cliente_nombre or "N/A",
+                total=row.total or 0.0,
+                saldo=row.saldo or 0.0,
+                estado=row.estado or "PENDIENTE",
+                estado_entrega=row.estado_entrega,
+                vendedor_nombre=row.vendedor_nombre,
+                canal_venta_nombre=row.canal_venta_nombre,
+            )
+            for row in rows
+        ]
     except Exception as e:
         print(f"ERROR in get_ventas_pendientes_cobro: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1076,7 +1384,20 @@ def listar_ventas_optimizado(
     session = get_session_for_tenant(tenant_slug)
     try:
         query = (
-            session.query(Venta)
+            session.query(
+                Venta.id,
+                Venta.codigo,
+                Venta.fecha,
+                Venta.presupuesto_id,
+                Venta.cliente_id,
+                Cliente.nombre.label("cliente_nombre"),
+                Venta.total,
+                Venta.saldo,
+                Venta.estado,
+                Venta.estado_entrega,
+                Vendedor.nombre.label("vendedor_nombre"),
+                CanalVenta.nombre.label("canal_venta_nombre"),
+            )
             .outerjoin(Cliente, Venta.cliente_id == Cliente.id)
             .outerjoin(Vendedor, Venta.vendedor_id == Vendedor.id)
             .outerjoin(CanalVenta, Venta.canal_venta_id == CanalVenta.id)
@@ -1108,10 +1429,10 @@ def listar_ventas_optimizado(
                 )
             )
 
-        total = query.count()
+        total = query.order_by(None).count()
         total_pages = ceil(total / page_size) if total else 1
         offset = (page - 1) * page_size
-        ventas = (
+        rows = (
             query
             .order_by(Venta.fecha.desc(), Venta.id.desc())
             .offset(offset)
@@ -1121,19 +1442,20 @@ def listar_ventas_optimizado(
 
         items = [
             VentaListItemOut(
-                id=venta.id,
-                codigo=venta.codigo,
-                fecha=venta.fecha,
-                cliente_id=venta.cliente_id,
-                cliente_nombre=venta.cliente_rel.nombre if venta.cliente_rel else "N/A",
-                vendedor_nombre=venta.vendedor_rel.nombre if getattr(venta, "vendedor_rel", None) else None,
-                canal_venta_nombre=venta.canal_venta_rel.nombre if getattr(venta, "canal_venta_rel", None) else None,
-                total=venta.total or 0.0,
-                saldo=venta.saldo or 0.0,
-                estado=venta.estado,
-                estado_entrega=venta.estado_entrega,
+                id=row.id,
+                codigo=row.codigo,
+                fecha=row.fecha,
+                presupuesto_id=row.presupuesto_id,
+                cliente_id=row.cliente_id,
+                cliente_nombre=row.cliente_nombre or "N/A",
+                vendedor_nombre=row.vendedor_nombre,
+                canal_venta_nombre=row.canal_venta_nombre,
+                total=row.total or 0.0,
+                saldo=row.saldo or 0.0,
+                estado=row.estado,
+                estado_entrega=row.estado_entrega,
             )
-            for venta in ventas
+            for row in rows
         ]
         return VentaListResponseOut(
             items=items,
@@ -1141,6 +1463,7 @@ def listar_ventas_optimizado(
             page_size=page_size,
             total=total,
             total_pages=total_pages,
+            version=_obtener_version_ventas(session),
         )
     finally:
         session.close()
@@ -1162,6 +1485,42 @@ def obtener_venta(venta_id: int, tenant_slug: str = Depends(get_tenant_slug), cu
             vo.cliente_nombre = "N/A"
         vo.vendedor_nombre = v.vendedor_rel.nombre if getattr(v, "vendedor_rel", None) else None
         vo.canal_venta_nombre = v.canal_venta_rel.nombre if getattr(v, "canal_venta_rel", None) else None
+        vo.pagos = [
+            PagoOut(
+                **{**PagoOut.model_validate(p).model_dump(), "banco_nombre": p.banco_rel.nombre_banco if p.banco_rel else None}
+            )
+            for p in v.pagos
+        ]
+
+        pre = v.presupuesto_rel
+        if pre:
+            vo.items = [
+                VentaItemOut(
+                    id=item.id,
+                    producto_id=item.producto_id,
+                    producto_nombre=item.producto_rel.nombre if item.producto_rel else None,
+                    cantidad=item.cantidad,
+                    precio_unitario=item.precio_unitario,
+                    costo_unitario=item.costo_unitario,
+                    descuento=item.descuento,
+                    subtotal=item.subtotal,
+                    descripcion_personalizada=item.descripcion_personalizada,
+                    iva=item.producto_rel.impuesto if item.producto_rel else None,
+                )
+                for item in pre.items
+            ]
+            vo.observaciones = pre.observaciones
+            vo.doctor_receta = pre.doctor_receta
+            vo.fecha_receta = pre.fecha_receta
+            vo.fecha_proximo_control = pre.fecha_proximo_control
+            vo.graduacion_od_esfera = pre.graduacion_od_esfera
+            vo.graduacion_od_cilindro = pre.graduacion_od_cilindro
+            vo.graduacion_od_eje = pre.graduacion_od_eje
+            vo.graduacion_od_adicion = pre.graduacion_od_adicion
+            vo.graduacion_oi_esfera = pre.graduacion_oi_esfera
+            vo.graduacion_oi_cilindro = pre.graduacion_oi_cilindro
+            vo.graduacion_oi_eje = pre.graduacion_oi_eje
+            vo.graduacion_oi_adicion = pre.graduacion_oi_adicion
         return vo
     finally:
         session.close()
@@ -1173,7 +1532,7 @@ def crear_venta(data: VentaCreate, tenant_slug: str = Depends(get_tenant_slug), 
     Crea una Venta a partir de un Presupuesto.
     Efectos automáticos:
     - Marca el Presupuesto como VENDIDO.
-    - Estado de entrega inicial: EN_LABORATORIO.
+    - Estado de entrega inicial: EN_LABORATORIO, salvo que ningún ítem requiera laboratorio (ahí nace ENTREGADO).
     - Si hay referidor con comisión, genera registro en tabla Comision.
     - Si hay pagos iniciales, aplica los movimientos de caja/banco/tarjeta.
     """
@@ -1188,9 +1547,16 @@ def crear_venta(data: VentaCreate, tenant_slug: str = Depends(get_tenant_slug), 
 
         venta_data["fecha"] = _resolver_fecha_operacion(session, venta_data.get("fecha"))
 
+        estado_entrega_inicial = "EN_LABORATORIO"
+        presupuesto_id = venta_data.get("presupuesto_id")
+        if presupuesto_id:
+            pre_origen = session.query(Presupuesto).filter(Presupuesto.id == presupuesto_id).first()
+            if pre_origen:
+                estado_entrega_inicial = _estado_entrega_inicial(pre_origen.items)
+
         venta = Venta(
             codigo=codigo,
-            estado_entrega="EN_LABORATORIO",  # Estado inicial siempre
+            estado_entrega=estado_entrega_inicial,
             **venta_data
         )
         pagado_inicial = sum(p.monto for p in pagos_data)
@@ -1204,6 +1570,7 @@ def crear_venta(data: VentaCreate, tenant_slug: str = Depends(get_tenant_slug), 
             pre = session.query(Presupuesto).filter(Presupuesto.id == venta.presupuesto_id).first()
             if pre:
                 pre.estado = "VENDIDO"
+                _descontar_stock_venta(session, pre.items)
 
         # 2. Crear comisión automática para el referidor
         if venta.referidor_id and venta.comision_monto and venta.comision_monto > 0:
@@ -1223,7 +1590,7 @@ def crear_venta(data: VentaCreate, tenant_slug: str = Depends(get_tenant_slug), 
             pago = Pago(venta_id=venta.id, **pago_dict)
             session.add(pago)
             session.flush()  # Necesario para tener pago.id
-            _procesar_pago(session, pago, codigo)
+            _procesar_pago(session, pago, codigo, current_user=current_user)
 
         session.commit()
         session.refresh(venta)
@@ -1271,13 +1638,13 @@ def registrar_pago(
             pago_dict["fecha"] = _resolver_fecha_operacion(session)
         else:
             pago_dict["fecha"] = _resolver_fecha_operacion(session, pago_dict["fecha"])
-        require_jornada_abierta_para_fecha(session, pago_dict["fecha"], accion="registrar un cobro")
+        require_jornada_abierta_para_fecha(session, pago_dict["fecha"], accion="registrar un cobro", current_user=current_user)
 
         pago = Pago(venta_id=venta_id, **pago_dict)
         session.add(pago)
         session.flush()
 
-        _procesar_pago(session, pago, venta.codigo)
+        _procesar_pago(session, pago, venta.codigo, current_user=current_user)
 
         venta.saldo = max(0.0, venta.saldo - pago_data.monto)
         venta.estado = "PAGADO" if venta.saldo == 0 else "PENDIENTE"
@@ -1370,7 +1737,7 @@ def anular_venta(
             for item in items:
                 if item.producto_id:
                     prod = session.query(Producto).filter(Producto.id == item.producto_id).first()
-                    if prod and prod.stock_actual is not None:
+                    if prod and prod.stock_actual is not None and prod.controla_stock:
                         prod.stock_actual += item.cantidad
 
         # 4. Revertir estado del presupuesto
@@ -1581,7 +1948,7 @@ def registrar_cobro_multiple(
     try:
         grupo_id = str(uuid.uuid4())
         fecha_pago = normalizar_fecha_negocio(session, data.fecha)
-        require_jornada_abierta_para_fecha(session, fecha_pago, accion="registrar un cobro")
+        require_jornada_abierta_para_fecha(session, fecha_pago, accion="registrar un cobro", current_user=current_user)
         pagos_orm = []
         total_acumulado = 0.0
 
@@ -1613,7 +1980,7 @@ def registrar_cobro_multiple(
 
             # Si es EFECTIVO, registramos movimiento individual en caja (como hacía el legacy)
             if data.metodo_pago == "EFECTIVO":
-                _registrar_en_caja(session, item.monto, f"Cobro Múltiple - Venta {venta.codigo}", pago.id, fecha=fecha_pago)
+                _registrar_en_caja(session, item.monto, f"Cobro Múltiple - Venta {venta.codigo}", pago.id, fecha=fecha_pago, current_user=current_user)
 
         # Si es BANCO, registramos UN SOLO movimiento agrupado
         if data.metodo_pago in ("TRANSFERENCIA", "TARJETA"):
@@ -1625,15 +1992,16 @@ def registrar_cobro_multiple(
                 concepto += f" - {data.nota}"
             
             _registrar_en_banco(
-                session, data.banco_id, total_acumulado, concepto, 
-                tipo="INGRESO", pago_venta_id=None, grupo_pago_id=grupo_id, fecha=fecha_pago
+                session, data.banco_id, total_acumulado, concepto,
+                tipo="INGRESO", pago_venta_id=None, grupo_pago_id=grupo_id, fecha=fecha_pago,
+                current_user=current_user,
             )
 
             if data.metodo_pago == "TARJETA":
                 # La comisión de tarjeta en cobro múltiple es un tema complejo.
-                # En el legacy se aplicaba por el total del grupo? 
+                # En el legacy se aplicaba por el total del grupo?
                 # Reaplicamos lógica: por el total del grupo.
-                _registrar_comision_tarjeta_grupal(session, data.banco_id, total_acumulado, grupo_id, fecha=fecha_pago)
+                _registrar_comision_tarjeta_grupal(session, data.banco_id, total_acumulado, grupo_id, fecha=fecha_pago, current_user=current_user)
 
         session.commit()
         return {"ok": True, "grupo_pago_id": grupo_id, "cantidad_pagos": len(pagos_orm)}
@@ -1730,6 +2098,86 @@ def crear_ajuste_venta(
     except Exception as e:
         session.rollback()
         raise HTTPException(status_code=500, detail=f"Error al registrar ajuste: {str(e)}")
+    finally:
+        session.close()
+
+
+@router.post("/{venta_id:int}/corregir-cerrada", response_model=CorreccionVentaCerradaOut)
+def corregir_venta_cerrada(
+    venta_id: int,
+    data: CorreccionVentaCerradaCreate,
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(require_action("ventas.ajustar", "ventas")),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        require_jornada_abierta(session)
+        venta = session.query(Venta).filter(Venta.id == venta_id).first()
+        if not venta:
+            raise HTTPException(status_code=404, detail="Venta no encontrada.")
+        if venta.estado in {"ANULADA", "ANULADO"}:
+            raise HTTPException(status_code=422, detail="No se puede corregir una venta anulada.")
+        if not venta.presupuesto_id or not venta.presupuesto_rel:
+            raise HTTPException(status_code=422, detail="La venta no tiene presupuesto asociado para generar el cambio.")
+
+        correccion_existente = (
+            session.query(CorreccionVentaCerrada)
+            .filter(
+                CorreccionVentaCerrada.venta_origen_id == venta.id,
+                CorreccionVentaCerrada.estado == "ACTIVA",
+            )
+            .first()
+        )
+        if correccion_existente:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Esta venta ya tiene una correccion activa vinculada al presupuesto {correccion_existente.presupuesto_nuevo_rel.codigo if correccion_existente.presupuesto_nuevo_rel else correccion_existente.presupuesto_nuevo_id}.",
+            )
+
+        monto_cobrado_original = float(sum(float(p.monto or 0.0) for p in (venta.pagos or [])))
+        saldo_original = float(venta.saldo or 0.0)
+        nuevo_presupuesto = _clonar_presupuesto_para_correccion(
+            session,
+            venta,
+            motivo=data.motivo,
+            observacion=data.observacion,
+            monto_cobrado_original=monto_cobrado_original,
+        )
+
+        if data.devolver_stock_original:
+            for item in venta.presupuesto_rel.items or []:
+                if not item.producto_id:
+                    continue
+                producto = session.query(Producto).filter(Producto.id == item.producto_id).first()
+                if producto and producto.stock_actual is not None and producto.controla_stock:
+                    producto.stock_actual += int(item.cantidad or 0)
+
+        usuario_nombre = (
+            getattr(current_user, "nombre_completo", None)
+            or getattr(current_user, "nombre", None)
+            or getattr(current_user, "email", None)
+            or "Sistema"
+        )
+        correccion = CorreccionVentaCerrada(
+            venta_origen_id=venta.id,
+            presupuesto_nuevo_id=nuevo_presupuesto.id,
+            motivo=data.motivo,
+            observacion=data.observacion,
+            devolver_stock_original=bool(data.devolver_stock_original),
+            monto_cobrado_original=monto_cobrado_original,
+            saldo_original=saldo_original,
+            usuario=usuario_nombre,
+        )
+        session.add(correccion)
+        session.commit()
+        session.refresh(correccion)
+        return _serializar_correccion_venta(correccion)
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=f"Error al corregir venta cerrada: {str(e)}")
     finally:
         session.close()
 
@@ -1832,11 +2280,13 @@ def _registrar_comision_tarjeta_grupal(
     monto_total: float,
     grupo_id: str,
     fecha: Optional[datetime] = None,
+    current_user=None,
 ):
-    """Versión grupal de la comisión de tarjeta."""
-    from app.models.models import GastoOperativo, CategoriaGasto, ConfiguracionEmpresa
-    config = session.query(ConfiguracionEmpresa).first()
-    pct: float = config.porcentaje_comision_tarjeta or 0.0
+    """Versión grupal de la comisión de tarjeta. El porcentaje es el propio de ESE banco
+    (Banco.porcentaje_comision) — mismo criterio que _registrar_comision_tarjeta."""
+    from app.models.models import GastoOperativo, CategoriaGasto, Banco
+    banco_comision = session.query(Banco).filter(Banco.id == banco_id).first()
+    pct: float = (banco_comision.porcentaje_comision or 0.0) if banco_comision else 0.0
     if pct <= 0:
         return
     
@@ -1865,9 +2315,9 @@ def _registrar_comision_tarjeta_grupal(
         pago_venta_id=None,
         grupo_pago_id=grupo_id,
         fecha=gasto.fecha,
+        current_user=current_user,
     )
     gasto.movimiento_banco_id = mov.id
-
 
 
 

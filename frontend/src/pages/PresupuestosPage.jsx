@@ -4,11 +4,15 @@ import { flushSync } from 'react-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../context/AuthContext'
 import Modal from '../components/Modal'
-import { FileText, Plus, Search, ShoppingBag, X, AlertCircle, ClipboardList, Clock } from 'lucide-react'
+import FinancialJornadaNotice from '../components/FinancialJornadaNotice'
+import { FileText, Plus, Search, ShoppingBag, X, AlertCircle, ClipboardList, Clock, Zap } from 'lucide-react'
+import { useFinancialJornadaStatus } from '../hooks/useFinancialJornada'
 import usePendingNavigationGuard from '../utils/usePendingNavigationGuard'
 import { requestAndOpenPdf } from '../utils/fileDownloads'
 import { nowBusinessDateTimeLocalValue, parseBackendDateTime, todayBusinessInputValue } from '../utils/formatters'
+import { markModuleFreshnessSeen, shouldForceModuleRefresh } from '../utils/moduleFreshness'
 import { formatGsAmount, normalizeGsInput, parseGsInput } from '../utils/currencyInputs'
+import { completeTrackedFlow, failTrackedFlow, markFlowStep, startTrackedFlow, waitForNextPaint } from '../utils/performanceMonitor'
 
 const fmt = v => new Intl.NumberFormat('es-PY').format(v ?? 0)
 const fmtDate = d => {
@@ -33,6 +37,14 @@ const formatDateTimeLocalValue = value => {
     return `${year}-${month}-${day}`
 }
 const buildDatePatchValue = value => (value ? `${value}T12:00:00` : null)
+function orderCategoriasItem(categories, parentId = null, level = 0) {
+    return categories
+        .filter(category => (category.categoria_padre_id ?? null) === parentId)
+        .flatMap(category => [
+            { ...category, nivel: level },
+            ...orderCategoriasItem(categories, category.id, level + 1),
+        ])
+}
 const addMonthsToDateInput = (baseValue, months) => {
     const baseDate = baseValue ? new Date(`${baseValue}T12:00:00`) : new Date()
     if (Number.isNaN(baseDate.getTime())) return ''
@@ -45,15 +57,19 @@ const sanitizeItemFinancials = item => {
     const cantidad = Math.max(1, parseInt(item?.cantidad, 10) || 1)
     const precioUnitario = Math.max(0, Math.trunc(Number(item?.precio_unitario || 0)))
     const bruto = precioUnitario * cantidad
-    const descuento = Math.min(Math.max(0, Math.trunc(Number(item?.descuento || 0))), bruto)
+    // El descuento no se recorta al bruto aca mientras el usuario todavia esta
+    // cargando datos (ver onBlur en el input, que recien ahi lo ajusta) — solo se
+    // evita negativo. El subtotal si queda a salvo con el piso en 0.
+    const descuento = Math.max(0, Math.trunc(Number(item?.descuento || 0)))
     return {
         ...item,
         cantidad,
         precio_unitario: precioUnitario,
         descuento,
-        subtotal: bruto - descuento,
+        subtotal: Math.max(0, bruto - descuento),
     }
 }
+const isJornadaClosedError = error => String(error?.response?.data?.detail || '').toLowerCase().includes('jornada')
 const abrirPresupuestoPdf = async presupuestoId => {
     await requestAndOpenPdf(
         () => api.get(`/presupuestos/${presupuestoId}/pdf`, { responseType: 'blob' }),
@@ -192,13 +208,36 @@ function PresupuestoRowActions({
 function ItemRow({ item, idx, onUpdate, onRemove }) {
     const [buscarProd, setBuscarProd] = useState(item.busq || '')
     const [showList, setShowList] = useState(false)
+    const [categoriaId, setCategoriaId] = useState('')
+    const [proveedorId, setProveedorId] = useState('')
     const upd = (k, v) => onUpdate(idx, { ...item, [k]: v })
+
+    // Cuando un kit rápido inserta/reemplaza filas ajenas a esta instancia (splice en el array
+    // del padre), React reutiliza el componente por índice — hay que resincronizar el texto
+    // visible del buscador con el nombre real del producto que quedó en esa fila.
+    useEffect(() => {
+        setBuscarProd(item.busq || '')
+    }, [item.busq, item.producto_id])
+
     const p = { nombre: item.busq || buscarProd || '' }
+
+    const { data: categorias = [] } = useQuery({
+        queryKey: ['categorias'],
+        queryFn: () => api.get('/categorias/').then(r => r.data),
+    })
+    const { data: proveedores = [] } = useQuery({
+        queryKey: ['proveedores'],
+        queryFn: () => api.get('/proveedores/').then(r => r.data),
+    })
+    const categoriasOrdenadas = orderCategoriasItem(categorias)
+
     const { data: filtrados = [] } = useQuery({
-        queryKey: ['productos-select', buscarProd],
+        queryKey: ['productos-select', buscarProd, categoriaId, proveedorId],
         queryFn: () => {
             const params = new URLSearchParams({ page: '1', page_size: '30', solo_activos: 'true' })
             if (buscarProd.trim()) params.append('buscar', buscarProd.trim())
+            if (categoriaId) params.append('categoria_id', categoriaId)
+            if (proveedorId) params.append('proveedor_id', proveedorId)
             return api.get(`/productos/listado-optimizado?${params.toString()}`).then(r => r.data.items || [])
         },
         retry: false,
@@ -249,9 +288,23 @@ function ItemRow({ item, idx, onUpdate, onRemove }) {
                         onChange={e => { setBuscarProd(e.target.value); setShowList(true); if (!e.target.value) onUpdate(idx, { ...item, busq: '', producto_id: '', precio_unitario: 0, costo_unitario: 0, costo_variable: false, subtotal: 0 }) }}
                     />
                     {showList && (
-                        <div style={{ position: 'absolute', zIndex: 999, top: '100%', left: 0, minWidth: 380, background: '#1a1d27', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10, maxHeight: 300, overflowY: 'auto', boxShadow: '0 12px 40px rgba(0,0,0,0.7)' }}
-                            onMouseDown={e => e.preventDefault()}
+                        <div style={{ position: 'absolute', zIndex: 999, top: '100%', left: 0, minWidth: 380, background: '#1a1d27', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 10, maxHeight: 340, overflowY: 'auto', boxShadow: '0 12px 40px rgba(0,0,0,0.7)' }}
+                            onMouseDown={e => { if (e.target.tagName !== 'SELECT') e.preventDefault() }}
                         >
+                            <div style={{ display: 'flex', gap: 4, padding: '8px 10px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                                <select className="form-select" style={{ flex: 1, padding: '4px 6px', fontSize: '0.74rem' }} value={categoriaId} onChange={e => setCategoriaId(e.target.value)}>
+                                    <option value="">Todas las categorías</option>
+                                    {categoriasOrdenadas.map(cat => (
+                                        <option key={cat.id} value={cat.id}>{'—'.repeat(cat.nivel)} {cat.nombre}</option>
+                                    ))}
+                                </select>
+                                <select className="form-select" style={{ flex: 1, padding: '4px 6px', fontSize: '0.74rem' }} value={proveedorId} onChange={e => setProveedorId(e.target.value)}>
+                                    <option value="">Todos los proveedores</option>
+                                    {proveedores.map(prov => (
+                                        <option key={prov.id} value={prov.id}>{prov.nombre}</option>
+                                    ))}
+                                </select>
+                            </div>
                             {filtrados.length === 0 ? (
                                 <div style={{ padding: '12px 16px', color: 'var(--text-muted)', fontSize: '0.82rem' }}>Sin resultados</div>
                             ) : filtrados.map(prod => (
@@ -324,6 +377,10 @@ function ItemRow({ item, idx, onUpdate, onRemove }) {
                     const descuento = normalizeGsInput(e.target.value).amount
                     onUpdate(idx, sanitizeItemFinancials({ ...item, descuento }))
                 }}
+                onBlur={e => {
+                    const descuento = normalizeGsInput(e.target.value, calculateItemGross(item)).amount
+                    onUpdate(idx, sanitizeItemFinancials({ ...item, descuento }))
+                }}
                 onFocus={e => e.target.select()}
             /></td>
             <td style={{ fontWeight: 600, color: 'var(--primary-light)', whiteSpace: 'nowrap' }}>Gs. {fmt(item.subtotal)}</td>
@@ -332,16 +389,52 @@ function ItemRow({ item, idx, onUpdate, onRemove }) {
     )
 }
 
+function KitRapidoSelect({ onSeleccionar }) {
+    const { data: paquetes = [] } = useQuery({
+        queryKey: ['paquetes-venta-todos'],
+        queryFn: () => api.get('/presupuestos/paquetes-venta?activo=true').then(r => r.data),
+    })
+    const [valor, setValor] = useState('')
+
+    if (paquetes.length === 0) return null
+
+    return (
+        <select
+            className="form-select btn-sm"
+            style={{ maxWidth: 220, borderColor: 'rgba(96,165,250,0.4)' }}
+            value={valor}
+            onChange={e => {
+                const id = e.target.value
+                setValor('')
+                if (!id) return
+                const paquete = paquetes.find(p => String(p.id) === id)
+                if (paquete) onSeleccionar(paquete)
+            }}
+        >
+            <option value="">⚡ Elegir kit rápido...</option>
+            {paquetes.map(paquete => (
+                <option key={paquete.id} value={paquete.id}>{paquete.nombre}</option>
+            ))}
+        </select>
+    )
+}
+
 // Modal para convertir presupuesto en venta
 function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
     const qc = useQueryClient()
+    const traceRef = useRef(null)
     const [metodo, setMetodo] = useState('EFECTIVO')
     const [bancoId, setBancoId] = useState('')
     const [monto, setMonto] = useState('')
     const [nota, setNota] = useState('')
     const [pagoInicial, setPagoInicial] = useState(false)
+    const [showJornadaRecovery, setShowJornadaRecovery] = useState(false)
 
     const { data: bancos = [] } = useQuery({ queryKey: ['bancos'], queryFn: () => api.get('/bancos/').then(r => r.data) })
+    const { data: jornadaEstado, isLoading: jornadaEstadoLoading, isFetched: jornadaEstadoFetched } = useFinancialJornadaStatus()
+    const jornadaAbierta = jornadaEstado?.abierta === true
+    const jornadaVerificando = pagoInicial && !showJornadaRecovery && !jornadaEstadoFetched && jornadaEstadoLoading
+    const mostrarAvisoJornada = showJornadaRecovery || (jornadaEstadoFetched && !jornadaAbierta)
     const montoMaximo = Math.max(0, Math.trunc(Number(presupuesto?.total || 0)))
     const montoCobrado = parseGsInput(monto)
 
@@ -386,17 +479,42 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
 
     const convertir = useMutation({
         mutationFn: pagos => api.post(`/presupuestos/${presupuesto.id}/convertir-venta`, pagos),
-        onSuccess: response => {
+        onSuccess: async response => {
             const ventaNueva = response?.data
+            const trace = traceRef.current
+            markFlowStep(trace, 'venta_creada', 'Venta creada desde presupuesto', {
+                venta_id: ventaNueva?.id ?? null,
+            })
             removerPresupuestoDeCache(presupuesto.id)
             insertarVentaEnCache(ventaNueva)
             onClose(ventaNueva)
-            Promise.all([
+            await Promise.all([
                 qc.invalidateQueries({ queryKey: ['presupuestos'] }),
                 qc.invalidateQueries({ queryKey: ['ventas-optimizado'] }),
                 qc.invalidateQueries({ queryKey: ['ventas'] }),
             ]).catch(() => {})
-        }
+            markFlowStep(trace, 'tablas_actualizadas', 'Presupuestos y ventas actualizados')
+            await waitForNextPaint()
+            completeTrackedFlow(trace, {
+                metadata: {
+                    presupuesto_id: presupuesto?.id ?? null,
+                    presupuesto_codigo: presupuesto?.codigo || null,
+                    venta_id: ventaNueva?.id ?? null,
+                    venta_codigo: ventaNueva?.codigo || null,
+                    pago_inicial: pagoInicial && montoCobrado > 0 ? montoCobrado : 0,
+                    pago_inicial_metodo: pagoInicial && montoCobrado > 0 ? metodo : null,
+                },
+            })
+            traceRef.current = null
+        },
+        onError: error => {
+            failTrackedFlow(traceRef.current, { error })
+            traceRef.current = null
+            if (isJornadaClosedError(error)) {
+                setShowJornadaRecovery(true)
+                qc.invalidateQueries({ queryKey: ['jornada-financiera-actual'] })
+            }
+        },
     })
     const confirmNavigation = usePendingNavigationGuard(
         convertir.isPending || pagoInicial,
@@ -410,8 +528,20 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
         return () => onBusyChange?.(false)
     }, [convertir.isPending, onBusyChange])
 
+    useEffect(() => {
+        if (jornadaAbierta) setShowJornadaRecovery(false)
+    }, [jornadaAbierta])
+
     const handleSubmit = e => {
         e.preventDefault()
+        if (pagoInicial && !jornadaEstadoFetched) {
+            window.alert('Estamos verificando el estado de la jornada financiera. Intenta de nuevo en un instante.')
+            return
+        }
+        if (pagoInicial && !jornadaAbierta) {
+            window.alert('Debes abrir la jornada financiera antes de registrar un cobro inicial.')
+            return
+        }
         if (pagoInicial && montoCobrado > montoMaximo) {
             window.alert('El monto cobrado no puede superar el total pendiente del presupuesto.')
             return
@@ -425,6 +555,18 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
                 nota: nota || null
             })
         }
+        traceRef.current = startTrackedFlow({
+            flowKey: 'convertir_a_venta',
+            label: 'Convertir a Venta',
+            metadata: {
+                presupuesto_id: presupuesto?.id ?? null,
+                presupuesto_codigo: presupuesto?.codigo || null,
+                pago_inicial_habilitado: Boolean(pagoInicial),
+            },
+        })
+        markFlowStep(traceRef.current, 'envio_conversion', 'Solicitud de conversion enviada', {
+            cantidad_pagos: pagos.length,
+        })
         convertir.mutate(pagos)
     }
 
@@ -450,6 +592,29 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
             </label>
             {pagoInicial && (
                 <>
+                    {jornadaVerificando ? (
+                        <div
+                            className="card"
+                            style={{
+                                marginBottom: 12,
+                                padding: '12px 14px',
+                                borderColor: 'rgba(26, 86, 219, 0.25)',
+                                background: 'linear-gradient(135deg, rgba(26, 86, 219, 0.09), rgba(59, 130, 246, 0.06))',
+                            }}
+                        >
+                            <div style={{ fontWeight: 700, marginBottom: 4 }}>Verificando jornada financiera...</div>
+                            <div style={{ color: 'var(--text-secondary)', fontSize: '0.84rem', lineHeight: 1.45 }}>
+                                Estamos confirmando si la jornada de hoy ya esta abierta para no mostrar acciones incorrectas ni cortar tu flujo.
+                            </div>
+                        </div>
+                    ) : (
+                        <FinancialJornadaNotice
+                            compact
+                            forceVisible={mostrarAvisoJornada}
+                            statusData={jornadaEstado}
+                            statusLoading={jornadaEstadoLoading}
+                        />
+                    )}
                     <div className="grid-2 mb-16">
                         <div className="form-group">
                             <label className="form-label">Monto cobrado (Gs.)</label>
@@ -461,7 +626,7 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
                                 onChange={e => setMonto(normalizeGsInput(e.target.value).formatted)}
                                 onFocus={e => e.target.select()}
                                 placeholder="0"
-                                disabled={convertir.isPending}
+                                disabled={convertir.isPending || !jornadaAbierta || jornadaVerificando}
                             />
                             <div style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: '0.76rem' }}>
                                 Sugerido: Gs. {fmt(montoMaximo)}. No se permite cargar más que el saldo pendiente.
@@ -469,7 +634,7 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
                         </div>
                         <div className="form-group">
                             <label className="form-label">Método</label>
-                            <select className="form-select" value={metodo} onChange={e => setMetodo(e.target.value)} disabled={convertir.isPending}>
+                            <select className="form-select" value={metodo} onChange={e => setMetodo(e.target.value)} disabled={convertir.isPending || !jornadaAbierta || jornadaVerificando}>
                                 <option value="EFECTIVO">💵 Efectivo</option>
                                 <option value="TARJETA">💳 Tarjeta</option>
                                 <option value="TRANSFERENCIA">🏦 Transferencia</option>
@@ -479,7 +644,7 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
                     {['TARJETA', 'TRANSFERENCIA'].includes(metodo) && (
                         <div className="form-group mb-16">
                             <label className="form-label">Banco *</label>
-                            <select className="form-select" value={bancoId} onChange={e => setBancoId(e.target.value)} required disabled={convertir.isPending}>
+                            <select className="form-select" value={bancoId} onChange={e => setBancoId(e.target.value)} required disabled={convertir.isPending || !jornadaAbierta || jornadaVerificando}>
                                 <option value="">Seleccionar banco...</option>
                                 {bancos.map(b => <option key={b.id} value={b.id}>{b.nombre_banco}</option>)}
                             </select>
@@ -488,7 +653,7 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
                     )}
                     <div className="form-group mb-16">
                         <label className="form-label">Nota</label>
-                        <input className="form-input" value={nota} onChange={e => setNota(e.target.value)} placeholder="Opcional..." disabled={convertir.isPending} />
+                        <input className="form-input" value={nota} onChange={e => setNota(e.target.value)} placeholder="Opcional..." disabled={convertir.isPending || !jornadaAbierta || jornadaVerificando} />
                     </div>
                 </>
             )}
@@ -499,7 +664,7 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
             )}
             <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
                 <button type="button" className="btn btn-secondary" onClick={() => { if (confirmNavigation()) onClose() }} disabled={convertir.isPending}>Cancelar</button>
-                <button type="submit" className="btn btn-primary" disabled={convertir.isPending}>
+                <button type="submit" className="btn btn-primary" disabled={convertir.isPending || (pagoInicial && !jornadaAbierta)}>
                     {convertir.isPending ? 'Confirmando venta...' : <><ShoppingBag size={15} /> Confirmar Venta</>}
                 </button>
             </div>
@@ -680,6 +845,7 @@ const presupuestoCoincideConFiltro = (presupuesto, estadoFiltro, vendedorFiltro,
 
 function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
     const qc = useQueryClient()
+    const traceRef = useRef(null)
     const esEdicion = !!presupuesto
     const [cliente, setCliente] = useState(presupuesto ? String(presupuesto.cliente_id) : '')
     const [buscarCli, setBuscarCli] = useState(presupuesto ? (presupuesto.cliente_nombre || '') : '')
@@ -885,9 +1051,33 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
             : api.post('/presupuestos/', d),
         onSuccess: async (response) => {
             const presupuestoActualizado = response?.data
+            const trace = traceRef.current
+            if (!esEdicion) {
+                markFlowStep(trace, 'presupuesto_guardado', 'Presupuesto guardado en backend', {
+                    presupuesto_id: presupuestoActualizado?.id ?? null,
+                })
+            }
             if (presupuestoActualizado) actualizarCachePresupuestos(presupuestoActualizado)
             await qc.invalidateQueries({ queryKey: ['presupuestos'] })
             onClose()
+            if (!esEdicion) {
+                markFlowStep(trace, 'listado_actualizado', 'Listado de presupuestos actualizado')
+                await waitForNextPaint()
+                completeTrackedFlow(trace, {
+                    metadata: {
+                        presupuesto_id: presupuestoActualizado?.id ?? null,
+                        presupuesto_codigo: presupuestoActualizado?.codigo || null,
+                        cliente_id: presupuestoActualizado?.cliente_id ?? null,
+                    },
+                })
+                traceRef.current = null
+            }
+        },
+        onError: error => {
+            if (!esEdicion) {
+                failTrackedFlow(traceRef.current, { error })
+                traceRef.current = null
+            }
         }
     })
     const confirmNavigation = usePendingNavigationGuard(
@@ -906,6 +1096,22 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
     const addItem = () => setItems(p => [...p, blankItem()])
     const updItem = (idx, v) => { const a = [...items]; a[idx] = v; setItems(a) }
     const remItem = idx => setItems(p => p.filter((_, i) => i !== idx))
+    const aplicarPaquete = (paquete) => {
+        if (!paquete.items || paquete.items.length === 0) return
+        const refItem = ref => sanitizeItemFinancials({
+            ...blankItem(),
+            busq: ref.nombre,
+            producto_id: ref.id,
+            precio_unitario: ref.precio_venta,
+            costo_unitario: ref.costo_variable ? 0 : (ref.costo || 0),
+            costo_variable: ref.costo_variable,
+        })
+        const filasNuevas = paquete.items.map(refItem)
+        setItems(p => {
+            const sinFilasVacias = p.filter(i => i.producto_id || i.busq)
+            return [...sinFilasVacias, ...filasNuevas]
+        })
+    }
 
     const handleSubmit = e => {
         e.preventDefault()
@@ -925,6 +1131,17 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
         // Alerta si hay referidor pero sin comisión
         if (referidor && (!comision || parseFloat(comision) === 0)) {
             if (!window.confirm('El referidor seleccionado no tiene comisión asignada. ¿Desea guardar el presupuesto igual?')) return
+        }
+        if (!esEdicion) {
+            traceRef.current = startTrackedFlow({
+                flowKey: 'nuevo_presupuesto',
+                label: 'Nuevo Presupuesto',
+                metadata: {
+                    cliente_id: cliente ? parseInt(cliente) : null,
+                    cantidad_items: items.filter(i => i.producto_id).length,
+                },
+            })
+            markFlowStep(traceRef.current, 'envio_formulario', 'Formulario de presupuesto enviado')
         }
         crear.mutate({
             cliente_id: parseInt(cliente),
@@ -1123,7 +1340,10 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
             <div style={{ marginBottom: 16 }}>
                 <div className="flex-between mb-16">
                     <p style={{ fontSize: '0.85rem', fontWeight: 600 }}>Ítems del Presupuesto</p>
-                    <button type="button" className="btn btn-secondary btn-sm" onClick={addItem}><Plus size={14} /> Agregar ítem</button>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <KitRapidoSelect onSeleccionar={aplicarPaquete} />
+                        <button type="button" className="btn btn-secondary btn-sm" onClick={addItem}><Plus size={14} /> Agregar ítem</button>
+                    </div>
                 </div>
                 <div className="table-container">
                     <table>
@@ -1267,6 +1487,8 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
 
 export default function PresupuestosPage() {
     const qc = useQueryClient()
+    useFinancialJornadaStatus()
+    const forceRefreshOnMount = shouldForceModuleRefresh('presupuestos')
     const [buscar, setBuscar] = useState('')
     const [modal, setModal] = useState(false)
     const [editarPre, setEditarPre] = useState(null)     // presupuesto a editar
@@ -1312,7 +1534,13 @@ export default function PresupuestosPage() {
             return api.get(`/presupuestos/listado-optimizado?${params.toString()}`).then(r => r.data)
         },
         retry: false,
+        refetchOnMount: forceRefreshOnMount ? 'always' : true,
     })
+
+    useEffect(() => {
+        if (!presupuestosData?.version) return
+        markModuleFreshnessSeen('presupuestos', presupuestosData.version)
+    }, [presupuestosData?.version])
 
     const presupuestos = Array.isArray(presupuestosData?.items) ? presupuestosData.items : []
     const filtrados = presupuestos

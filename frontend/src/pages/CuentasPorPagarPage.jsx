@@ -1,15 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertCircle, Building2, CreditCard, Eye, Landmark, Pencil, ReceiptText, Trash2, Wallet } from 'lucide-react'
+import { AlertCircle, Building2, CreditCard, Eye, Landmark, Pencil, ReceiptText, Save, Trash2, Wallet } from 'lucide-react'
 
 import Modal from '../components/Modal'
+import DetalleCompraContent from '../components/DetalleCompraContent'
+import FinancialJornadaNotice from '../components/FinancialJornadaNotice'
 import RemoteSearchSelect from '../components/RemoteSearchSelect'
 import { api, useAuth } from '../context/AuthContext'
-import { invalidateJornadaLiveData } from '../hooks/useFinancialJornada'
+import { invalidateJornadaLiveData, useFinancialJornadaStatus } from '../hooks/useFinancialJornada'
 import { exportReportBlob } from '../utils/reportExports'
 import { hasActionAccess } from '../utils/roles'
 import { parseBackendDateTime, toDateTimeLocalValue as toBusinessDateTimeLocalValue } from '../utils/formatters'
 import { formatGsAmount, normalizeGsInput, parseGsInput } from '../utils/currencyInputs'
+import { confirmarFechaAtrasada } from '../utils/confirmarFechaAtrasada'
 
 const fmt = value => new Intl.NumberFormat('es-PY').format(value ?? 0)
 const fmtDate = value => {
@@ -17,6 +20,7 @@ const fmtDate = value => {
     return date ? date.toLocaleDateString('es-PY') : '-'
 }
 const toDateTimeLocalValue = toBusinessDateTimeLocalValue
+const isJornadaClosedError = error => String(error?.response?.data?.detail || '').toLowerCase().includes('jornada')
 
 function estadoBadge(estado) {
     const map = {
@@ -135,10 +139,27 @@ function DetalleProveedorModal({ proveedor, onClose }) {
 
 function SeleccionarOSModal({ documentos, seleccionadas, onConfirm, onClose }) {
     const [selectedIds, setSelectedIds] = useState(seleccionadas)
+    const masterCheckboxRef = useRef(null)
 
     const toggle = compraId => {
         setSelectedIds(prev => prev.includes(compraId) ? prev.filter(id => id !== compraId) : [...prev, compraId])
     }
+    const allSelected = documentos.length > 0 && selectedIds.length === documentos.length
+    const someSelected = selectedIds.length > 0 && !allSelected
+
+    const toggleAll = () => {
+        setSelectedIds(allSelected ? [] : documentos.map(item => item.compra_id))
+    }
+
+    useEffect(() => {
+        setSelectedIds(seleccionadas)
+    }, [seleccionadas])
+
+    useEffect(() => {
+        if (masterCheckboxRef.current) {
+            masterCheckboxRef.current.indeterminate = someSelected
+        }
+    }, [someSelected])
 
     const totalSeleccionado = documentos
         .filter(item => selectedIds.includes(item.compra_id))
@@ -161,7 +182,16 @@ function SeleccionarOSModal({ documentos, seleccionadas, onConfirm, onClose }) {
                     <table>
                         <thead>
                             <tr>
-                                <th></th>
+                                <th>
+                                    <input
+                                        ref={masterCheckboxRef}
+                                        type="checkbox"
+                                        checked={allSelected}
+                                        onChange={toggleAll}
+                                        aria-label={allSelected ? 'Deseleccionar todas las OS' : 'Seleccionar todas las OS'}
+                                        style={{ accentColor: 'var(--primary-light)' }}
+                                    />
+                                </th>
                                 <th>Fecha</th>
                                 <th>OS origen</th>
                                 <th>Saldo</th>
@@ -214,6 +244,9 @@ function PagoProveedorModal({ proveedor, onClose }) {
     const [errorAgregarMedio, setErrorAgregarMedio] = useState('')
     const [errorConfirmacion, setErrorConfirmacion] = useState('')
     const [montoEditado, setMontoEditado] = useState(false)
+    const [showJornadaRecovery, setShowJornadaRecovery] = useState(false)
+    const { data: jornadaEstado } = useFinancialJornadaStatus()
+    const jornadaAbierta = Boolean(jornadaEstado?.abierta)
 
     const { data: bancos = [] } = useQuery({
         queryKey: ['bancos'],
@@ -252,9 +285,19 @@ function PagoProveedorModal({ proveedor, onClose }) {
             invalidateJornadaLiveData(queryClient)
             onClose()
         },
+        onError: error => {
+            if (isJornadaClosedError(error)) {
+                setShowJornadaRecovery(true)
+                queryClient.invalidateQueries({ queryKey: ['jornada-financiera-actual'] })
+            }
+        },
     })
 
     const agregarMetodo = () => {
+        if (!jornadaAbierta) {
+            setErrorAgregarMedio('Debes abrir la jornada financiera antes de cargar medios de pago.')
+            return
+        }
         if (montoNum <= 0) {
             setErrorAgregarMedio('Debes cargar un monto mayor a cero para agregar el medio de pago.')
             return
@@ -294,8 +337,16 @@ function PagoProveedorModal({ proveedor, onClose }) {
         setMonto(formatGsAmount(montoSugerido))
     }, [montoEditado, montoSugerido])
 
+    useEffect(() => {
+        if (jornadaAbierta) setShowJornadaRecovery(false)
+    }, [jornadaAbierta])
+
     const confirmarPago = event => {
         event.preventDefault()
+        if (!jornadaAbierta) {
+            setErrorConfirmacion('Debes abrir la jornada financiera antes de confirmar este pago.')
+            return
+        }
         let usarFacturaGenerica = false
         if (metodos.length === 0) {
             setErrorConfirmacion('Debes agregar al menos un medio de pago antes de confirmar.')
@@ -321,6 +372,7 @@ function PagoProveedorModal({ proveedor, onClose }) {
             return
         }
 
+        if (!confirmarFechaAtrasada(fecha)) return
         setErrorConfirmacion('')
         registrarPago.mutate({
             fecha: fecha || null,
@@ -339,6 +391,7 @@ function PagoProveedorModal({ proveedor, onClose }) {
     return (
         <>
         <form onSubmit={confirmarPago}>
+            <FinancialJornadaNotice compact forceVisible={showJornadaRecovery || !jornadaAbierta} />
             <div className="card mb-16" style={{ padding: '14px 16px' }}>
                 <div style={{ display: 'grid', gap: 6 }}>
                     <div style={{ fontWeight: 700 }}>{proveedor.proveedor_nombre}</div>
@@ -407,7 +460,7 @@ function PagoProveedorModal({ proveedor, onClose }) {
             <div className="grid-2 mb-16">
                 <div className="form-group">
                     <label className="form-label">Fecha del pago</label>
-                    <input type="datetime-local" className="form-input" value={fecha} onChange={event => setFecha(event.target.value)} />
+                    <input type="datetime-local" className="form-input" value={fecha} onChange={event => setFecha(event.target.value)} disabled={!jornadaAbierta} />
                 </div>
                 <div className="form-group">
                     <label className="form-label">Monto total agregado</label>
@@ -421,7 +474,7 @@ function PagoProveedorModal({ proveedor, onClose }) {
                 <div className="grid-2 mb-16">
                     <div className="form-group">
                         <label className="form-label">Metodo</label>
-                        <select className="form-select" value={metodoPago} onChange={event => setMetodoPago(event.target.value)}>
+                        <select className="form-select" value={metodoPago} onChange={event => setMetodoPago(event.target.value)} disabled={!jornadaAbierta}>
                             <option value="EFECTIVO">EFECTIVO</option>
                             <option value="TRANSFERENCIA">TRANSFERENCIA</option>
                             <option value="TARJETA">TARJETA</option>
@@ -440,6 +493,7 @@ function PagoProveedorModal({ proveedor, onClose }) {
                                 setMonto(normalizeGsInput(event.target.value).formatted)
                             }}
                             onFocus={event => event.target.select()}
+                            disabled={!jornadaAbierta}
                         />
                         <div style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: '0.76rem' }}>
                             Sugerido: Gs. {fmt(montoSugerido)}. No se permite superar {osSeleccionadas.length > 0 ? 'las OS seleccionadas' : 'la deuda abierta'}.
@@ -447,18 +501,18 @@ function PagoProveedorModal({ proveedor, onClose }) {
                     </div>
                     <div className="form-group">
                         <label className="form-label">Banco</label>
-                        <select className="form-select" value={bancoId} onChange={event => setBancoId(event.target.value)} disabled={metodoPago === 'EFECTIVO'}>
+                        <select className="form-select" value={bancoId} onChange={event => setBancoId(event.target.value)} disabled={!jornadaAbierta || metodoPago === 'EFECTIVO'}>
                             <option value="">Seleccionar banco</option>
                             {bancos.map(banco => <option key={banco.id} value={banco.id}>{banco.nombre_banco}</option>)}
                         </select>
                     </div>
                     <div className="form-group">
                         <label className="form-label">Comprobante</label>
-                        <input className="form-input" value={nroComprobante} onChange={event => setNroComprobante(event.target.value)} placeholder="Opcional" />
+                        <input className="form-input" value={nroComprobante} onChange={event => setNroComprobante(event.target.value)} placeholder="Opcional" disabled={!jornadaAbierta} />
                     </div>
                 </div>
                 <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
-                    <button type="button" className="btn btn-secondary" onClick={agregarMetodo}>
+                    <button type="button" className="btn btn-secondary" onClick={agregarMetodo} disabled={!jornadaAbierta}>
                         Agregar medio
                     </button>
                 </div>
@@ -526,7 +580,7 @@ function PagoProveedorModal({ proveedor, onClose }) {
                 <button
                     type="submit"
                     className="btn btn-primary"
-                    disabled={registrarPago.isPending}
+                    disabled={registrarPago.isPending || !jornadaAbierta}
                 >
                     {registrarPago.isPending ? <span className="spinner" style={{ width: 16, height: 16 }} /> : <><Wallet size={15} /> Confirmar pago</>}
                 </button>
@@ -566,6 +620,9 @@ function EditarPagoHistorialModal({ grupoId, onClose }) {
     const [errorConfirmacion, setErrorConfirmacion] = useState('')
     const [seeded, setSeeded] = useState(false)
     const [montoEditado, setMontoEditado] = useState(false)
+    const [showJornadaRecovery, setShowJornadaRecovery] = useState(false)
+    const { data: jornadaEstado } = useFinancialJornadaStatus()
+    const jornadaAbierta = Boolean(jornadaEstado?.abierta)
 
     const { data: bancos = [] } = useQuery({
         queryKey: ['bancos'],
@@ -603,12 +660,22 @@ function EditarPagoHistorialModal({ grupoId, onClose }) {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['cxp-resumen'] })
             queryClient.invalidateQueries({ queryKey: ['cxp-contados-pendientes'] })
-            queryClient.invalidateQueries({ queryKey: ['cxp-historial-pagos'] })
+            queryClient.invalidateQueries({ queryKey: ['cxp-historial-pagos-listado'] })
             queryClient.invalidateQueries({ queryKey: ['compras'] })
             queryClient.invalidateQueries({ queryKey: ['bancos'] })
             queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
             queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
             invalidateJornadaLiveData(queryClient)
+            onClose()
+        },
+    })
+
+    const guardarFactura = useMutation({
+        mutationFn: payload => api.patch(`/compras/cuentas-por-pagar/pagos-historial/${encodeURIComponent(grupoId)}/factura`, payload),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['cxp-historial-pagos-listado'] })
+            queryClient.invalidateQueries({ queryKey: ['cxp-historial-detalle', grupoId] })
+            queryClient.invalidateQueries({ queryKey: ['compras'] })
             onClose()
         },
     })
@@ -649,8 +716,32 @@ function EditarPagoHistorialModal({ grupoId, onClose }) {
         setMonto(formatGsAmount(montoSugerido))
     }, [montoEditado, montoSugerido])
 
+    useEffect(() => {
+        if (jornadaAbierta) setShowJornadaRecovery(false)
+    }, [jornadaAbierta])
+
     const eliminarMetodo = index => {
         setMetodos(prev => prev.filter((_, idx) => idx !== index))
+    }
+
+    const resolverPayloadFactura = () => {
+        let usarFacturaGenerica = false
+        if (!detalle?.puede_usar_factura_global) {
+            setErrorConfirmacion('Este lote no admite edicion administrativa de factura.')
+            return null
+        }
+        if (!facturaGlobal.trim()) {
+            const continuarSinFactura = confirm('No cargaste una factura para este pago. ¿Quieres continuar con numeracion interna generica?')
+            if (!continuarSinFactura) {
+                setErrorConfirmacion('Debes cargar una factura o confirmar la numeracion interna.')
+                return null
+            }
+            usarFacturaGenerica = true
+        }
+        return {
+            factura_global: facturaGlobal.trim() ? facturaGlobal : null,
+            usar_factura_generica: usarFacturaGenerica,
+        }
     }
 
     const confirmar = event => {
@@ -670,6 +761,9 @@ function EditarPagoHistorialModal({ grupoId, onClose }) {
             usarFacturaGenerica = true
         }
         setErrorConfirmacion('')
+        const confirmarReedicion = window.confirm('Vas a guardar una re-edicion financiera de este pago. Esto puede actualizar caja, bancos y movimientos asociados. ¿Deseas continuar?')
+        if (!confirmarReedicion) return
+        if (!confirmarFechaAtrasada(fecha)) return
         guardarEdicion.mutate({
             fecha: fecha || null,
             metodos_pago: metodos.map(item => ({
@@ -682,6 +776,13 @@ function EditarPagoHistorialModal({ grupoId, onClose }) {
             factura_global: detalle.puede_usar_factura_global ? (facturaGlobal || null) : null,
             usar_factura_generica: usarFacturaGenerica,
         })
+    }
+
+    const confirmarFactura = () => {
+        const payload = resolverPayloadFactura()
+        if (!payload) return
+        setErrorConfirmacion('')
+        guardarFactura.mutate(payload)
     }
 
     if (isLoading) {
@@ -699,11 +800,12 @@ function EditarPagoHistorialModal({ grupoId, onClose }) {
 
     return (
         <form onSubmit={confirmar}>
+            <FinancialJornadaNotice compact forceVisible={showJornadaRecovery || !jornadaAbierta} />
             <div className="card mb-16" style={{ padding: '14px 16px' }}>
                 <div style={{ display: 'grid', gap: 6 }}>
                     <div style={{ fontWeight: 700 }}>{detalle.proveedor_nombre}</div>
                     <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>
-                        Se reeditara este pago sobre las mismas compras asociadas.
+                        Puedes actualizar la factura del lote sin tocar caja o banco. La reedicion financiera sigue trabajando sobre las mismas compras asociadas.
                     </div>
                     <div style={{ color: 'var(--warning)', fontWeight: 700, fontSize: '0.9rem' }}>
                         Total original: Gs. {fmt(totalOriginal)}
@@ -728,6 +830,9 @@ function EditarPagoHistorialModal({ grupoId, onClose }) {
                         onChange={event => setFacturaGlobal(event.target.value.toUpperCase())}
                         placeholder="Ej: 001-001-0001234"
                     />
+                    <div style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: '0.76rem' }}>
+                        Este cambio es administrativo y se refleja tambien en Compras, aunque la jornada de ese pago ya este cerrada.
+                    </div>
                 </div>
             )}
 
@@ -833,24 +938,185 @@ function EditarPagoHistorialModal({ grupoId, onClose }) {
                 )}
             </div>
 
-            {(errorConfirmacion || guardarEdicion.isError) && (
+            {(errorConfirmacion || guardarEdicion.isError || guardarFactura.isError) && (
                 <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: '0.82rem', color: '#f87171', display: 'flex', gap: 8 }}>
                     <AlertCircle size={16} />
-                    {errorConfirmacion || guardarEdicion.error?.response?.data?.detail || 'No se pudo editar el pago.'}
+                    {errorConfirmacion || guardarFactura.error?.response?.data?.detail || guardarEdicion.error?.response?.data?.detail || 'No se pudo editar el pago.'}
                 </div>
             )}
 
             <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
                 <button type="button" className="btn btn-secondary" onClick={onClose}>Cancelar</button>
+                {detalle.puede_usar_factura_global && (
+                    <button
+                        type="button"
+                        className="btn btn-danger"
+                        onClick={confirmarFactura}
+                        disabled={guardarFactura.isPending}
+                    >
+                        {guardarFactura.isPending ? <span className="spinner" style={{ width: 16, height: 16 }} /> : <><Save size={15} /> Guardar cambio de factura</>}
+                    </button>
+                )}
                 <button type="submit" className="btn btn-primary" disabled={guardarEdicion.isPending}>
-                    {guardarEdicion.isPending ? <span className="spinner" style={{ width: 16, height: 16 }} /> : <><Pencil size={15} /> Guardar cambios</>}
+                    {guardarEdicion.isPending ? <span className="spinner" style={{ width: 16, height: 16 }} /> : <><Pencil size={15} /> Guardar re-edicion financiera</>}
                 </button>
             </div>
         </form>
     )
 }
 
-function HistorialPagoActions({ item, onEditar, onPDF, onRevertir, isRevirtiendo, user, pdfOpeningGroupId, revertingGroupId }) {
+function VerPagoHistorialModal({ grupoId, onClose }) {
+    const [selectedCompraId, setSelectedCompraId] = useState(null)
+    const [openingCompraId, setOpeningCompraId] = useState(null)
+    const openTimerRef = useRef(null)
+    const { data: detalle, isLoading, isError, error } = useQuery({
+        queryKey: ['cxp-historial-detalle', grupoId],
+        queryFn: () => api.get(`/compras/cuentas-por-pagar/pagos-historial/${encodeURIComponent(grupoId)}`).then(response => response.data),
+        retry: false,
+    })
+
+    useEffect(() => {
+        return () => {
+            if (openTimerRef.current) clearTimeout(openTimerRef.current)
+        }
+    }, [])
+
+    const abrirDocumento = compraId => {
+        if (openTimerRef.current) clearTimeout(openTimerRef.current)
+        setOpeningCompraId(compraId)
+        document.getElementById(`historial-pago-doc-${grupoId}-${compraId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        openTimerRef.current = window.setTimeout(() => {
+            setSelectedCompraId(compraId)
+            setOpeningCompraId(null)
+        }, 220)
+    }
+
+    if (isLoading) {
+        return <div className="flex-center" style={{ padding: 60 }}><div className="spinner" style={{ width: 30, height: 30 }} /></div>
+    }
+
+    if (isError || !detalle) {
+        return (
+            <div className="empty-state" style={{ padding: '40px 20px' }}>
+                <AlertCircle size={34} />
+                <p>{error?.response?.data?.detail || 'No se pudo cargar el detalle del pago.'}</p>
+            </div>
+        )
+    }
+
+    return (
+        <div style={{ display: 'grid', gap: 16 }}>
+            <div className="card" style={{ marginBottom: 0, padding: '14px 16px' }}>
+                <div style={{ display: 'grid', gap: 6, fontSize: '0.82rem' }}>
+                    <div style={{ fontWeight: 700, fontSize: '0.95rem' }}>{detalle.proveedor_nombre || '-'}</div>
+                    <div><strong>Fecha:</strong> {fmtDate(detalle.fecha)}</div>
+                    <div><strong>Total:</strong> Gs. {fmt(detalle.total)}</div>
+                    <div><strong>OS:</strong> {detalle.os_origen?.length ? detalle.os_origen.join(', ') : '-'}</div>
+                    <div><strong>Facturas:</strong> {detalle.facturas?.length ? detalle.facturas.join(', ') : '-'}</div>
+                </div>
+            </div>
+
+            <div className="card" style={{ marginBottom: 0, padding: 0 }}>
+                <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', fontWeight: 700 }}>Medios de pago</div>
+                <div className="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metodo</th>
+                                <th>Banco</th>
+                                <th>Comprobante</th>
+                                <th>Monto</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {(detalle.metodos_pago || []).map((item, index) => (
+                                <tr key={`${item.metodo_pago}-${index}`}>
+                                    <td>{item.metodo_pago || '-'}</td>
+                                    <td>{item.banco_nombre || '-'}</td>
+                                    <td>{item.nro_comprobante || '-'}</td>
+                                    <td style={{ fontWeight: 700 }}>Gs. {fmt(item.monto)}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div className="card" style={{ marginBottom: 0, padding: 0 }}>
+                <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', fontWeight: 700 }}>Documentos afectados</div>
+                <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: '0.8rem' }}>
+                    Al abrir un documento, la fila se resalta y el detalle completo aparece en una ventana individual con la misma vista que ya usa Compras.
+                </div>
+                <div className="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Documento</th>
+                                <th>OS</th>
+                                <th>Factura</th>
+                                <th>Cliente</th>
+                                <th>Metodo</th>
+                                <th>Comprobante</th>
+                                <th>Monto</th>
+                                <th>Accion</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {(detalle.documentos_detalle || []).map(item => (
+                                <tr
+                                    key={`${item.compra_id}-${item.documento}`}
+                                    id={`historial-pago-doc-${grupoId}-${item.compra_id}`}
+                                    style={{
+                                        background: selectedCompraId === item.compra_id
+                                            ? 'rgba(59,130,246,0.12)'
+                                            : openingCompraId === item.compra_id
+                                                ? 'rgba(250,204,21,0.12)'
+                                                : undefined,
+                                        transition: 'background-color 160ms ease, box-shadow 160ms ease',
+                                        boxShadow: openingCompraId === item.compra_id
+                                            ? 'inset 3px 0 0 var(--warning)'
+                                            : selectedCompraId === item.compra_id
+                                                ? 'inset 3px 0 0 var(--primary-light)'
+                                                : undefined,
+                                    }}
+                                >
+                                    <td>{item.documento || '-'}</td>
+                                    <td>{item.os_origen || '-'}</td>
+                                    <td>{item.factura || '-'}</td>
+                                    <td>{item.cliente || '-'}</td>
+                                    <td>{item.metodo || '-'}</td>
+                                    <td>{item.comprobante || '-'}</td>
+                                    <td style={{ fontWeight: 700 }}>Gs. {fmt(item.monto)}</td>
+                                    <td>
+                                        <button type="button" className="btn btn-secondary btn-sm" onClick={() => abrirDocumento(item.compra_id)}>
+                                            <Eye size={14} /> {openingCompraId === item.compra_id ? 'Abriendo...' : 'Ver documento'}
+                                        </button>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
+                <button type="button" className="btn btn-secondary" onClick={onClose}>Cerrar</button>
+            </div>
+
+            {selectedCompraId && (
+                <Modal
+                    title={`Ver documento #${selectedCompraId}`}
+                    onClose={() => setSelectedCompraId(null)}
+                    maxWidth="960px"
+                >
+                    <DetalleCompraContent compraId={selectedCompraId} onClose={() => setSelectedCompraId(null)} />
+                </Modal>
+            )}
+        </div>
+    )
+}
+
+function HistorialPagoActions({ item, onVer, onEditar, onPDF, onRevertir, isRevirtiendo, user, pdfOpeningGroupId, revertingGroupId }) {
     const [open, setOpen] = useState(false)
     const [menuPosition, setMenuPosition] = useState({ top: 0, left: 0 })
     const buttonRef = useRef(null)
@@ -925,6 +1191,9 @@ function HistorialPagoActions({ item, onEditar, onPDF, onRevertir, isRevirtiendo
                             zIndex: 100,
                         }}
                     >
+                        <button className="dropdown-item" onClick={() => handleAction(() => onVer(item))}>
+                            <Eye size={14} style={{ marginRight: 8 }} /> Ver pago
+                        </button>
                         {puedeEditar && (
                             <button className="dropdown-item" onClick={() => handleAction(() => onEditar(item))}>
                                 <Pencil size={14} style={{ marginRight: 8 }} /> Editar pago
@@ -959,15 +1228,23 @@ export default function CuentasPorPagarPage() {
     const queryClient = useQueryClient()
     const { user } = useAuth()
     const [tab, setTab] = useState('creditos')
+    const [readyTabs, setReadyTabs] = useState({
+        creditos: false,
+        contados: false,
+        historial: false,
+    })
     const [detalleProveedor, setDetalleProveedor] = useState(null)
     const [pagoProveedor, setPagoProveedor] = useState(null)
     const [editarPagoGrupo, setEditarPagoGrupo] = useState(null)
+    const [verPagoGrupo, setVerPagoGrupo] = useState(null)
     const [historialProveedorId, setHistorialProveedorId] = useState('')
     const [historialOS, setHistorialOS] = useState('')
     const [historialFactura, setHistorialFactura] = useState('')
     const [historialCliente, setHistorialCliente] = useState('')
     const [historialFechaDesde, setHistorialFechaDesde] = useState('')
     const [historialFechaHasta, setHistorialFechaHasta] = useState('')
+    const [historialPage, setHistorialPage] = useState(1)
+    const historialPageSize = 25
     const [historialProveedores, setHistorialProveedores] = useState([])
     const [historialProveedoresLoading, setHistorialProveedoresLoading] = useState(false)
     const [historialProveedorBusqueda, setHistorialProveedorBusqueda] = useState('')
@@ -976,20 +1253,37 @@ export default function CuentasPorPagarPage() {
     const [historialPdfGroupId, setHistorialPdfGroupId] = useState(null)
     const [historialRevertingGroupId, setHistorialRevertingGroupId] = useState(null)
 
+    useEffect(() => {
+        if (readyTabs[tab]) return
+        const timer = window.setTimeout(() => {
+            setReadyTabs(prev => (prev[tab] ? prev : { ...prev, [tab]: true }))
+        }, 160)
+        return () => window.clearTimeout(timer)
+    }, [readyTabs, tab])
+
     const { data: resumen = [], isLoading: loadingResumen, isError: errorResumen, error: resumenError } = useQuery({
         queryKey: ['cxp-resumen'],
         queryFn: () => api.get('/compras/cuentas-por-pagar/resumen').then(response => response.data),
+        enabled: tab === 'creditos' && readyTabs.creditos,
         retry: false,
+        staleTime: 30000,
     })
 
     const { data: contados = [], isLoading: loadingContados, isError: errorContados, error: contadosError } = useQuery({
         queryKey: ['cxp-contados-pendientes'],
         queryFn: () => api.get('/compras/cuentas-por-pagar/contados-pendientes').then(response => response.data),
+        enabled: tab === 'contados' && readyTabs.contados,
         retry: false,
+        staleTime: 30000,
     })
-    const { data: historialPagos = [], isLoading: loadingHistorial } = useQuery({
-        queryKey: ['cxp-historial-pagos', historialProveedorId, historialOS, historialFactura, historialCliente, historialFechaDesde, historialFechaHasta],
-        queryFn: () => api.get('/compras/cuentas-por-pagar/pagos-historial', {
+    const {
+        data: historialData = { items: [], page: 1, page_size: historialPageSize, total: 0, total_pages: 1 },
+        isLoading: loadingHistorial,
+        isError: errorHistorial,
+        error: historialError,
+    } = useQuery({
+        queryKey: ['cxp-historial-pagos-listado', historialProveedorId, historialOS, historialFactura, historialCliente, historialFechaDesde, historialFechaHasta, historialPage, historialPageSize],
+        queryFn: () => api.get('/compras/cuentas-por-pagar/pagos-historial-paginado', {
             params: {
                 proveedor_id: historialProveedorId || undefined,
                 buscar_os: historialOS || undefined,
@@ -997,10 +1291,23 @@ export default function CuentasPorPagarPage() {
                 buscar_cliente: historialCliente || undefined,
                 fecha_desde: historialFechaDesde || undefined,
                 fecha_hasta: historialFechaHasta || undefined,
+                page: historialPage,
+                page_size: historialPageSize,
             },
-        }).then(response => response.data),
+        }).then(response => response.data || { items: [], page: 1, page_size: historialPageSize, total: 0, total_pages: 1 }),
+        enabled: tab === 'historial' && readyTabs.historial,
         retry: false,
+        staleTime: 30000,
     })
+
+    const historialPagos = historialData.items || []
+    const historialTotal = Number(historialData.total || 0)
+    const historialTotalPages = Number(historialData.total_pages || 1)
+    const historialCurrentPage = Number(historialData.page || 1)
+
+    useEffect(() => {
+        setHistorialPage(1)
+    }, [historialProveedorId, historialOS, historialFactura, historialCliente, historialFechaDesde, historialFechaHasta])
 
     useEffect(() => {
         if (!historialProveedorBusqueda.trim()) {
@@ -1028,7 +1335,7 @@ export default function CuentasPorPagarPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['cxp-resumen'] })
             queryClient.invalidateQueries({ queryKey: ['cxp-contados-pendientes'] })
-            queryClient.invalidateQueries({ queryKey: ['cxp-historial-pagos'] })
+            queryClient.invalidateQueries({ queryKey: ['cxp-historial-pagos-listado'] })
             queryClient.invalidateQueries({ queryKey: ['compras'] })
             queryClient.invalidateQueries({ queryKey: ['bancos'] })
             queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
@@ -1308,6 +1615,7 @@ export default function CuentasPorPagarPage() {
                                     setHistorialOS('')
                                     setHistorialFactura('')
                                     setHistorialCliente('')
+                                    setHistorialPage(1)
                                 }}
                             >
                                 Limpiar
@@ -1329,59 +1637,83 @@ export default function CuentasPorPagarPage() {
                         <div className="flex-center" style={{ padding: 60 }}>
                             <div className="spinner" style={{ width: 32, height: 32 }} />
                         </div>
+                    ) : errorHistorial ? (
+                        <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 10, padding: '12px 14px', margin: 16, color: '#fca5a5', fontSize: '0.82rem', display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+                            <AlertCircle size={16} style={{ marginTop: 2 }} />
+                            <div>
+                                <div style={{ fontWeight: 700, marginBottom: 4 }}>No se pudo cargar el historial de pagos.</div>
+                                <div>{historialError?.response?.data?.detail || 'Verifica backend y vuelve a intentar.'}</div>
+                            </div>
+                        </div>
                     ) : historialPagos.length === 0 ? (
                         <div className="empty-state">
                             <ReceiptText size={40} />
                             <p>No hay pagos a proveedores para mostrar.</p>
                         </div>
                     ) : (
-                        <div className="table-container">
-                            <table>
-                                <thead>
-                                    <tr>
-                                        <th>Fecha</th>
-                                        <th>Proveedor</th>
-                                        <th>OS</th>
-                                        <th>Factura</th>
-                                        <th>Clientes</th>
-                                        <th>Metodos</th>
-                                        <th>Comprobantes</th>
-                                        <th>Total</th>
-                                        <th style={{ width: 120 }}>Acciones</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {historialPagos.map(item => (
-                                        <tr key={item.grupo_id}>
-                                            <td style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>{fmtDate(item.fecha)}</td>
-                                            <td style={{ fontWeight: 700 }}>{item.proveedor_nombre || '-'}</td>
-                                            <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{item.os_origen?.length ? item.os_origen.join(', ') : '-'}</td>
-                                            <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{item.facturas?.length ? item.facturas.join(', ') : '-'}</td>
-                                            <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{item.clientes?.length ? item.clientes.join(', ') : '-'}</td>
-                                            <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{item.metodos?.length ? item.metodos.join(', ') : '-'}</td>
-                                            <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{item.comprobantes?.length ? item.comprobantes.join(', ') : '-'}</td>
-                                            <td style={{ fontWeight: 800, color: 'var(--success)' }}>Gs. {fmt(item.total)}</td>
-                                            <td>
-                                                <HistorialPagoActions
-                                                    item={item}
-                                                    isRevirtiendo={revertirPago.isPending}
-                                                    onEditar={selected => setEditarPagoGrupo(selected)}
-                                                    onPDF={abrirHistorialPagoPDF}
-                                                    onRevertir={selected => {
-                                                        if (confirm('Ã‚Â¿Revertir este pago? Esto restaurarÃƒÂ¡ los saldos y devolverÃƒÂ¡ fondos a caja o banco.')) {
-                                                            setHistorialRevertingGroupId(selected.grupo_id)
-                                                            revertirPago.mutate(selected.grupo_id)
-                                                        }
-                                                    }}
-                                                    user={user}
-                                                    pdfOpeningGroupId={historialPdfGroupId}
-                                                    revertingGroupId={historialRevertingGroupId}
-                                                />
-                                            </td>
+                        <div>
+                            <div className="table-container">
+                                <table>
+                                    <thead>
+                                        <tr>
+                                            <th>Fecha</th>
+                                            <th>Proveedor</th>
+                                            <th>OS</th>
+                                            <th>Factura</th>
+                                            <th>Clientes</th>
+                                            <th>Metodos</th>
+                                            <th>Comprobantes</th>
+                                            <th>Total</th>
+                                            <th style={{ width: 120 }}>Acciones</th>
                                         </tr>
-                                    ))}
-                                </tbody>
-                            </table>
+                                    </thead>
+                                    <tbody>
+                                        {historialPagos.map(item => (
+                                            <tr key={item.grupo_id}>
+                                                <td style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>{fmtDate(item.fecha)}</td>
+                                                <td style={{ fontWeight: 700 }}>{item.proveedor_nombre || '-'}</td>
+                                                <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{item.os_origen?.length ? item.os_origen.join(', ') : '-'}</td>
+                                                <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{item.facturas?.length ? item.facturas.join(', ') : '-'}</td>
+                                                <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{item.clientes?.length ? item.clientes.join(', ') : '-'}</td>
+                                                <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{item.metodos?.length ? item.metodos.join(', ') : '-'}</td>
+                                                <td style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{item.comprobantes?.length ? item.comprobantes.join(', ') : '-'}</td>
+                                                <td style={{ fontWeight: 800, color: 'var(--success)' }}>Gs. {fmt(item.total)}</td>
+                                                <td>
+                                                    <HistorialPagoActions
+                                                        item={item}
+                                                        onVer={selected => setVerPagoGrupo(selected)}
+                                                        isRevirtiendo={revertirPago.isPending}
+                                                        onEditar={selected => setEditarPagoGrupo(selected)}
+                                                        onPDF={abrirHistorialPagoPDF}
+                                                        onRevertir={selected => {
+                                                            if (confirm('Ã‚Â¿Revertir este pago? Esto restaurarÃƒÂ¡ los saldos y devolverÃƒÂ¡ fondos a caja o banco.')) {
+                                                                setHistorialRevertingGroupId(selected.grupo_id)
+                                                                revertirPago.mutate(selected.grupo_id)
+                                                            }
+                                                        }}
+                                                        user={user}
+                                                        pdfOpeningGroupId={historialPdfGroupId}
+                                                        revertingGroupId={historialRevertingGroupId}
+                                                    />
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap', padding: '12px 16px', borderTop: '1px solid var(--border)' }}>
+                                <div style={{ color: 'var(--text-secondary)', fontSize: '0.82rem' }}>
+                                    Mostrando pagina {historialCurrentPage} de {historialTotalPages} · {historialTotal} registros
+                                </div>
+                                <div style={{ display: 'flex', gap: 8 }}>
+                                    <button type="button" className="btn btn-secondary btn-sm" disabled={historialCurrentPage <= 1} onClick={() => setHistorialPage(prev => Math.max(1, prev - 1))}>
+                                        Anterior
+                                    </button>
+                                    <button type="button" className="btn btn-secondary btn-sm" disabled={historialCurrentPage >= historialTotalPages} onClick={() => setHistorialPage(prev => Math.min(historialTotalPages, prev + 1))}>
+                                        Siguiente
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     )}
                 </div>
@@ -1412,6 +1744,15 @@ export default function CuentasPorPagarPage() {
                     maxWidth="860px"
                 >
                     <EditarPagoHistorialModal grupoId={editarPagoGrupo.grupo_id} onClose={() => setEditarPagoGrupo(null)} />
+                </Modal>
+            )}
+            {verPagoGrupo && (
+                <Modal
+                    title={`Ver pago: ${verPagoGrupo.proveedor_nombre || 'Proveedor'}`}
+                    onClose={() => setVerPagoGrupo(null)}
+                    maxWidth="1120px"
+                >
+                    <VerPagoHistorialModal grupoId={verPagoGrupo.grupo_id} onClose={() => setVerPagoGrupo(null)} />
                 </Modal>
             )}
         </div>

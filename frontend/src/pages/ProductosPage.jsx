@@ -61,6 +61,8 @@ function ProductoForm({ initial = {}, onSave, onCancel, loading, canViewCosts })
         descripcion: initial.descripcion || '',
         activo: initial.activo ?? true,
         bajo_pedido: Boolean(initial.bajo_pedido),
+        requiere_laboratorio: initial.requiere_laboratorio ?? true,
+        controla_stock: initial.controla_stock ?? true,
         atributos_ids: initial.atributos?.map(attr => attr.id) || [],
     })
 
@@ -327,6 +329,8 @@ function ProductoForm({ initial = {}, onSave, onCancel, loading, canViewCosts })
                 {[
                     { key: 'costo_variable', label: 'Costo variable' },
                     { key: 'bajo_pedido', label: 'Bajo pedido' },
+                    { key: 'requiere_laboratorio', label: 'Requiere laboratorio' },
+                    { key: 'controla_stock', label: 'Controla stock' },
                     { key: 'activo', label: 'Activo' },
                 ].map(({ key, label }) => (
                     <label
@@ -446,10 +450,17 @@ export default function ProductosPage() {
     const [buscarDebounced, setBuscarDebounced] = useState('')
     const [categoriaFiltro, setCategoriaFiltro] = useState('')
     const [marcaFiltro, setMarcaFiltro] = useState('')
+    const [proveedorFiltro, setProveedorFiltro] = useState('')
     const [modal, setModal] = useState(null)
     const [soloActivos, setSoloActivos] = useState(true)
     const [page, setPage] = useState(1)
     const [pageSize, setPageSize] = useState(25)
+    const [loadSecondaryFilters, setLoadSecondaryFilters] = useState(false)
+
+    useEffect(() => {
+        const timer = window.setTimeout(() => setLoadSecondaryFilters(true), 150)
+        return () => window.clearTimeout(timer)
+    }, [])
 
     useEffect(() => {
         const timer = setTimeout(() => setBuscarDebounced(buscar.trim()), 350)
@@ -458,10 +469,10 @@ export default function ProductosPage() {
 
     useEffect(() => {
         setPage(1)
-    }, [buscarDebounced, categoriaFiltro, marcaFiltro, soloActivos, pageSize])
+    }, [buscarDebounced, categoriaFiltro, marcaFiltro, proveedorFiltro, soloActivos, pageSize])
 
     const { data, isLoading, isError, error } = useQuery({
-        queryKey: ['productos-optimizado', buscarDebounced, categoriaFiltro, marcaFiltro, soloActivos, page, pageSize],
+        queryKey: ['productos-optimizado', buscarDebounced, categoriaFiltro, marcaFiltro, proveedorFiltro, soloActivos, page, pageSize],
         queryFn: () => {
             const params = new URLSearchParams({
                 page: String(page),
@@ -477,6 +488,9 @@ export default function ProductosPage() {
             if (marcaFiltro) {
                 params.append('marca_id', marcaFiltro)
             }
+            if (proveedorFiltro) {
+                params.append('proveedor_id', proveedorFiltro)
+            }
             return api.get(`/productos/listado-optimizado?${params.toString()}`).then(response => response.data)
         },
         retry: false,
@@ -489,12 +503,21 @@ export default function ProductosPage() {
     const { data: categorias = [] } = useQuery({
         queryKey: ['categorias'],
         queryFn: () => api.get('/categorias/').then(response => response.data),
+        enabled: loadSecondaryFilters,
         retry: false,
     })
 
     const { data: marcas = [] } = useQuery({
         queryKey: ['marcas'],
         queryFn: () => api.get('/marcas/').then(response => response.data),
+        enabled: loadSecondaryFilters,
+        retry: false,
+    })
+
+    const { data: proveedores = [] } = useQuery({
+        queryKey: ['proveedores'],
+        queryFn: () => api.get('/proveedores/').then(response => response.data),
+        enabled: loadSecondaryFilters,
         retry: false,
     })
 
@@ -609,6 +632,14 @@ export default function ProductosPage() {
                             </option>
                         ))}
                     </select>
+                    <select className="form-select" style={{ flex: '0 0 200px', width: 200 }} value={proveedorFiltro} onChange={event => setProveedorFiltro(event.target.value)}>
+                        <option value="">Todos los proveedores</option>
+                        {proveedores.map(proveedor => (
+                            <option key={proveedor.id} value={proveedor.id}>
+                                {proveedor.nombre}
+                            </option>
+                        ))}
+                    </select>
                     <select
                         className="form-select"
                         style={{ flex: '0 0 120px', width: 120 }}
@@ -671,6 +702,8 @@ export default function ProductosPage() {
                                             <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
                                                 {producto.costo_variable && <span className="badge badge-gray">Costo variable</span>}
                                                 {producto.bajo_pedido && <span className="badge badge-blue">Bajo pedido</span>}
+                                                {producto.requiere_laboratorio === false && <span className="badge badge-gray">Sin laboratorio</span>}
+                                                {producto.controla_stock === false && <span className="badge badge-gray">Sin stock</span>}
                                             </div>
                                         </td>
                                         <td style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>
@@ -750,8 +783,8 @@ export default function ProductosPage() {
                             onSave={handleSave}
                             onCancel={() => setModal(null)}
                             loading={crear.isPending || editar.isPending}
-                        canViewCosts={canViewCosts}
-                    />
+                            canViewCosts={canViewCosts}
+                        />
                     )}
                 </Modal>
             )}
