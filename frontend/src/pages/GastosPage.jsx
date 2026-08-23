@@ -474,7 +474,7 @@ export default function GastosPage() {
                             </div>
                             <div className="form-group">
                                 <label className="form-label">Monto (Gs.)</label>
-                                <input className="form-input" type="number" min="0" step="100" value={formGasto.monto} onChange={event => setFormGasto(prev => ({ ...prev, monto: event.target.value }))} required disabled={gastoModalBusy} />
+                                <input className="form-input" type="number" min="0" step="1" value={formGasto.monto} onChange={event => setFormGasto(prev => ({ ...prev, monto: event.target.value }))} required disabled={gastoModalBusy} />
                             </div>
                             <div className="form-group">
                                 <label className="form-label">Metodo de pago</label>

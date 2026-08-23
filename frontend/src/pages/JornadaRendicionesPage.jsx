@@ -897,7 +897,7 @@ function RendirModalInner({
 
                 <div className="form-group">
                     <label className="form-label">Monto rendido *</label>
-                    <input className="form-input" type="number" step="100" value={montoRendido} onChange={event => setMontoRendido(event.target.value)} required />
+                    <input className="form-input" type="number" step="1" value={montoRendido} onChange={event => setMontoRendido(event.target.value)} required />
                 </div>
 
                 <div className="form-group">

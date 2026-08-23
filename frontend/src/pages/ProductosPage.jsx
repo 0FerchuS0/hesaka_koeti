@@ -280,7 +280,7 @@ function ProductoForm({ initial = {}, onSave, onCancel, loading, canViewCosts })
                         onChange={event => setField('precio_venta', event.target.value)}
                         required
                         min="0"
-                        step="100"
+                        step="1"
                     />
                 </div>
 
@@ -294,7 +294,7 @@ function ProductoForm({ initial = {}, onSave, onCancel, loading, canViewCosts })
                             onChange={event => setField('costo', event.target.value)}
                             disabled={formData.costo_variable}
                             min="0"
-                            step="100"
+                            step="1"
                             placeholder={formData.costo_variable ? 'Variable' : '0'}
                         />
                     </div>

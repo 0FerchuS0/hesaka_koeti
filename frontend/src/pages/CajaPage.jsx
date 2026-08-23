@@ -126,7 +126,7 @@ function TransferenciaInternaModal({ onClose }) {
             <div className="grid-2 mb-16">
                 <div className="form-group">
                     <label className="form-label">Monto</label>
-                    <input className="form-input" type="number" min="0" step="100" value={form.monto} onChange={event => setForm(prev => ({ ...prev, monto: event.target.value }))} required />
+                    <input className="form-input" type="number" min="0" step="1" value={form.monto} onChange={event => setForm(prev => ({ ...prev, monto: event.target.value }))} required />
                 </div>
                 <div className="form-group">
                     <label className="form-label">Concepto</label>
@@ -243,7 +243,7 @@ function BancoFormModal({ banco, onClose }) {
                 <input
                     className="form-input"
                     type="number"
-                    step="100"
+                    step="1"
                     value={form.saldo_actual}
                     onChange={event => setForm(prev => ({ ...prev, saldo_actual: event.target.value }))}
                 />
@@ -856,7 +856,7 @@ export default function CajaPage() {
                     <form onSubmit={event => { event.preventDefault(); ajustar.mutate() }}>
                         <div className="form-group">
                             <label className="form-label">Monto (Gs.) — negativo para egreso</label>
-                            <input className="form-input" type="number" step="100" value={monto} onChange={event => setMonto(event.target.value)} required placeholder="Ej: 50000 o -30000" />
+                            <input className="form-input" type="number" step="1" value={monto} onChange={event => setMonto(event.target.value)} required placeholder="Ej: 50000 o -30000" />
                         </div>
                         <div className="form-group">
                             <label className="form-label">Concepto *</label>
