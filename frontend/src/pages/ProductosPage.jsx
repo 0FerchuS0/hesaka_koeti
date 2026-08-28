@@ -43,11 +43,12 @@ function orderCategorias(categories, parentId = null, level = 0) {
     ])
 }
 
-function ProductoForm({ initial = {}, onSave, onCancel, loading, canViewCosts }) {
+function ProductoForm({ initial = {}, onSave, onCancel, loading, canViewCosts, serverError }) {
     const isEditing = Boolean(initial.id)
     const [formError, setFormError] = useState('')
     const [formData, setFormData] = useState({
         codigo: initial.codigo || '',
+        codigo_barra: initial.codigo_barra || '',
         nombre: initial.nombre || '',
         codigo_fabricante: initial.codigo_fabricante || '',
         marca_id: initial.marca_id ? String(initial.marca_id) : '',
@@ -202,9 +203,19 @@ function ProductoForm({ initial = {}, onSave, onCancel, loading, canViewCosts })
                         className="form-input"
                         value={formData.codigo_fabricante}
                         onChange={event => setField('codigo_fabricante', event.target.value)}
-                        placeholder="Codigo de barras / fabricante"
+                        placeholder="Codigo del fabricante"
                     />
                 </div>
+            </div>
+
+            <div className="form-group">
+                <label className="form-label">Codigo de barras</label>
+                <input
+                    className="form-input"
+                    value={formData.codigo_barra}
+                    onChange={event => setField('codigo_barra', event.target.value)}
+                    placeholder="Escanea o ingresa el codigo de barras del producto"
+                />
             </div>
 
             <div className="form-group">
@@ -307,7 +318,6 @@ function ProductoForm({ initial = {}, onSave, onCancel, loading, canViewCosts })
                         type="number"
                         value={formData.stock_actual}
                         onChange={event => setField('stock_actual', event.target.value)}
-                        min="0"
                     />
                 </div>
 
@@ -425,9 +435,9 @@ function ProductoForm({ initial = {}, onSave, onCancel, loading, canViewCosts })
                 )}
             </div>
 
-            {formError && (
+            {(formError || serverError) && (
                 <div style={{ color: 'var(--danger)', marginBottom: 12, fontSize: '0.9rem' }}>
-                    {formError}
+                    {formError || serverError}
                 </div>
             )}
 
@@ -452,6 +462,7 @@ export default function ProductosPage() {
     const [marcaFiltro, setMarcaFiltro] = useState('')
     const [proveedorFiltro, setProveedorFiltro] = useState('')
     const [modal, setModal] = useState(null)
+    const [serverError, setServerError] = useState('')
     const [soloActivos, setSoloActivos] = useState(true)
     const [page, setPage] = useState(1)
     const [pageSize, setPageSize] = useState(25)
@@ -542,7 +553,11 @@ export default function ProductosPage() {
             queryClient.invalidateQueries({ queryKey: ['productos'] })
             queryClient.invalidateQueries({ queryKey: ['productos-optimizado'] })
             queryClient.invalidateQueries({ queryKey: ['producto-detalle'] })
+            setServerError('')
             setModal(null)
+        },
+        onError: error => {
+            setServerError(error?.response?.data?.detail || 'No se pudo guardar el producto.')
         },
     })
 
@@ -552,7 +567,11 @@ export default function ProductosPage() {
             queryClient.invalidateQueries({ queryKey: ['productos'] })
             queryClient.invalidateQueries({ queryKey: ['productos-optimizado'] })
             queryClient.invalidateQueries({ queryKey: ['producto-detalle'] })
+            setServerError('')
             setModal(null)
+        },
+        onError: error => {
+            setServerError(error?.response?.data?.detail || 'No se pudo actualizar el producto.')
         },
     })
 
@@ -565,6 +584,7 @@ export default function ProductosPage() {
     })
 
     const handleSave = form => {
+        setServerError('')
         if (modal === 'nuevo') {
             crear.mutate(form)
             return
@@ -771,7 +791,7 @@ export default function ProductosPage() {
             </div>
 
             {modal && (
-                <Modal title={modal === 'nuevo' ? 'Nuevo Producto' : `Editar: ${modal.nombre}`} onClose={() => setModal(null)} maxWidth="760px">
+                <Modal title={modal === 'nuevo' ? 'Nuevo Producto' : `Editar: ${modal.nombre}`} onClose={() => { setServerError(''); setModal(null) }} maxWidth="760px">
                     {modal !== 'nuevo' && isFetchingEditingProduct && !editingProductDetail ? (
                         <div className="flex-center" style={{ padding: 40 }}>
                             <div className="spinner" style={{ width: 28, height: 28 }} />
@@ -781,9 +801,10 @@ export default function ProductosPage() {
                             key={modal === 'nuevo' ? 'nuevo' : `edit-${editingProductId}`}
                             initial={modal !== 'nuevo' ? (editingProductDetail || modal) : {}}
                             onSave={handleSave}
-                            onCancel={() => setModal(null)}
+                            onCancel={() => { setServerError(''); setModal(null) }}
                             loading={crear.isPending || editar.isPending}
                             canViewCosts={canViewCosts}
+                            serverError={serverError}
                         />
                     )}
                 </Modal>

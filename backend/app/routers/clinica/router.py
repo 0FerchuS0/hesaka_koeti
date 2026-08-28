@@ -1,3 +1,4 @@
+import re
 from datetime import date, datetime, timedelta
 from math import ceil
 
@@ -6,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, literal, or_, text, union_all
 from sqlalchemy.orm import noload, selectinload
 
-from app.database import LEGACY_TURNO_RECORDATORIO_COLUMNS_SQL, get_session_for_tenant
+from app.database import get_session_for_tenant
 from app.middleware.tenant import get_tenant_slug
 from app.models.clinica_models import (
     ConsultaContactologia,
@@ -24,10 +25,12 @@ from app.models.clinica_models import (
     VademecumTratamiento,
 )
 from app.models.models import Cliente, ConfiguracionEmpresa, Referidor
+from app.schemas.schemas import ClienteOut
 from app.schemas.schemas import ClinicaAlertOut, ClinicaDashboardResumenOut, ClinicaRecentConsultaOut
 from app.schemas.schemas import (
     ClinicaConsultaContactologiaIn,
     ClinicaConsultaDetalleOut,
+    ClinicaConvertirClienteIn,
     ClinicaHistorialGeneralItemOut,
     ClinicaHistorialGeneralOut,
     ClinicaHistorialGeneralResumenOut,
@@ -112,6 +115,14 @@ def _normalizar_texto(value):
     if value is None:
         return None
     text_value = str(value).strip()
+    if not text_value:
+        return None
+    # Los saltos de linea se pierden al mostrar el texto en tarjetas/resumenes
+    # de una sola linea (historial, PDF, etc.), asi que se guardan como " / "
+    # para que la separacion quede visible en todos lados.
+    text_value = re.sub(r'\r\n|\r|\n', ' / ', text_value)
+    text_value = re.sub(r'\s*/\s*(?:/\s*)+', ' / ', text_value)
+    text_value = re.sub(r'\s+', ' ', text_value).strip(' /')
     return text_value or None
 
 
@@ -452,6 +463,24 @@ def _normalizar_estado_turno(value: str | None) -> str:
     return estado
 
 
+def _opciones_turno_completo():
+    """paciente_rel/doctor_rel/lugar_atencion_rel son lazy='selectin' -- y a su vez
+    Paciente.cliente_rel/referidor_rel y Doctor/LugarAtencion.consultas_oftalmologicas/
+    consultas_contactologia TAMBIEN lo son. Sin noload('*') en cada nivel, listar la
+    agenda arrastra toda esa red por cada turno (confirmado: 520 queries / 1.86s para
+    50 turnos)."""
+    return (
+        noload('*'),
+        selectinload(TurnoClinico.paciente_rel).options(
+            noload('*'),
+            selectinload(Paciente.cliente_rel).options(noload('*')),
+            selectinload(Paciente.referidor_rel).options(noload('*')),
+        ),
+        selectinload(TurnoClinico.doctor_rel).options(noload('*')),
+        selectinload(TurnoClinico.lugar_atencion_rel).options(noload('*')),
+    )
+
+
 def _serializar_turno(turno, fecha_referencia: date | None = None) -> ClinicaTurnoOut:
     hoy = fecha_referencia or fecha_actual_negocio()
     dias_restantes = None
@@ -629,10 +658,6 @@ def _sincronizar_turno_proximo_control(
     fecha_control_nueva: date | None,
     motivo: str | None,
 ):
-    # Defensive production fix: some Railway databases still carry legacy
-    # reminder columns from an older schema version.
-    session.execute(text(LEGACY_TURNO_RECORDATORIO_COLUMNS_SQL))
-
     turno = (
         session.query(TurnoClinico)
         .filter(
@@ -709,16 +734,26 @@ def _sincronizar_turno_proximo_control(
     ))
 
 
+def _opciones_paciente_cliente_referidor_acotadas():
+    """cliente_rel/referidor_rel tienen su propia red de relaciones lazy='selectin'
+    (ventas, presupuestos, pagos, comisiones...) -- sin noload('*') en cada una, cargar
+    un Paciente dispara esa cascada entera aunque el codigo solo necesite el nombre."""
+    return (
+        selectinload(Paciente.cliente_rel).options(noload('*')),
+        selectinload(Paciente.referidor_rel).options(noload('*')),
+    )
+
+
 def _obtener_paciente_seguro(session, paciente_id: int):
     paciente = (
         session.query(Paciente)
         .options(
+            noload('*'),
             noload(Paciente.consultas_oftalmologicas),
             noload(Paciente.consultas_contactologia),
             noload(Paciente.cuestionarios),
             noload(Paciente.recetas_pdf),
-            selectinload(Paciente.cliente_rel),
-            selectinload(Paciente.referidor_rel),
+            *_opciones_paciente_cliente_referidor_acotadas(),
         )
         .filter(Paciente.id == paciente_id)
         .first()
@@ -1371,9 +1406,7 @@ def listar_turnos_clinica(
         query = (
             session.query(TurnoClinico)
             .options(
-                selectinload(TurnoClinico.paciente_rel),
-                selectinload(TurnoClinico.doctor_rel),
-                selectinload(TurnoClinico.lugar_atencion_rel),
+                *_opciones_turno_completo(),
             )
             .outerjoin(Paciente, Paciente.id == TurnoClinico.paciente_id)
             )
@@ -1434,9 +1467,7 @@ def listar_proximos_controles_clinica(
         items = (
             session.query(TurnoClinico)
             .options(
-                selectinload(TurnoClinico.paciente_rel),
-                selectinload(TurnoClinico.doctor_rel),
-                selectinload(TurnoClinico.lugar_atencion_rel),
+                *_opciones_turno_completo(),
             )
             .filter(
                 TurnoClinico.es_control.is_(True),
@@ -1463,9 +1494,7 @@ def listar_recordatorios_clinica(
         base_query = (
             session.query(TurnoClinico)
             .options(
-                selectinload(TurnoClinico.paciente_rel),
-                selectinload(TurnoClinico.doctor_rel),
-                selectinload(TurnoClinico.lugar_atencion_rel),
+                *_opciones_turno_completo(),
             )
         )
 
@@ -1502,9 +1531,7 @@ def resumen_recordatorios_clinica(
         base_query = (
             session.query(TurnoClinico)
             .options(
-                selectinload(TurnoClinico.paciente_rel),
-                selectinload(TurnoClinico.doctor_rel),
-                selectinload(TurnoClinico.lugar_atencion_rel),
+                *_opciones_turno_completo(),
             )
             .order_by(TurnoClinico.fecha_hora.asc(), TurnoClinico.id.asc())
         )
@@ -1559,7 +1586,12 @@ def crear_turno_clinica(
         )
         session.add(turno)
         session.commit()
-        session.refresh(turno)
+        turno = (
+            session.query(TurnoClinico)
+            .options(*_opciones_turno_completo())
+            .filter(TurnoClinico.id == turno.id)
+            .first()
+        )
         return _serializar_turno(turno, fecha_actual_negocio(session))
     finally:
         session.close()
@@ -1624,7 +1656,13 @@ def editar_turno_clinica(
         turno.motivo = _normalizar_texto(payload.motivo)
         turno.notas = _normalizar_texto(payload.notas)
         session.commit()
-        session.refresh(turno)
+        session.expunge(turno)
+        turno = (
+            session.query(TurnoClinico)
+            .options(*_opciones_turno_completo())
+            .filter(TurnoClinico.id == turno_id)
+            .first()
+        )
         return _serializar_turno(turno, fecha_actual_negocio(session))
     finally:
         session.close()
@@ -1660,12 +1698,12 @@ def listar_pacientes_clinica(
     try:
         query = session.query(Paciente)
         query = query.options(
+            noload('*'),
             noload(Paciente.consultas_oftalmologicas),
             noload(Paciente.consultas_contactologia),
             noload(Paciente.cuestionarios),
             noload(Paciente.recetas_pdf),
-            selectinload(Paciente.cliente_rel),
-            selectinload(Paciente.referidor_rel),
+            *_opciones_paciente_cliente_referidor_acotadas(),
         )
         if buscar:
             termino = f"%{buscar.strip()}%"
@@ -2452,6 +2490,15 @@ def obtener_historial_paciente_clinica(
                 ConsultaOftalmologica.tipo_lente,
                 ConsultaOftalmologica.material_lente,
                 ConsultaOftalmologica.fecha_control,
+                ConsultaOftalmologica.observaciones,
+                ConsultaOftalmologica.ref_od_esfera,
+                ConsultaOftalmologica.ref_od_cilindro,
+                ConsultaOftalmologica.ref_od_eje,
+                ConsultaOftalmologica.ref_od_adicion,
+                ConsultaOftalmologica.ref_oi_esfera,
+                ConsultaOftalmologica.ref_oi_cilindro,
+                ConsultaOftalmologica.ref_oi_eje,
+                ConsultaOftalmologica.ref_oi_adicion,
                 Doctor.nombre_completo.label("doctor_nombre"),
                 LugarAtencion.nombre.label("lugar_nombre"),
             )
@@ -2472,6 +2519,7 @@ def obtener_historial_paciente_clinica(
                 ConsultaContactologia.tipo_lente,
                 ConsultaContactologia.marca_recomendada,
                 ConsultaContactologia.fecha_control,
+                ConsultaContactologia.observaciones,
                 Doctor.nombre_completo.label("doctor_nombre"),
                 LugarAtencion.nombre.label("lugar_nombre"),
             )
@@ -2504,8 +2552,17 @@ def obtener_historial_paciente_clinica(
                     tipo_lente=row.tipo_lente,
                     material_lente=row.material_lente,
                     fecha_control=row.fecha_control,
+                    observaciones=row.observaciones,
                     anamnesis_id=anamnesis.id if anamnesis else row.anamnesis_id,
                     anamnesis_resumen=_resumir_anamnesis(anamnesis),
+                    ref_od_esfera=row.ref_od_esfera,
+                    ref_od_cilindro=row.ref_od_cilindro,
+                    ref_od_eje=row.ref_od_eje,
+                    ref_od_adicion=row.ref_od_adicion,
+                    ref_oi_esfera=row.ref_oi_esfera,
+                    ref_oi_cilindro=row.ref_oi_cilindro,
+                    ref_oi_eje=row.ref_oi_eje,
+                    ref_oi_adicion=row.ref_oi_adicion,
                 )
             )
         contactologia = []
@@ -2524,6 +2581,7 @@ def obtener_historial_paciente_clinica(
                     tipo_lente=row.tipo_lente,
                     marca_recomendada=row.marca_recomendada,
                     fecha_control=row.fecha_control,
+                    observaciones=row.observaciones,
                     anamnesis_id=anamnesis.id if anamnesis else row.anamnesis_id,
                     anamnesis_resumen=_resumir_anamnesis(anamnesis),
                 )
@@ -2742,10 +2800,12 @@ def crear_receta_medicamento(
         _obtener_paciente_seguro(session, payload.paciente_id)
         if not payload.detalles:
             raise HTTPException(status_code=400, detail="Debe agregar al menos un medicamento.")
-        for detalle in payload.detalles:
-            medicamento = session.query(VademecumMedicamento).filter(VademecumMedicamento.id == detalle.medicamento_id).first()
-            if not medicamento:
-                raise HTTPException(status_code=404, detail="Medicamento no encontrado.")
+        medicamento_ids = {detalle.medicamento_id for detalle in payload.detalles}
+        encontrados_ids = {
+            m.id for m in session.query(VademecumMedicamento.id).filter(VademecumMedicamento.id.in_(medicamento_ids)).all()
+        }
+        if encontrados_ids != medicamento_ids:
+            raise HTTPException(status_code=404, detail="Medicamento no encontrado.")
 
         receta = RecetaMedicamento(
             paciente_id=payload.paciente_id,
@@ -2786,10 +2846,12 @@ def editar_receta_medicamento(
         _obtener_paciente_seguro(session, payload.paciente_id)
         if not payload.detalles:
             raise HTTPException(status_code=400, detail="Debe agregar al menos un medicamento.")
-        for detalle in payload.detalles:
-            medicamento = session.query(VademecumMedicamento).filter(VademecumMedicamento.id == detalle.medicamento_id).first()
-            if not medicamento:
-                raise HTTPException(status_code=404, detail="Medicamento no encontrado.")
+        medicamento_ids = {detalle.medicamento_id for detalle in payload.detalles}
+        encontrados_ids = {
+            m.id for m in session.query(VademecumMedicamento.id).filter(VademecumMedicamento.id.in_(medicamento_ids)).all()
+        }
+        if encontrados_ids != medicamento_ids:
+            raise HTTPException(status_code=404, detail="Medicamento no encontrado.")
 
         receta.paciente_id = payload.paciente_id
         receta.consulta_id = payload.consulta_id
@@ -2943,6 +3005,16 @@ def crear_paciente_clinica(
             if not referidor:
                 raise HTTPException(status_code=404, detail="Referidor no encontrado.")
 
+        cliente_id_vinculado = None
+        if payload.cliente_id:
+            cliente_vinculado = session.query(Cliente).filter(Cliente.id == payload.cliente_id).first()
+            if not cliente_vinculado:
+                raise HTTPException(status_code=404, detail="Cliente no encontrado.")
+            ya_vinculado = session.query(Paciente).filter(Paciente.cliente_id == cliente_vinculado.id).first()
+            if ya_vinculado:
+                raise HTTPException(status_code=400, detail="Ese cliente ya tiene una ficha clinica asociada.")
+            cliente_id_vinculado = cliente_vinculado.id
+
         paciente = Paciente(
             nombre_completo=nombre,
             fecha_nacimiento=payload.fecha_nacimiento,
@@ -2952,6 +3024,7 @@ def crear_paciente_clinica(
             direccion=(payload.direccion or "").strip() or None,
             referidor_id=referidor_id,
             notas=(payload.notas or "").strip() or None,
+            cliente_id=cliente_id_vinculado,
         )
         session.add(paciente)
         session.flush()
@@ -2960,12 +3033,66 @@ def crear_paciente_clinica(
         paciente = (
             session.query(Paciente)
             .options(
+                noload('*'),
                 noload(Paciente.consultas_oftalmologicas),
                 noload(Paciente.consultas_contactologia),
                 noload(Paciente.cuestionarios),
                 noload(Paciente.recetas_pdf),
-                selectinload(Paciente.cliente_rel),
-                selectinload(Paciente.referidor_rel),
+                *_opciones_paciente_cliente_referidor_acotadas(),
+            )
+            .filter(Paciente.id == paciente_id)
+            .first()
+        )
+        return _serializar_pacientes(session, [paciente])[0]
+    finally:
+        session.close()
+
+
+@router.post("/pacientes/desde-cliente/{cliente_id:int}", response_model=ClinicaPacienteOut)
+def crear_paciente_desde_cliente(
+    cliente_id: int,
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(require_action("clinica.pacientes_crear", "clinica")),
+):
+    """Crea una ficha clinica ya vinculada a un cliente existente, precargada
+    con sus datos. Evita el duplicado inverso: alguien que ya es cliente y
+    ahora necesita una consulta no vuelve a generarse desde cero."""
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        cliente = session.query(Cliente).filter(Cliente.id == cliente_id).first()
+        if not cliente:
+            raise HTTPException(status_code=404, detail="Cliente no encontrado.")
+
+        existente = session.query(Paciente).filter(Paciente.cliente_id == cliente_id).first()
+        if existente:
+            raise HTTPException(status_code=400, detail="Este cliente ya tiene una ficha clinica asociada.")
+
+        ci = (cliente.ci or "").strip() or None
+        if ci and session.query(Paciente).filter(Paciente.ci_pasaporte == ci).first():
+            raise HTTPException(status_code=400, detail="Ya existe un paciente con ese CI/Pasaporte.")
+
+        paciente = Paciente(
+            nombre_completo=(cliente.nombre or "").strip(),
+            fecha_nacimiento=cliente.fecha_nacimiento,
+            ci_pasaporte=ci,
+            telefono=(cliente.telefono or "").strip() or None,
+            direccion=(cliente.direccion or "").strip() or None,
+            referidor_id=cliente.referidor_id,
+            cliente_id=cliente.id,
+        )
+        session.add(paciente)
+        session.flush()
+        paciente_id = paciente.id
+        session.commit()
+        paciente = (
+            session.query(Paciente)
+            .options(
+                noload('*'),
+                noload(Paciente.consultas_oftalmologicas),
+                noload(Paciente.consultas_contactologia),
+                noload(Paciente.cuestionarios),
+                noload(Paciente.recetas_pdf),
+                *_opciones_paciente_cliente_referidor_acotadas(),
             )
             .filter(Paciente.id == paciente_id)
             .first()
@@ -3538,15 +3665,16 @@ def editar_paciente_clinica(
         paciente.notas = (payload.notas or "").strip() or None
 
         session.commit()
+        session.expunge(paciente)
         paciente = (
             session.query(Paciente)
             .options(
+                noload('*'),
                 noload(Paciente.consultas_oftalmologicas),
                 noload(Paciente.consultas_contactologia),
                 noload(Paciente.cuestionarios),
                 noload(Paciente.recetas_pdf),
-                selectinload(Paciente.cliente_rel),
-                selectinload(Paciente.referidor_rel),
+                *_opciones_paciente_cliente_referidor_acotadas(),
             )
             .filter(Paciente.id == paciente_id)
             .first()
@@ -3556,9 +3684,98 @@ def editar_paciente_clinica(
         session.close()
 
 
+def _telefono_variantes(telefono: str | None) -> list[str]:
+    """Formas equivalentes de un mismo numero paraguayo (con/sin 0 inicial,
+    con/sin 595), para no perder matches solo por como se tipeo el numero."""
+    digitos = re.sub(r"\D", "", telefono or "")
+    if len(digitos) < 8:
+        return []
+    nucleo = digitos[-9:]
+    return [nucleo, f"0{nucleo}", f"595{nucleo}", f"+595{nucleo}"]
+
+
+def _buscar_clientes_candidatos(session, *, ci: str | None, telefono: str | None, nombre: str | None) -> list[Cliente]:
+    """Candidatos de Cliente para un paciente (existente o por crear): CI
+    exacto, telefono equivalente, o nombre con todas sus palabras presentes.
+    Ninguno se aplica solo - siempre se le muestran al usuario para que
+    confirme."""
+    candidatos: dict[int, Cliente] = {}
+
+    ci = (ci or "").strip()
+    if ci:
+        for cliente in session.query(Cliente).filter(Cliente.ci == ci).all():
+            candidatos[cliente.id] = cliente
+
+    variantes = _telefono_variantes(telefono)
+    if variantes:
+        for cliente in session.query(Cliente).filter(Cliente.telefono.in_(variantes)).all():
+            candidatos[cliente.id] = cliente
+
+    nombre = (nombre or "").strip()
+    tokens = [t for t in nombre.split() if len(t) >= 3]
+    if tokens:
+        query = session.query(Cliente)
+        for token in tokens:
+            query = query.filter(Cliente.nombre.ilike(f"%{token}%"))
+        for cliente in query.limit(5).all():
+            candidatos[cliente.id] = cliente
+
+    return list(candidatos.values())[:5]
+
+
+def _serializar_clientes_candidatos(clientes: list[Cliente]) -> list[ClienteOut]:
+    result = []
+    for cliente in clientes:
+        item = ClienteOut.model_validate(cliente)
+        item.referidor_nombre = cliente.referidor_rel.nombre if cliente.referidor_rel else None
+        result.append(item)
+    return result
+
+
+@router.get("/pacientes/posibles-clientes", response_model=list[ClienteOut])
+def posibles_clientes_para_datos(
+    nombre: str = Query(""),
+    telefono: str = Query(""),
+    ci: str = Query(""),
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(require_action("clinica.pacientes_crear", "clinica")),
+):
+    """Chequeo previo a crear un paciente: busca clientes parecidos a los
+    datos que se estan tipeando, antes de que el paciente exista siquiera."""
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        candidatos = _buscar_clientes_candidatos(session, ci=ci, telefono=telefono, nombre=nombre)
+        return _serializar_clientes_candidatos(candidatos)
+    finally:
+        session.close()
+
+
+@router.get("/pacientes/{paciente_id:int}/posibles-clientes", response_model=list[ClienteOut])
+def posibles_clientes_para_paciente(
+    paciente_id: int,
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(require_action("clinica.convertir_cliente", "clinica")),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        paciente = session.query(Paciente).filter(Paciente.id == paciente_id).first()
+        if not paciente:
+            raise HTTPException(status_code=404, detail="Paciente no encontrado.")
+        if paciente.cliente_id:
+            return []
+
+        candidatos = _buscar_clientes_candidatos(
+            session, ci=paciente.ci_pasaporte, telefono=paciente.telefono, nombre=paciente.nombre_completo
+        )
+        return _serializar_clientes_candidatos(candidatos)
+    finally:
+        session.close()
+
+
 @router.post("/pacientes/{paciente_id:int}/convertir-cliente", response_model=ClinicaPacienteOut)
 def convertir_paciente_a_cliente(
     paciente_id: int,
+    payload: ClinicaConvertirClienteIn | None = None,
     tenant_slug: str = Depends(get_tenant_slug),
     current_user=Depends(require_action("clinica.convertir_cliente", "clinica")),
 ):
@@ -3567,12 +3784,12 @@ def convertir_paciente_a_cliente(
         paciente = (
             session.query(Paciente)
             .options(
+                noload('*'),
                 noload(Paciente.consultas_oftalmologicas),
                 noload(Paciente.consultas_contactologia),
                 noload(Paciente.cuestionarios),
                 noload(Paciente.recetas_pdf),
-                selectinload(Paciente.cliente_rel),
-                selectinload(Paciente.referidor_rel),
+                *_opciones_paciente_cliente_referidor_acotadas(),
             )
             .filter(Paciente.id == paciente_id)
             .first()
@@ -3583,7 +3800,13 @@ def convertir_paciente_a_cliente(
             raise HTTPException(status_code=400, detail="Este paciente ya fue convertido a cliente.")
 
         ci = (paciente.ci_pasaporte or "").strip() or None
-        cliente = session.query(Cliente).filter(Cliente.ci == ci).first() if ci else None
+        cliente_id_forzado = payload.cliente_id if payload else None
+        if cliente_id_forzado:
+            cliente = session.query(Cliente).filter(Cliente.id == cliente_id_forzado).first()
+            if not cliente:
+                raise HTTPException(status_code=404, detail="Cliente no encontrado.")
+        else:
+            cliente = session.query(Cliente).filter(Cliente.ci == ci).first() if ci else None
 
         if cliente:
             if not cliente.telefono and paciente.telefono:
@@ -3612,15 +3835,18 @@ def convertir_paciente_a_cliente(
 
         paciente.cliente_id = cliente.id
         session.commit()
+        # expunge es imprescindible: la instancia ya cargada antes del commit ignora
+        # las options() de esta query nueva si no se saca del identity map primero.
+        session.expunge(paciente)
         paciente = (
             session.query(Paciente)
             .options(
+                noload('*'),
                 noload(Paciente.consultas_oftalmologicas),
                 noload(Paciente.consultas_contactologia),
                 noload(Paciente.cuestionarios),
                 noload(Paciente.recetas_pdf),
-                selectinload(Paciente.cliente_rel),
-                selectinload(Paciente.referidor_rel),
+                *_opciones_paciente_cliente_referidor_acotadas(),
             )
             .filter(Paciente.id == paciente_id)
             .first()

@@ -4,17 +4,17 @@
    ================================================================ */
 
 :root {
-  /* Colores primarios */
-  --primary: #1a56db;
-  --primary-dark: #1341b3;
-  --primary-light: #3b82f6;
-  --primary-glow: rgba(26, 86, 219, 0.15);
+  /* Colores primarios (identidad visual HESAKA) */
+  --primary: #7c4dff;
+  --primary-dark: #6236c9;
+  --primary-light: #a78bfa;
+  --primary-glow: rgba(124, 77, 255, 0.18);
 
   /* Fondo general */
-  --bg-main: #0f1117;
-  --bg-card: #1a1d27;
-  --bg-card-hover: #21253a;
-  --bg-sidebar: #13161f;
+  --bg-main: #0d0d13;
+  --bg-card: #1a1824;
+  --bg-card-hover: #221f30;
+  --bg-sidebar: #100e18;
 
   /* Textos */
   --text-primary: #f0f4ff;
@@ -173,23 +173,14 @@ img {
   padding: 20px 10px;
 }
 
-.sidebar-logo-icon {
-  width: 40px;
-  height: 40px;
-  background: linear-gradient(135deg, var(--primary), #7c3aed);
-  border-radius: var(--radius-sm);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 800;
-  font-size: 16px;
-  color: white;
-  box-shadow: 0 0 20px rgba(26, 86, 219, 0.4);
+.sidebar-logo-full {
+  height: 30px;
+  width: auto;
 }
 
-.sidebar-logo-text {
-  display: flex;
-  flex-direction: column;
+.sidebar-logo-mark {
+  height: 30px;
+  width: auto;
 }
 
 .sidebar-toggle {
@@ -209,20 +200,6 @@ img {
 .sidebar-toggle:hover {
   color: var(--text-primary);
   background: rgba(255, 255, 255, 0.1);
-}
-
-.sidebar-logo-text span:first-child {
-  font-weight: 700;
-  font-size: 1rem;
-  color: var(--text-primary);
-  letter-spacing: 0.5px;
-}
-
-.sidebar-logo-text span:last-child {
-  font-size: 0.7rem;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 1px;
 }
 
 .sidebar-nav {
@@ -331,7 +308,7 @@ img {
 .sidebar-user-avatar {
   width: 34px;
   height: 34px;
-  background: linear-gradient(135deg, var(--primary), #7c3aed);
+  background: linear-gradient(135deg, var(--primary), var(--primary-light));
   border-radius: 50%;
   display: flex;
   align-items: center;
@@ -487,7 +464,7 @@ img {
 }
 
 .stat-icon.blue {
-  background: rgba(26, 86, 219, 0.15);
+  background: rgba(124, 77, 255, 0.15);
   color: var(--primary-light);
 }
 
@@ -678,12 +655,12 @@ tr:hover td {
 .btn-primary {
   background: var(--primary);
   color: white;
-  box-shadow: 0 0 20px rgba(26, 86, 219, 0.3);
+  box-shadow: 0 0 20px rgba(124, 77, 255, 0.3);
 }
 
 .btn-primary:hover {
   background: var(--primary-dark);
-  box-shadow: 0 0 30px rgba(26, 86, 219, 0.5);
+  box-shadow: 0 0 30px rgba(124, 77, 255, 0.5);
   transform: translateY(-1px);
 }
 
@@ -1278,7 +1255,7 @@ select:not([class*="react-select"]) {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: radial-gradient(ellipse at 30% 50%, rgba(26, 86, 219, 0.1) 0%, transparent 60%),
+  background: radial-gradient(ellipse at 30% 50%, rgba(124, 77, 255, 0.1) 0%, transparent 60%),
     radial-gradient(ellipse at 70% 20%, rgba(124, 58, 237, 0.08) 0%, transparent 55%),
     var(--bg-main);
 }
@@ -1302,18 +1279,9 @@ select:not([class*="react-select"]) {
   margin-bottom: 36px;
 }
 
-.login-logo-icon {
-  width: 64px;
-  height: 64px;
-  background: linear-gradient(135deg, var(--primary), #7c3aed);
-  border-radius: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 24px;
-  font-weight: 800;
-  color: white;
-  box-shadow: 0 8px 32px rgba(26, 86, 219, 0.4);
+.login-logo img,
+.sidebar-logo img {
+  display: block;
 }
 
 .login-logo h1 {

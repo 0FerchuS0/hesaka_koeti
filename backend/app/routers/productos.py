@@ -82,6 +82,7 @@ def _construir_query_productos(session, buscar, categoria_id, marca_id, solo_act
         query = query.filter(
             Producto.nombre.ilike(term)
             | Producto.codigo.ilike(term)
+            | Producto.codigo_barra.ilike(term)
             | Producto.marca.ilike(term)
             | Producto.codigo_fabricante.ilike(term)
         )
@@ -531,6 +532,7 @@ def listar_productos(
             query = query.filter(
                 Producto.nombre.ilike(f"%{buscar}%")
                 | Producto.codigo.ilike(f"%{buscar}%")
+                | Producto.codigo_barra.ilike(f"%{buscar}%")
                 | Producto.marca.ilike(f"%{buscar}%")
             )
 
@@ -558,6 +560,7 @@ def listar_productos_optimizado(
             session.query(
                 Producto.id,
                 Producto.codigo,
+                Producto.codigo_barra,
                 Producto.nombre,
                 Producto.codigo_fabricante,
                 Producto.marca_id,
@@ -592,6 +595,7 @@ def listar_productos_optimizado(
                 or_(
                     Producto.nombre.ilike(term),
                     Producto.codigo.ilike(term),
+                    Producto.codigo_barra.ilike(term),
                     Producto.marca.ilike(term),
                     Producto.codigo_fabricante.ilike(term),
                 )
@@ -613,6 +617,7 @@ def listar_productos_optimizado(
                 ProductoListItemOut(
                     id=row.id,
                     codigo=row.codigo,
+                    codigo_barra=row.codigo_barra,
                     nombre=row.nombre,
                     codigo_fabricante=row.codigo_fabricante,
                     marca_id=row.marca_id,
@@ -700,6 +705,17 @@ def crear_producto(
     session = get_session_for_tenant(tenant_slug)
     try:
         _get_categoria_or_404(session, data.categoria_id)
+        if data.codigo_barra:
+            conflicto = (
+                session.query(Producto)
+                .filter(Producto.codigo_barra == data.codigo_barra)
+                .first()
+            )
+            if conflicto:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f'El codigo de barras "{data.codigo_barra}" ya esta asignado al producto "{conflicto.nombre}".',
+                )
         payload = data.model_dump(exclude={"atributos_ids", "codigo"})
         payload["codigo"] = _generate_codigo_producto(session, data.categoria_id)
         if data.costo_variable:
@@ -752,6 +768,18 @@ def editar_producto(
             raise HTTPException(status_code=404, detail="Producto no encontrado.")
 
         _get_categoria_or_404(session, data.categoria_id)
+        if data.codigo_barra:
+            conflicto = (
+                session.query(Producto)
+                .filter(Producto.codigo_barra == data.codigo_barra)
+                .filter(Producto.id != producto_id)
+                .first()
+            )
+            if conflicto:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f'El codigo de barras "{data.codigo_barra}" ya esta asignado al producto "{conflicto.nombre}".',
+                )
         payload = data.model_dump(exclude={"atributos_ids", "codigo"})
         if data.costo_variable:
             payload["costo"] = 0.0

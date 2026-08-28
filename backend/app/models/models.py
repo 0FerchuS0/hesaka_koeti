@@ -85,6 +85,7 @@ class Producto(TimestampMixin, Base):
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
     codigo = Column(String(50), unique=True, nullable=False)
+    codigo_barra = Column(String(100), unique=True, nullable=True)
     nombre = Column(String(200), nullable=False)
     codigo_fabricante = Column(String(100), nullable=True)
     marca = Column(String(100), nullable=True)  # Marca comercial (ej: ESSILOR, HOYA, TRANSITIONS)

@@ -6,6 +6,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.utils.pdf_branding import pie_pagina_hesaka
+
 
 EMPRESA_SUBTITULO_FALLBACK = ""
 
@@ -196,6 +198,8 @@ def generar_pdf_consulta_clinica(empresa_nombre: str, paciente_nombre: str, paci
         obs = consulta.get("observaciones")
         if _has_value(obs):
             story.extend([Spacer(1, 0.35 * cm), Paragraph("Observaciones:", section), Paragraph(_texto(obs), normal)])
+
+    story.extend(pie_pagina_hesaka())
 
     doc.build(story)
     pdf = buffer.getvalue()

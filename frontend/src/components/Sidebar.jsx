@@ -3,6 +3,8 @@ import { NavLink, useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { getNavigationControlState } from '../utils/navigationControl'
 import { hasActionAccess, hasModuleAccess, normalizeRole } from '../utils/roles'
+import hesakaLogoFull from '../assets/hesaka-logo-full.png'
+import hesakaLogoIcon from '../assets/hesaka-logo-icon.png'
 import {
     LayoutDashboard,
     Package,
@@ -129,6 +131,7 @@ const navGroups = [
                     { to: '/reportes/ventas', label: 'Ventas y Rentabilidad' },
                     { to: '/reportes/ventas-productos', label: 'Ventas por Productos' },
                     { to: '/reportes/comparativo-mensual', label: 'Comparativo Mensual' },
+                    { to: '/reportes/graduaciones-demandadas', label: 'Graduaciones Más Demandadas' },
                     { to: '/reportes/compras', label: 'Compras y Proveedores' },
                     { to: '/reportes/laboratorio', label: 'Trabajos Laboratorio' },
                     { to: '/reportes/finanzas', label: 'Financiero / Caja' },
@@ -293,7 +296,7 @@ export default function Sidebar({ collapsed = false, onToggle, mobileOpen = fals
                     }
                     if (item.to === '/reportes') {
                         const subItems = (item.subItems || []).filter(sub => {
-                            if (['/reportes/ventas', '/reportes/ventas-productos', '/reportes/comparativo-mensual', '/reportes/compras'].includes(sub.to)) {
+                            if (['/reportes/ventas', '/reportes/ventas-productos', '/reportes/comparativo-mensual', '/reportes/graduaciones-demandadas', '/reportes/compras'].includes(sub.to)) {
                                 return hasModuleAccess(user, 'reportes_comercial')
                             }
                             if (sub.to === '/reportes/laboratorio') {
@@ -354,12 +357,10 @@ export default function Sidebar({ collapsed = false, onToggle, mobileOpen = fals
         />
         <aside className={`sidebar ${collapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'sidebar-mobile-open' : ''}`}>
             <div className="sidebar-logo">
-                <div className="sidebar-logo-icon">H</div>
-                {!collapsed && (
-                    <div className="sidebar-logo-text">
-                    <span>HESAKA Web</span>
-                    <span>Sistema de Gestion</span>
-                    </div>
+                {collapsed ? (
+                    <img src={hesakaLogoIcon} alt="HESAKA" className="sidebar-logo-mark" />
+                ) : (
+                    <img src={hesakaLogoFull} alt="HESAKA" className="sidebar-logo-full" />
                 )}
                 <button
                     type="button"

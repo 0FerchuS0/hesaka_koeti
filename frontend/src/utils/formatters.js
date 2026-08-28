@@ -100,3 +100,43 @@ export const nowBusinessDateTimeLocalValue = () => {
 
 export const formatCurrentBusinessDate = (locale = 'es-PY', options = {}) =>
     new Intl.DateTimeFormat(locale, { timeZone: BUSINESS_TIME_ZONE, ...options }).format(new Date())
+
+// Formatos locales paraguayos frecuentes (0XXXXXXXX, 09XXXXXXXX, 9XXXXXXXX,
+// con o sin 595 duplicado por error de tipeo) se completan con el 595. Un
+// numero que ya trae otro codigo de pais (ej. Brasil +55) no matchea ninguno
+// de esos patrones y antes se descartaba a '' - ahora se deja pasar tal cual,
+// siempre que tenga un largo razonable de telefono (8 a 15 digitos, E.164).
+export const normalizarTelefonoWhatsapp = (value) => {
+    let digits = String(value || '').replace(/\D/g, '')
+    if (!digits) return ''
+
+    if (digits.startsWith('00')) {
+        digits = digits.slice(2)
+    }
+
+    if (digits.startsWith('59509')) {
+        digits = `595${digits.slice(4)}`
+    }
+
+    if (digits.startsWith('5950')) {
+        digits = `595${digits.slice(4)}`
+    }
+
+    if (digits.startsWith('09') && digits.length === 10) {
+        return `595${digits.slice(1)}`
+    }
+
+    if (digits.startsWith('0') && digits.length >= 7 && digits.length <= 11) {
+        return `595${digits.slice(1)}`
+    }
+
+    if (digits.startsWith('9') && digits.length >= 8 && digits.length <= 10) {
+        return `595${digits}`
+    }
+
+    if (digits.length >= 8 && digits.length <= 15) {
+        return digits
+    }
+
+    return ''
+}

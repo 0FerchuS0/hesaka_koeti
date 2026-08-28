@@ -6,6 +6,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.utils.pdf_branding import pie_pagina_hesaka
+
 
 def _fmt_gs(value):
     return f"Gs. {int(round(value or 0)):,}".replace(",", ".")
@@ -165,6 +167,7 @@ def generar_pdf_ficha_cliente(ficha, config):
     _style_table(table)
     table.setStyle(TableStyle([("ALIGN", (4, 1), (4, -1), "RIGHT")]))
     story.append(table)
+    story.extend(pie_pagina_hesaka())
 
     doc.build(story)
     buffer.seek(0)
@@ -227,6 +230,7 @@ def generar_pdf_ficha_proveedor(ficha, config):
     _style_table(table)
     table.setStyle(TableStyle([("ALIGN", (3, 1), (5, -1), "RIGHT"), ("ALIGN", (1, 1), (1, -1), "CENTER")]))
     story.append(table)
+    story.extend(pie_pagina_hesaka())
 
     doc.build(story)
     buffer.seek(0)

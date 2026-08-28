@@ -2,9 +2,11 @@ import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { useAuth } from '../context/AuthContext'
-import { LogIn } from 'lucide-react'
+import { LogIn, ArrowLeftRight } from 'lucide-react'
 import PasswordField from '../components/PasswordField'
 import { api } from '../context/AuthContext'
+import hesakaLogoFull from '../assets/hesaka-logo-full.png'
+import hesakaLogoIcon from '../assets/hesaka-logo-icon.png'
 import { failTrackedFlow, markFlowStep, startTrackedFlow } from '../utils/performanceMonitor'
 
 export default function LoginPage() {
@@ -67,13 +69,17 @@ export default function LoginPage() {
             <div className="login-card">
                 <div className="login-logo">
                     {logoUrl ? (
-                        <div style={{ width: 96, height: 96, margin: '0 auto 12px', borderRadius: 20, background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 12 }}>
-                            <img src={logoUrl} alt="Logo institucional" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14, margin: '0 auto 12px' }}>
+                            <img src={hesakaLogoIcon} alt="HESAKA" style={{ height: 40, width: 'auto', flexShrink: 0 }} />
+                            <ArrowLeftRight size={18} strokeWidth={2.25} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+                            <div style={{ width: 64, height: 64, borderRadius: 16, background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 10, flexShrink: 0 }}>
+                                <img src={logoUrl} alt="Logo institucional" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                            </div>
                         </div>
                     ) : (
-                        <div className="login-logo-icon">H</div>
+                        <img src={hesakaLogoFull} alt="HESAKA" style={{ height: 44, width: 'auto', margin: '0 auto 10px' }} />
                     )}
-                    <h1>{configPublica?.nombre || 'HESAKA Web'}</h1>
+                    {(logoUrl || configPublica?.nombre) && <h1>{configPublica?.nombre || 'HESAKA Web'}</h1>}
                     <p>Sistema de Gestion para Opticas</p>
                 </div>
 

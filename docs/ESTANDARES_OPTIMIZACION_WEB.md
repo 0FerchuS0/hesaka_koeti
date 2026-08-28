@@ -234,6 +234,73 @@ No recomendado:
 - crear sessionmaker en cada request si ya puede cachearse
 - ejecutar ajustes de esquema frecuentemente dentro del flujo caliente
 
+### 6.2 Estrategia lazy en relaciones ORM (evitar cascadas de `lazy='selectin'`)
+Encontrado y corregido en produccion (agosto 2026): declarar `lazy='selectin'` en una relacion no es gratis cuando el modelo del otro lado **tambien** tiene relaciones `lazy='selectin'` propias -- cargar un solo registro dispara una cascada de decenas o cientos de consultas sin que el codigo la haya pedido explicitamente.
+
+Caso real medido: listar 100 gastos operativos ejecutaba 496 consultas (1.75s) porque `GastoOperativo.categoria_rel` y `.banco_rel` son `lazy='selectin'`, y a su vez `CategoriaGasto.gastos` y `Banco.pagos` / `.pagos_compras` / `.movimientos` **tambien** lo son -- cada gasto listado arrastraba todo el historial de su categoria y de su banco. Mismo patron encontrado y corregido en `Venta`, `Cliente`, `Presupuesto`, `Compra`, `Paciente`, `Referidor`, `Vendedor`, `CanalVenta` (ver tabla de resultados abajo).
+
+| Endpoint | Antes | Despues |
+|---|---|---|
+| Listar 100 gastos | 496 consultas / 1.75s | 3 consultas / 172ms |
+| Abrir un presupuesto | 152 consultas / 473ms | 6 consultas / 7ms |
+| Abrir una compra | 230 consultas / 871ms | 12 consultas / 190ms |
+| Historial de jornadas (15 filas) | 895 consultas / 3.4s | 16 consultas / 49ms |
+| Cargar un paciente (turnos/consultas) | 78 consultas | 2 consultas |
+
+Regla obligatoria:
+- toda query nueva que cargue un objeto ORM de un modelo "hub" (con relaciones `lazy='selectin'` propias que apuntan a colecciones grandes o transaccionales: `Venta`, `Cliente`, `Presupuesto`, `Compra`, `Paciente`, `Banco`, `CategoriaGasto`, `Referidor`, `Vendedor`, `CanalVenta`) debe agregar `noload('*')` en el nivel superior de `.options(...)`, y volver a agregar `noload('*')` en cada `selectinload(...)` anidado que si se necesite, dejando pasar solo la relacion puntual que la pantalla usa.
+- nunca dejar una query sin `.options(...)` sobre estos modelos "porque total no se usan las relaciones" -- el default de SQLAlchemy para `lazy='selectin'` las carga igual, se usen o no.
+- entre catalogos, esta cascada solo es un riesgo cuando el modelo del otro lado tiene su propia coleccion `lazy='selectin'` hacia una tabla transaccional (ventas, pagos, movimientos, comisiones). Relaciones catalogo-a-catalogo (`Producto.categoria_rel`, `.marca_rel`, `.proveedor_rel`) no cascadean mas alla y no necesitan este tratamiento.
+
+Patron de codigo (ejemplo real, `backend/app/utils/jornada.py`):
+```python
+def _opciones_venta_cliente_acotadas():
+    return selectinload(Venta.cliente_rel).options(noload('*'))
+```
+
+Cuando el objeto se acaba de crear o mutar (`session.add()` + `commit()` + acceso a sus relaciones antes de responder), ver la seccion 6.4 -- `session.refresh()` no sirve para esto, hace falta volver a consultar el objeto.
+
+Cuando si hay que mantener una coleccion cargada (por ejemplo `Presupuesto.items` en un `session.delete()` con `cascade="all, delete-orphan"`, que necesita la coleccion en memoria para saber que filas hijas borrar), dejarla sin `noload` a ese nivel pero seguir bloqueando **sus** relaciones internas (`selectinload(Presupuesto.items).options(noload('*'))`).
+
+### 6.3 Cuando usar `noload('*')` vs. batch `IN(...)` (N+1 clasico)
+Son dos tecnicas distintas para dos problemas distintos -- no son intercambiables:
+
+| Situacion | Tecnica | Por que |
+|---|---|---|
+| Se carga un objeto ORM completo (o una lista de ellos) de un modelo "hub" y sus relaciones `lazy='selectin'` arrastran cascadas no pedidas | `noload('*')` + `selectinload(...)` puntual y anidado (ver 6.2) | Corta la cascada en el nivel exacto donde se genera, sin tocar el modelo |
+| Ya se tiene una lista de IDs (por ejemplo `producto_id` de cada item de un presupuesto) y se necesita el dato relacionado de cada uno, sin pasar por el objeto ORM completo | `SELECT ... WHERE id IN (...)` una sola vez, arma un `dict` en memoria y se usa en el loop | Evita 1 consulta por item sin tocar la carga del objeto principal; mas simple cuando no hace falta el objeto ORM entero |
+
+No son excluyentes: un mismo endpoint puede usar batch `IN(...)` para resolver el costo de items (ver `editar_presupuesto` en `ventas.py`, precarga de `Producto` por `IN(producto_ids)`) y `noload('*')` para el objeto principal que se devuelve al final.
+
+### 6.4 `session.commit()` + acceso a relaciones despues: nunca usar `session.refresh()` solo, y ojo con el `id` detached
+Encontrado en produccion (agosto 2026), en la misma sesion que 6.2/6.3: varios endpoints "editar y devolver el objeto actualizado" (`editar_presupuesto`, `editar_gasto`, `editar_paciente`, `convertir_paciente_a_cliente`, etc.) seguian arrastrando la cascada completa **incluso despues** de aplicar `noload('*')` a la query original. La causa es independiente del patron de 6.2 y tiene dos partes:
+
+**Parte 1 -- `session.refresh(objeto)` no respeta ninguna `.options()` anterior.**
+`expire_on_commit=True` (default de SQLAlchemy, y el que usa este proyecto) marca **todas** las relaciones de un objeto como expiradas al hacer `commit()`. Un `session.refresh(objeto)` posterior sin `attribute_names` no solo actualiza columnas: tambien recarga relaciones expiradas usando el `lazy='selectin'` **de clase**, ignorando por completo las opciones `noload('*')` de la query que lo cargo originalmente. Medido: un `refresh()` sobre un `Presupuesto` ya cargado con opciones acotadas disparo 115 consultas por si solo, antes de que el codigo tocara ninguna relacion.
+
+**Parte 2 -- ni siquiera una re-consulta alcanza si el objeto ya esta en el identity map.**
+La correccion obvia es reemplazar `session.refresh(objeto)` por una consulta nueva con las mismas `.options()` acotadas. Pero si `objeto` **ya estaba cargado** en esa misma `session` antes del `commit()` (el caso tipico: se lo carga al principio del endpoint para validarlo/mutarlo), SQLAlchemy reutiliza la instancia ya trackeada del identity map al popular los resultados de la query nueva, e **ignora las options() de esa query nueva** para esa instancia -- misma cascada de vuelta. Medido: 258 consultas sin este paso, 6 consultas con el.
+
+**Patron obligatorio para todo endpoint que mute un objeto ya cargado y necesite devolver sus relaciones:**
+```python
+objeto_id = objeto.id          # 1. capturar el id ANTES de expunge
+session.commit()
+session.expunge(objeto)        # 2. sacarlo del identity map
+objeto = (
+    session.query(Modelo)
+    .options(*opciones_acotadas())
+    .filter(Modelo.id == objeto_id)   # usar el id ya capturado, o el parametro de ruta si existe
+    .first()
+)
+```
+
+**Por que el id se captura antes del expunge:** despues de `session.expunge()` el objeto queda `detached` (sin sesion). Si `id` tambien quedo expirado por el commit -- paso en la practica, no es solo teoria -- leerlo desde un objeto detached tira `DetachedInstanceError` en vez de silenciosamente andar mal. Si el endpoint ya tiene el id disponible como parametro de ruta (`pre_id`, `gasto_id`, `paciente_id`, etc.), usar ese directamente y ni siquiera hace falta leerlo del objeto.
+
+**Cuando NO hace falta el patron completo:**
+- objeto recien creado con el constructor (`Modelo(**data)` + `session.add()`), nunca cargado con una query antes del commit: no esta en conflicto con ningun identity map previo, un `session.query(...).options(...).filter(id==objeto.id).first()` simple alcanza (`session.expunge()` no es necesario, pero tampoco molesta si se agrega por consistencia).
+- el endpoint solo necesita refrescar columnas propias, sin ninguna relacion, despues del commit: usar `session.refresh(objeto, attribute_names=["col1", "col2"])` -- evita la relectura de columnas innecesarias y no dispara ninguna relacion (medido: 1 query en vez de 115).
+- el modelo no tiene relaciones `lazy='selectin'` en absoluto (catalogos chicos: `DestinatarioRendicion`, `Cuestionario`): `session.refresh()` sin acotar es seguro.
+
 ### 7. Reportes
 Los reportes deben usar:
 - agregaciones SQL cuando sea posible
@@ -268,7 +335,7 @@ Cuando aparezcan problemas reales de velocidad en produccion o en pruebas operat
   - `proveedor_id + fecha`
 
 No recomendado:
-- refactorizar en masa relaciones ORM o estrategias `lazy` sin una medicion previa
+- refactorizar en masa relaciones ORM o estrategias `lazy` sin medicion previa (cantidad de consultas + tiempo, antes/despues) -- con medicion real de por medio, el patron `noload('*')` de la seccion 6.2 es el estandar vigente, no una excepcion
 - aplicar cambios estructurales grandes solo porque una herramienta los sugiere
 - introducir Redis, particionamiento o vistas materializadas antes de agotar estas tres prioridades
 

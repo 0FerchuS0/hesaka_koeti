@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
+from sqlalchemy.orm import noload, selectinload
 from sqlalchemy.exc import IntegrityError
 
 from app.database import get_session_for_tenant
@@ -203,6 +204,7 @@ class ClienteFichaOut(BaseModel):
     proximo_control: Optional[date] = None
     proximo_control_origen: Optional[str] = None
     historial_armazones: List["ArmazonHistorialItemOut"] = []
+    paciente_id: Optional[int] = None
 
 
 class ProveedorFichaOut(BaseModel):
@@ -247,7 +249,10 @@ ClienteFichaOut.model_rebuild()
 
 
 def _construir_query_clientes(session, buscar: Optional[str], referidor_id: Optional[int]):
-    query = session.query(Cliente)
+    # Cliente.referidor_rel es lazy='selectin', y Referidor.clientes/comisiones
+    # TAMBIEN -- sin noload, cada cliente listado arrastra todos los demas clientes
+    # y comisiones de su mismo referidor.
+    query = session.query(Cliente).options(noload('*'), selectinload(Cliente.referidor_rel).options(noload('*')))
     if referidor_id:
         query = query.filter(Cliente.referidor_id == referidor_id)
     if buscar and buscar.strip():
@@ -876,6 +881,12 @@ def _build_cliente_ficha(session, cliente: Cliente):
             )
         )
 
+    paciente_vinculado = (
+        session.query(ClinicaPaciente.id)
+        .filter(ClinicaPaciente.cliente_id == cliente.id)
+        .first()
+    )
+
     return ClienteFichaOut(
         cliente=cliente_out,
         deuda_total=sum(item.saldo for item in ventas_pendientes),
@@ -885,6 +896,7 @@ def _build_cliente_ficha(session, cliente: Cliente):
         proximo_control=proximo_control,
         proximo_control_origen=proximo_control_origen,
         historial_armazones=historial_armazones,
+        paciente_id=paciente_vinculado[0] if paciente_vinculado else None,
     )
 
 
@@ -1438,7 +1450,10 @@ def listar_referidores(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        return session.query(Referidor).order_by(Referidor.nombre).all()
+        # Referidor.clientes/comisiones son lazy='selectin' -- mismo bug que
+        # vendedores/canales/bancos: sin noload, listar referidores arrastra
+        # todos sus clientes y comisiones asociados.
+        return session.query(Referidor).options(noload('*')).order_by(Referidor.nombre).all()
     finally:
         session.close()
 
@@ -1602,7 +1617,10 @@ def listar_vendedores(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        query = session.query(Vendedor)
+        # VendedorOut solo expone campos escalares -- sin este noload, listar vendedores
+        # arrastra (lazy='selectin') todas sus ventas y presupuestos, que a su vez
+        # cargan cada uno su propia red de relaciones (cliente, items, pagos...).
+        query = session.query(Vendedor).options(noload('*'))
         if solo_activos:
             query = query.filter(Vendedor.activo == True)
         return query.order_by(Vendedor.nombre.asc()).all()
@@ -1710,7 +1728,8 @@ def listar_canales_venta(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        query = session.query(CanalVenta)
+        # Mismo motivo que listar_vendedores: CanalVentaOut es solo campos escalares.
+        query = session.query(CanalVenta).options(noload('*'))
         if solo_activos:
             query = query.filter(CanalVenta.activo == True)
         return query.order_by(CanalVenta.nombre.asc()).all()

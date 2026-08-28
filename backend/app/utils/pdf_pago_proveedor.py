@@ -7,6 +7,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from app.utils.timezone import ahora_desde_config
+from app.utils.pdf_branding import pie_pagina_hesaka
 
 
 def _fmt_gs(valor):
@@ -212,6 +213,7 @@ def generar_pdf_pago_proveedor(grupo, config):
         Paragraph("DETALLE DEL PAGO", styles["Heading2"]),
         tabla_detalle,
     ])
+    elementos.extend(pie_pagina_hesaka())
 
     doc.build(elementos)
     buffer.seek(0)

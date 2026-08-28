@@ -6,6 +6,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.utils.pdf_branding import pie_pagina_hesaka
+
 
 EMPRESA_SUBTITULO_FALLBACK = ""
 
@@ -106,6 +108,8 @@ def _render_receta_copy(story, styles, empresa_nombre, paciente_nombre, paciente
                 Paragraph("Firma y sello del profesional", ParagraphStyle("Firma", parent=normal, alignment=2, fontName="Helvetica", fontSize=9)),
             ]
         )
+
+    story.extend(pie_pagina_hesaka())
 
 
 def generar_pdf_receta_medicamento_clinica(empresa_nombre: str, paciente_nombre: str, paciente_ci: str | None, receta: dict) -> bytes:

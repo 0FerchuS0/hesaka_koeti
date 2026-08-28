@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import HTTPException
 from sqlalchemy import case, func
-from sqlalchemy.orm import lazyload, selectinload
+from sqlalchemy.orm import lazyload, noload, selectinload
 
 from app.models.models import (
     Banco,
@@ -26,6 +26,26 @@ from app.utils.timezone import (
     normalizar_fecha_negocio,
     zona_horaria_negocio as _zona_horaria_negocio,
 )
+
+def _opciones_venta_cliente_acotadas():
+    """Trae venta.cliente_rel sin arrastrar el resto de relaciones de Venta/Cliente
+    (vendedor, canal, referidor, presupuesto, pagos, ajustes, etc.) -- todas estan
+    declaradas lazy='selectin' por defecto, asi que sin este noload('*') el ORM las
+    carga igual aunque nadie las pida, multiplicando queries por cada venta."""
+    return selectinload(Venta.cliente_rel).options(noload('*'))
+
+
+def _opciones_pago_venta_acotadas(pago_venta_rel_attr):
+    """Mismo criterio, para queries que parten de MovimientoCaja/MovimientoBanco y
+    necesitan pago->venta->cliente sin el resto de relaciones de esos modelos."""
+    return selectinload(pago_venta_rel_attr).options(
+        noload('*'),
+        selectinload(Pago.venta_rel).options(
+            noload('*'),
+            _opciones_venta_cliente_acotadas(),
+        ),
+    )
+
 
 def resolver_destinatario_rendicion_activo(session, destinatario_id: int) -> DestinatarioRendicion:
     dest = session.query(DestinatarioRendicion).filter(DestinatarioRendicion.id == destinatario_id).first()
@@ -756,7 +776,8 @@ def construir_detalle_ventas_jornada(
             Venta.estado.notin_(["ANULADO", "ANULADA"]),
         )
         .options(
-            selectinload(Venta.cliente_rel),
+            noload('*'),
+            _opciones_venta_cliente_acotadas(),
         )
         .order_by(Venta.fecha.desc(), Venta.id.desc())
         .all()
@@ -847,7 +868,7 @@ def construir_ventas_pendientes_jornada(
             Venta.estado.notin_(["ANULADO", "ANULADA"]),
             Venta.saldo > 0,
         )
-        .options(selectinload(Venta.cliente_rel))
+        .options(noload('*'), _opciones_venta_cliente_acotadas())
         .order_by(Venta.fecha.desc(), Venta.id.desc())
         .all()
     )
@@ -882,7 +903,7 @@ def construir_ventas_pendientes_jornada(
         ventas_relacionadas = (
             session.query(Venta)
             .filter(Venta.id.in_(venta_ids_faltantes))
-            .options(selectinload(Venta.cliente_rel))
+            .options(noload('*'), _opciones_venta_cliente_acotadas())
             .all()
         )
         movimientos_por_venta: dict[int, list[MovimientoJornadaNormalizado]] = {}
@@ -1580,9 +1601,10 @@ def construir_filas_historial_jornadas(session, jornadas: list[JornadaFinanciera
         session.query(MovimientoCaja)
         .filter(MovimientoCaja.jornada_id.in_(ids))
         .options(
-            selectinload(MovimientoCaja.pago_venta_rel),
-            selectinload(MovimientoCaja.pago_compra_rel),
-            selectinload(MovimientoCaja.gasto_operativo_rel),
+            noload('*'),
+            _opciones_pago_venta_acotadas(MovimientoCaja.pago_venta_rel),
+            selectinload(MovimientoCaja.pago_compra_rel).options(noload('*')),
+            selectinload(MovimientoCaja.gasto_operativo_rel).options(noload('*')),
         )
         .all()
     )
@@ -1590,9 +1612,10 @@ def construir_filas_historial_jornadas(session, jornadas: list[JornadaFinanciera
         session.query(MovimientoBanco)
         .filter(MovimientoBanco.jornada_id.in_(ids))
         .options(
-            selectinload(MovimientoBanco.pago_venta_rel),
-            selectinload(MovimientoBanco.pago_compra_rel),
-            selectinload(MovimientoBanco.banco_rel),
+            noload('*'),
+            _opciones_pago_venta_acotadas(MovimientoBanco.pago_venta_rel),
+            selectinload(MovimientoBanco.pago_compra_rel).options(noload('*')),
+            selectinload(MovimientoBanco.banco_rel).options(noload('*')),
         )
         .all()
     )

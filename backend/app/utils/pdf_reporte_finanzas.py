@@ -7,6 +7,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from app.utils.timezone import ahora_desde_config
+from app.utils.pdf_branding import pie_pagina_hesaka
 
 
 GREEN_TEXT = colors.HexColor("#15803d")
@@ -239,6 +240,7 @@ def generar_pdf_reporte_finanzas(
 
     detail_table.setStyle(TableStyle(detail_style))
     elements.append(detail_table)
+    elements.extend(pie_pagina_hesaka())
 
     doc.build(elements)
     buffer.seek(0)

@@ -51,6 +51,7 @@ export default function MarcasPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['marcas'] })
             queryClient.invalidateQueries({ queryKey: ['productos'] })
+            queryClient.invalidateQueries({ queryKey: ['productos-optimizado'] })
             setModal(null)
         },
     })
@@ -60,6 +61,7 @@ export default function MarcasPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['marcas'] })
             queryClient.invalidateQueries({ queryKey: ['productos'] })
+            queryClient.invalidateQueries({ queryKey: ['productos-optimizado'] })
             setModal(null)
         },
     })
@@ -69,6 +71,7 @@ export default function MarcasPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['marcas'] })
             queryClient.invalidateQueries({ queryKey: ['productos'] })
+            queryClient.invalidateQueries({ queryKey: ['productos-optimizado'] })
         },
     })
 

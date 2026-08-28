@@ -9,6 +9,7 @@ from reportlab.lib.units import cm
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from app.utils.media_storage import resolve_logo_disk_path
 from app.utils.timezone import ahora_desde_config
+from app.utils.pdf_branding import pie_pagina_hesaka
 
 
 def _fmt_gs(value):
@@ -121,6 +122,7 @@ def generar_pdf_reporte_trabajos_lab(trabajos, config, fecha_desde=None, fecha_h
         ("PADDING", (0, 0), (-1, -1), 6),
     ]))
     elements.append(detail_table)
+    elements.extend(pie_pagina_hesaka())
 
     doc.build(elements)
     buffer.seek(0)

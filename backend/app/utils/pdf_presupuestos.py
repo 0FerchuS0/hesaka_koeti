@@ -6,6 +6,7 @@ from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas
 
 from app.utils.media_storage import resolve_logo_disk_path
+from app.utils.pdf_branding import dibujar_pie_pagina_hesaka
 
 
 def _fmt_gs(monto):
@@ -141,6 +142,8 @@ def generar_pdf_presupuesto(presupuesto, config) -> io.BytesIO:
         y_extra -= 0.5 * cm
     if presupuesto.observaciones:
         c.drawString(margin_x, y_extra, f"Observaciones: {presupuesto.observaciones[:90]}")
+
+    dibujar_pie_pagina_hesaka(c, width)
 
     c.save()
     buffer.seek(0)

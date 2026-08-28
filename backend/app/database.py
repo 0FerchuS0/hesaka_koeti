@@ -15,24 +15,6 @@ logger = logging.getLogger(__name__)
 
 Base = declarative_base()
 
-LEGACY_TURNO_RECORDATORIO_COLUMNS_SQL = """
-DO $$
-DECLARE
-    legacy_col text;
-BEGIN
-    FOR legacy_col IN
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'clinica_turnos'
-          AND column_name LIKE 'recordado_%'
-          AND column_name NOT IN ('recordado_3', 'recordado_hoy')
-    LOOP
-        EXECUTE format('ALTER TABLE clinica_turnos DROP COLUMN IF EXISTS %I', legacy_col);
-    END LOOP;
-END $$;
-"""
-
 # Cache de engines por tenant (evita crear uno nuevo en cada request)
 _engines: dict = {}
 _session_factories: dict = {}
@@ -205,6 +187,11 @@ def ensure_tenant_schema(engine, tenant_slug: str):
                 connection.execute(text("ALTER TABLE productos ADD COLUMN requiere_laboratorio BOOLEAN DEFAULT TRUE"))
             if "controla_stock" not in producto_columns:
                 connection.execute(text("ALTER TABLE productos ADD COLUMN controla_stock BOOLEAN DEFAULT TRUE"))
+            if "codigo_barra" not in producto_columns:
+                connection.execute(text("ALTER TABLE productos ADD COLUMN codigo_barra VARCHAR(100)"))
+            connection.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_producto_codigo_barra ON productos (codigo_barra)"
+            ))
 
     if "presupuestos" in table_names:
         presupuesto_columns = {column["name"] for column in inspector.get_columns("presupuestos")}
@@ -223,12 +210,6 @@ def ensure_tenant_schema(engine, tenant_slug: str):
                 connection.execute(text("ALTER TABLE presupuestos ADD COLUMN referidor_id INTEGER REFERENCES referidores(id)"))
             if "comision_monto" not in presupuesto_columns:
                 connection.execute(text("ALTER TABLE presupuestos ADD COLUMN comision_monto DOUBLE PRECISION DEFAULT 0"))
-            connection.execute(text(
-                """
-                UPDATE presupuestos
-                SET comision_monto = COALESCE(comision_monto, 0)
-                """
-            ))
 
     if "ventas" in table_names:
         venta_columns = {column["name"] for column in inspector.get_columns("ventas")}
@@ -500,7 +481,8 @@ def ensure_tenant_schema(engine, tenant_slug: str):
                 connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN consulta_id INTEGER"))
             if "consulta_tipo" not in turno_columns:
                 connection.execute(text("ALTER TABLE clinica_turnos ADD COLUMN consulta_tipo VARCHAR(30)"))
-            connection.execute(text(LEGACY_TURNO_RECORDATORIO_COLUMNS_SQL))
+            if "recordado_15" in turno_columns:
+                connection.execute(text("ALTER TABLE clinica_turnos DROP COLUMN recordado_15"))
             connection.execute(text("UPDATE clinica_turnos SET es_control = COALESCE(es_control, FALSE)"))
             connection.execute(text(
                 """

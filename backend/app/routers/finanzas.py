@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import noload, selectinload
 
 from app.database import get_session_for_tenant
 from app.middleware.tenant import get_tenant_slug
@@ -375,7 +376,11 @@ def obtener_estado_jornada_actual(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        return _serializar_estado_jornada(session)
+        # Este endpoint solo alimenta el cartel "jornada abierta/cerrada" (FinancialJornadaNotice),
+        # que unicamente lee .abierta y .resumen -- pedir el detalle operativo completo (cuentas por
+        # cobrar del dia, detalle de ventas, alerta de movimientos posteriores) es trabajo desperdiciado
+        # que se repite en cada pantalla que muestra el cartel (Gastos, Compras, Ventas, Caja).
+        return _serializar_estado_jornada(session, include_operational_detail=False, include_alerta_resumen=False)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1393,7 +1398,10 @@ def ajustar_caja(
 def listar_bancos(tenant_slug: str = Depends(get_tenant_slug), current_user=Depends(get_current_user)):
     session = get_session_for_tenant(tenant_slug)
     try:
-        return session.query(Banco).order_by(Banco.nombre_banco).all()
+        # BancoOut es solo campos escalares -- Banco.pagos/pagos_compras/movimientos
+        # son lazy='selectin', asi que sin este noload listar bancos arrastra TODO el
+        # historial de movimientos de cada banco (confirmado en listar_gastos: mismo bug).
+        return session.query(Banco).options(noload('*')).order_by(Banco.nombre_banco).all()
     finally:
         session.close()
 
@@ -1405,7 +1413,9 @@ def crear_banco(data: BancoCreate, tenant_slug: str = Depends(get_tenant_slug), 
         banco = Banco(**data.model_dump())
         session.add(banco)
         session.commit()
-        session.refresh(banco)
+        # Banco.pagos/pagos_compras/movimientos son lazy='selectin' -- refresh() sin
+        # acotar arrastra todo el historial del banco (mismo motivo que listar_bancos).
+        banco = session.query(Banco).options(noload('*')).filter(Banco.id == banco.id).first()
         return banco
     finally:
         session.close()
@@ -1428,7 +1438,12 @@ def editar_banco(
             setattr(banco, key, value)
 
         session.commit()
-        session.refresh(banco)
+        # Banco.pagos/pagos_compras/movimientos son lazy='selectin' -- refresh() sin
+        # acotar arrastra todo el historial del banco (mismo motivo que listar_bancos).
+        # expunge es necesario: la instancia ya cargada antes del commit ignora las
+        # options() de esta query nueva si no se saca del identity map primero.
+        session.expunge(banco)
+        banco = session.query(Banco).options(noload('*')).filter(Banco.id == banco_id).first()
         return banco
     finally:
         session.close()
@@ -1735,7 +1750,7 @@ def historial_transferencias_internas(
 def listar_categorias_gasto(tenant_slug: str = Depends(get_tenant_slug), current_user=Depends(get_current_user)):
     session = get_session_for_tenant(tenant_slug)
     try:
-        return session.query(CategoriaGasto).order_by(CategoriaGasto.nombre).all()
+        return session.query(CategoriaGasto).options(noload('*')).order_by(CategoriaGasto.nombre).all()
     finally:
         session.close()
 
@@ -1756,7 +1771,9 @@ def crear_categoria_gasto(
         categoria = CategoriaGasto(**data.model_dump())
         session.add(categoria)
         session.commit()
-        session.refresh(categoria)
+        # CategoriaGasto.gastos es lazy='selectin' -- refresh() sin acotar arrastra
+        # todos los gastos de esa categoria (mismo motivo que listar_categorias_gasto).
+        categoria = session.query(CategoriaGasto).options(noload('*')).filter(CategoriaGasto.id == categoria.id).first()
         return categoria
     except HTTPException:
         session.rollback()
@@ -1774,7 +1791,7 @@ def editar_categoria_gasto(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        categoria = session.query(CategoriaGasto).filter(CategoriaGasto.id == categoria_id).first()
+        categoria = session.query(CategoriaGasto).options(noload('*')).filter(CategoriaGasto.id == categoria_id).first()
         if not categoria:
             raise HTTPException(status_code=404, detail="Categoria de gasto no encontrada.")
 
@@ -1797,7 +1814,12 @@ def editar_categoria_gasto(
             setattr(categoria, key, value)
 
         session.commit()
-        session.refresh(categoria)
+        # CategoriaGasto.gastos es lazy='selectin' -- refresh() sin acotar arrastra
+        # todos los gastos de esa categoria (mismo motivo que listar_categorias_gasto).
+        # expunge saca la instancia ya cargada del identity map -- sin esto, esta
+        # query nueva ignora sus options() y recarga con el lazy de clase igual.
+        session.expunge(categoria)
+        categoria = session.query(CategoriaGasto).options(noload('*')).filter(CategoriaGasto.id == categoria_id).first()
         return categoria
     except HTTPException:
         session.rollback()
@@ -1814,7 +1836,7 @@ def eliminar_categoria_gasto(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        categoria = session.query(CategoriaGasto).filter(CategoriaGasto.id == categoria_id).first()
+        categoria = session.query(CategoriaGasto).options(noload('*')).filter(CategoriaGasto.id == categoria_id).first()
         if not categoria:
             raise HTTPException(status_code=404, detail="Categoria de gasto no encontrada.")
 
@@ -1848,7 +1870,15 @@ def listar_gastos(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        query = session.query(GastoOperativo)
+        # categoria_rel/banco_rel son lazy='selectin' -- pero CategoriaGasto.gastos y
+        # Banco.pagos/pagos_compras/movimientos TAMBIEN lo son, asi que sin noload('*')
+        # cada gasto listado arrastra TODOS los gastos de su categoria y TODO el
+        # historial de movimientos de su banco (confirmado: 496 queries para 100 filas).
+        query = session.query(GastoOperativo).options(
+            noload('*'),
+            selectinload(GastoOperativo.categoria_rel).options(noload('*')),
+            selectinload(GastoOperativo.banco_rel).options(noload('*')),
+        )
         if categoria_id:
             query = query.filter(GastoOperativo.categoria_id == categoria_id)
         if fecha_desde:
@@ -1891,7 +1921,16 @@ def registrar_gasto(
         _aplicar_impacto_gasto(session, gasto, categoria, current_user=current_user)
 
         session.commit()
-        session.refresh(gasto)
+        gasto = (
+            session.query(GastoOperativo)
+            .options(
+                noload('*'),
+                selectinload(GastoOperativo.categoria_rel).options(noload('*')),
+                selectinload(GastoOperativo.banco_rel).options(noload('*')),
+            )
+            .filter(GastoOperativo.id == gasto.id)
+            .first()
+        )
         return _build_gasto_out(gasto)
     except HTTPException:
         session.rollback()
@@ -1909,7 +1948,16 @@ def editar_gasto(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        gasto = session.query(GastoOperativo).filter(GastoOperativo.id == gasto_id).first()
+        gasto = (
+            session.query(GastoOperativo)
+            .options(
+                noload('*'),
+                selectinload(GastoOperativo.categoria_rel).options(noload('*')),
+                selectinload(GastoOperativo.banco_rel).options(noload('*')),
+            )
+            .filter(GastoOperativo.id == gasto_id)
+            .first()
+        )
         if not gasto:
             raise HTTPException(status_code=404, detail="Gasto no encontrado.")
 
@@ -1935,7 +1983,19 @@ def editar_gasto(
         _aplicar_impacto_gasto(session, gasto, categoria, current_user=current_user)
 
         session.commit()
-        session.refresh(gasto)
+        # expunge saca la instancia ya cargada del identity map -- sin esto, esta
+        # query nueva ignora sus options() y recarga con el lazy de clase igual.
+        session.expunge(gasto)
+        gasto = (
+            session.query(GastoOperativo)
+            .options(
+                noload('*'),
+                selectinload(GastoOperativo.categoria_rel).options(noload('*')),
+                selectinload(GastoOperativo.banco_rel).options(noload('*')),
+            )
+            .filter(GastoOperativo.id == gasto_id)
+            .first()
+        )
         return _build_gasto_out(gasto)
     except HTTPException:
         session.rollback()

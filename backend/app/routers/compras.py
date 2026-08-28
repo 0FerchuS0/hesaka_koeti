@@ -9,7 +9,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import String, case, cast, func, literal, or_
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import noload, selectinload
 
 from app.database import get_session_for_tenant
 from app.middleware.tenant import get_tenant_slug
@@ -69,20 +69,36 @@ logger = logging.getLogger(__name__)
 
 
 def _query_compra_detallada(session, compra_id: int) -> Optional[Compra]:
+    # Sin noload('*') en cada nivel, esta cadena de 5 niveles arrastra la red completa
+    # de Producto/Venta/Presupuesto/Cliente (todas lazy='selectin' por defecto) aunque
+    # solo se necesiten un puñado de nombres -- confirmado: 230 queries para 3 items.
     return (
         session.query(Compra)
         .options(
-            selectinload(Compra.proveedor_rel),
-            selectinload(Compra.items).selectinload(CompraDetalle.producto_rel),
-            selectinload(Compra.pagos).selectinload(PagoCompra.banco_rel),
-            selectinload(Compra.ventas_asociadas)
-            .selectinload(CompraVenta.venta_rel)
-            .selectinload(Venta.cliente_rel),
-            selectinload(Compra.ventas_asociadas)
-            .selectinload(CompraVenta.venta_rel)
-            .selectinload(Venta.presupuesto_rel)
-            .selectinload(Presupuesto.items)
-            .selectinload(PresupuestoItem.producto_rel),
+            noload('*'),
+            selectinload(Compra.proveedor_rel).options(noload('*')),
+            selectinload(Compra.items).options(
+                noload('*'),
+                selectinload(CompraDetalle.producto_rel).options(noload('*')),
+            ),
+            selectinload(Compra.pagos).options(
+                noload('*'),
+                selectinload(PagoCompra.banco_rel).options(noload('*')),
+            ),
+            selectinload(Compra.ventas_asociadas).options(
+                noload('*'),
+                selectinload(CompraVenta.venta_rel).options(
+                    noload('*'),
+                    selectinload(Venta.cliente_rel).options(noload('*')),
+                    selectinload(Venta.presupuesto_rel).options(
+                        noload('*'),
+                        selectinload(Presupuesto.items).options(
+                            noload('*'),
+                            selectinload(PresupuestoItem.producto_rel).options(noload('*')),
+                        ),
+                    ),
+                ),
+            ),
         )
         .filter(Compra.id == compra_id)
         .first()
@@ -645,29 +661,46 @@ def _anular_pago_compra(session, pago: PagoCompra):
     pago.estado = "ANULADO"
 
 
+def _opciones_pago_compra_detallado():
+    """Compra/Venta/Presupuesto/Cliente/Producto son todos lazy='selectin' por
+    defecto -- sin noload('*') en cada nivel de esta cadena de hasta 5 niveles,
+    cargar los pagos de un grupo arrastra toda esa red completa por cada pago."""
+    return (
+        noload('*'),
+        selectinload(PagoCompra.banco_rel).options(noload('*')),
+        selectinload(PagoCompra.compra_rel).options(
+            noload('*'),
+            selectinload(Compra.proveedor_rel).options(noload('*')),
+            selectinload(Compra.cliente_rel).options(noload('*')),
+            selectinload(Compra.venta_rel).options(
+                noload('*'),
+                selectinload(Venta.cliente_rel).options(noload('*')),
+            ),
+            selectinload(Compra.items).options(
+                noload('*'),
+                selectinload(CompraDetalle.presupuesto_item_rel).options(
+                    noload('*'),
+                    selectinload(PresupuestoItem.presupuesto_rel).options(
+                        noload('*'),
+                        selectinload(Presupuesto.cliente_rel).options(noload('*')),
+                    ),
+                ),
+            ),
+            selectinload(Compra.ventas_asociadas).options(
+                noload('*'),
+                selectinload(CompraVenta.venta_rel).options(
+                    noload('*'),
+                    selectinload(Venta.cliente_rel).options(noload('*')),
+                ),
+            ),
+        ),
+    )
+
+
 def _obtener_pagos_grupo(session, grupo_id: str) -> List[PagoCompra]:
     query = (
         session.query(PagoCompra)
-        .options(
-            selectinload(PagoCompra.compra_rel).selectinload(Compra.proveedor_rel),
-            selectinload(PagoCompra.banco_rel),
-            selectinload(PagoCompra.compra_rel).selectinload(Compra.cliente_rel),
-            selectinload(PagoCompra.compra_rel).selectinload(Compra.venta_rel).selectinload(Venta.cliente_rel),
-            selectinload(PagoCompra.compra_rel)
-            .selectinload(Compra.items)
-            .selectinload(CompraDetalle.presupuesto_item_rel)
-            .selectinload(PresupuestoItem.presupuesto_rel)
-            .selectinload(Presupuesto.cliente_rel),
-            selectinload(PagoCompra.compra_rel)
-            .selectinload(Compra.items)
-            .selectinload(CompraDetalle.presupuesto_item_rel)
-            .selectinload(PresupuestoItem.presupuesto_rel)
-            .selectinload(Presupuesto.venta_rel),
-            selectinload(PagoCompra.compra_rel)
-            .selectinload(Compra.ventas_asociadas)
-            .selectinload(CompraVenta.venta_rel)
-            .selectinload(Venta.cliente_rel),
-        )
+        .options(*_opciones_pago_compra_detallado())
         .filter(PagoCompra.estado == "ACTIVO")
     )
     if grupo_id.startswith("IND-"):
@@ -827,6 +860,18 @@ def _aplicar_pago_proveedor(session, proveedor_id: int, data: PagoProveedorCreat
 
 def _aplicar_items_compra(session, compra: Compra, items_data) -> dict[int, float]:
     costos_reales = {}
+
+    # Antes esto era un SELECT por item. Con una compra tipica de 3-5 items
+    # eso son varias consultas extra en el alta/edicion de compra, que es de
+    # las operaciones mas frecuentes del sistema. Se precarga en un solo
+    # IN(...) antes del loop.
+    producto_ids = {item_data.producto_id for item_data in items_data if item_data.producto_id}
+    productos_por_id = {}
+    if producto_ids:
+        productos_por_id = {
+            p.id: p for p in session.query(Producto).filter(Producto.id.in_(producto_ids)).all()
+        }
+
     for item_data in items_data:
         item = CompraDetalle(
             compra_id=compra.id,
@@ -842,7 +887,7 @@ def _aplicar_items_compra(session, compra: Compra, items_data) -> dict[int, floa
         session.add(item)
 
         if item_data.producto_id:
-            producto = session.query(Producto).filter(Producto.id == item_data.producto_id).first()
+            producto = productos_por_id.get(item_data.producto_id)
             if producto:
                 if producto.controla_stock:
                     producto.stock_actual = (producto.stock_actual or 0) + item_data.cantidad
@@ -890,11 +935,18 @@ def listar_ventas_pendientes_para_compra(
         query = (
             session.query(Venta)
             .options(
-                selectinload(Venta.cliente_rel),
-                selectinload(Venta.presupuesto_rel)
-                .selectinload(Presupuesto.items)
-                .selectinload(PresupuestoItem.producto_rel)
-                .selectinload(Producto.proveedor_rel),
+                noload('*'),
+                selectinload(Venta.cliente_rel).options(noload('*')),
+                selectinload(Venta.presupuesto_rel).options(
+                    noload('*'),
+                    selectinload(Presupuesto.items).options(
+                        noload('*'),
+                        selectinload(PresupuestoItem.producto_rel).options(
+                            noload('*'),
+                            selectinload(Producto.proveedor_rel).options(noload('*')),
+                        ),
+                    ),
+                ),
             )
             .filter(Venta.estado.notin_(["ANULADO", "ANULADA"]))
             .filter(Venta.estado_entrega == "EN_LABORATORIO")
@@ -1137,40 +1189,14 @@ def descargar_pago_proveedor_pdf(
             pago_id = int(grupo_id.replace("IND-", "", 1))
             pagos = (
                 session.query(PagoCompra)
-                .options(
-                    selectinload(PagoCompra.compra_rel).selectinload(Compra.proveedor_rel),
-                    selectinload(PagoCompra.compra_rel).selectinload(Compra.cliente_rel),
-                    selectinload(PagoCompra.compra_rel).selectinload(Compra.venta_rel).selectinload(Venta.cliente_rel),
-                    selectinload(PagoCompra.compra_rel)
-                    .selectinload(Compra.items)
-                    .selectinload(CompraDetalle.presupuesto_item_rel)
-                    .selectinload(PresupuestoItem.presupuesto_rel)
-                    .selectinload(Presupuesto.cliente_rel),
-                    selectinload(PagoCompra.compra_rel)
-                    .selectinload(Compra.ventas_asociadas)
-                    .selectinload(CompraVenta.venta_rel)
-                    .selectinload(Venta.cliente_rel),
-                )
+                .options(*_opciones_pago_compra_detallado())
                 .filter(PagoCompra.id == pago_id, PagoCompra.estado == "ACTIVO")
                 .all()
             )
         else:
             pagos = (
                 session.query(PagoCompra)
-                .options(
-                    selectinload(PagoCompra.compra_rel).selectinload(Compra.proveedor_rel),
-                    selectinload(PagoCompra.compra_rel).selectinload(Compra.cliente_rel),
-                    selectinload(PagoCompra.compra_rel).selectinload(Compra.venta_rel).selectinload(Venta.cliente_rel),
-                    selectinload(PagoCompra.compra_rel)
-                    .selectinload(Compra.items)
-                    .selectinload(CompraDetalle.presupuesto_item_rel)
-                    .selectinload(PresupuestoItem.presupuesto_rel)
-                    .selectinload(Presupuesto.cliente_rel),
-                    selectinload(PagoCompra.compra_rel)
-                    .selectinload(Compra.ventas_asociadas)
-                    .selectinload(CompraVenta.venta_rel)
-                    .selectinload(Venta.cliente_rel),
-                )
+                .options(*_opciones_pago_compra_detallado())
                 .filter(PagoCompra.lote_pago_id == grupo_id, PagoCompra.estado == "ACTIVO")
                 .all()
             )
@@ -1489,15 +1515,7 @@ def _construir_query_historial_pagos(
     )
 
     if include_options:
-        query = query.options(
-            selectinload(PagoCompra.compra_rel).selectinload(Compra.proveedor_rel),
-            selectinload(PagoCompra.compra_rel).selectinload(Compra.cliente_rel),
-            selectinload(PagoCompra.compra_rel).selectinload(Compra.venta_rel).selectinload(Venta.cliente_rel),
-            selectinload(PagoCompra.compra_rel)
-            .selectinload(Compra.ventas_asociadas)
-            .selectinload(CompraVenta.venta_rel)
-            .selectinload(Venta.cliente_rel),
-        )
+        query = query.options(*_opciones_pago_compra_detallado())
 
     if proveedor_id:
         query = query.filter(Compra.proveedor_id == proveedor_id)
@@ -1742,14 +1760,14 @@ def revertir_pago_proveedor(
             pago_id = int(grupo_id.replace("IND-", "", 1))
             pagos = (
                 session.query(PagoCompra)
-                .options(selectinload(PagoCompra.compra_rel))
+                .options(selectinload(PagoCompra.compra_rel).options(noload('*')))
                 .filter(PagoCompra.id == pago_id, PagoCompra.estado == "ACTIVO")
                 .all()
             )
         else:
             pagos = (
                 session.query(PagoCompra)
-                .options(selectinload(PagoCompra.compra_rel))
+                .options(selectinload(PagoCompra.compra_rel).options(noload('*')))
                 .filter(PagoCompra.lote_pago_id == grupo_id, PagoCompra.estado == "ACTIVO")
                 .all()
             )
@@ -1783,12 +1801,20 @@ def listar_compras(
         query = (
             session.query(Compra)
             .options(
-                selectinload(Compra.proveedor_rel),
-                selectinload(Compra.items).selectinload(CompraDetalle.producto_rel),
-                selectinload(Compra.pagos),
-                selectinload(Compra.ventas_asociadas)
-                .selectinload(CompraVenta.venta_rel)
-                .selectinload(Venta.cliente_rel),
+                noload('*'),
+                selectinload(Compra.proveedor_rel).options(noload('*')),
+                selectinload(Compra.items).options(
+                    noload('*'),
+                    selectinload(CompraDetalle.producto_rel).options(noload('*')),
+                ),
+                selectinload(Compra.pagos).options(noload('*')),
+                selectinload(Compra.ventas_asociadas).options(
+                    noload('*'),
+                    selectinload(CompraVenta.venta_rel).options(
+                        noload('*'),
+                        selectinload(Venta.cliente_rel).options(noload('*')),
+                    ),
+                ),
             )
         )
         if estado:
@@ -2020,7 +2046,9 @@ def editar_compra(
 
         for item in list(compra.items):
             if item.producto_id:
-                producto = session.query(Producto).filter(Producto.id == item.producto_id).first()
+                # producto_rel ya viene precargado (selectin) junto con compra.items,
+                # asi que esto no dispara un SELECT nuevo por item.
+                producto = item.producto_rel
                 if producto and producto.controla_stock:
                     producto.stock_actual = (producto.stock_actual or 0) - item.cantidad
             session.delete(item)
@@ -2080,7 +2108,11 @@ def editar_compra(
         _recalcular_estado_compra(session, compra)
 
         session.commit()
-        compra = _query_compra_detallada(session, compra.id)
+        # expunge saca la instancia ya cargada del identity map -- sin esto, la
+        # query de _query_compra_detallada ignora sus options() y recarga con el
+        # lazy='selectin' de clase igual (misma cascada que motivo el fix original).
+        session.expunge(compra)
+        compra = _query_compra_detallada(session, compra_id)
         return _serializar_compra(compra)
     except HTTPException:
         session.rollback()
@@ -2110,7 +2142,9 @@ def eliminar_compra(
 
         for item in list(compra.items):
             if item.producto_id:
-                producto = session.query(Producto).filter(Producto.id == item.producto_id).first()
+                # producto_rel ya viene precargado (selectin) junto con compra.items,
+                # asi que esto no dispara un SELECT nuevo por item.
+                producto = item.producto_rel
                 if producto and producto.controla_stock:
                     producto.stock_actual = (producto.stock_actual or 0) - item.cantidad
 
@@ -2240,7 +2274,12 @@ def registrar_pago_compra(
         _recalcular_estado_compra(session, compra)
 
         session.commit()
-        session.refresh(pago)
+        pago = (
+            session.query(PagoCompra)
+            .options(noload('*'), selectinload(PagoCompra.banco_rel).options(noload('*')))
+            .filter(PagoCompra.id == pago.id)
+            .first()
+        )
         return _serializar_pago_compra(pago)
     except HTTPException:
         session.rollback()
@@ -2260,7 +2299,7 @@ def eliminar_pago_compra(
     try:
         pago = (
             session.query(PagoCompra)
-            .options(selectinload(PagoCompra.compra_rel))
+            .options(selectinload(PagoCompra.compra_rel).options(noload('*')))
             .filter(PagoCompra.id == pago_id, PagoCompra.compra_id == compra_id)
             .first()
         )
@@ -2302,6 +2341,10 @@ def cambiar_estado_entrega(
         ventas = [rel.venta_rel for rel in compra.ventas_asociadas if rel.venta_rel]
         _actualizar_ventas_y_costos(session, ventas, {})
         session.commit()
+        # expire_on_commit deja compra.ventas_asociadas expirada -- accederla despues
+        # del commit sin recargar dispara el lazy='selectin' de clase (misma cascada).
+        session.expunge(compra)
+        compra = _query_compra_detallada(session, compra_id)
         return {
             "ok": True,
             "estado_entrega": compra.estado_entrega,

@@ -278,6 +278,9 @@ function PagoProveedorModal({ proveedor, onClose }) {
             queryClient.invalidateQueries({ queryKey: ['cxp-resumen'] })
             queryClient.invalidateQueries({ queryKey: ['cxp-contados-pendientes'] })
             queryClient.invalidateQueries({ queryKey: ['cxp-detalle-proveedor', proveedor.proveedor_id] })
+            // Sin esto el pago recien hecho no aparece en "Historial de pagos" hasta
+            // que otra accion no relacionada refresque esa cache.
+            queryClient.invalidateQueries({ queryKey: ['cxp-historial-pagos-listado'] })
             queryClient.invalidateQueries({ queryKey: ['compras'] })
             queryClient.invalidateQueries({ queryKey: ['bancos'] })
             queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })

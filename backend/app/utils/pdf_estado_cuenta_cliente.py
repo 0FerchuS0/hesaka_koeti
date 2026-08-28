@@ -7,6 +7,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.utils.pdf_branding import pie_pagina_hesaka
+
 
 def _fmt_gs(value):
     return f"Gs. {int(round(value or 0)):,}".replace(",", ".")
@@ -126,6 +128,7 @@ def generar_pdf_estado_cuenta_cliente(detalle, config, fecha_desde: date, fecha_
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
     story.append(movimientos_table)
+    story.extend(pie_pagina_hesaka())
 
     doc.build(story)
     buffer.seek(0)

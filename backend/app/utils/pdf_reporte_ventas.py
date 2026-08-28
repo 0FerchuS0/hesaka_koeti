@@ -8,6 +8,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 from app.utils.media_storage import resolve_logo_disk_path
 from app.utils.timezone import ahora_desde_config
+from app.utils.pdf_branding import pie_pagina_hesaka
 
 def generar_pdf_reporte_ventas(ventas_data, config, fecha_desde=None, fecha_hasta=None, 
                         total_comisiones_referidores=0.0, total_comisiones_bancarias=0.0) -> io.BytesIO:
@@ -257,15 +258,8 @@ def generar_pdf_reporte_ventas(ventas_data, config, fecha_desde=None, fecha_hast
     
     # Footer
     elements.append(Spacer(1, 1*cm))
-    footer_style = ParagraphStyle(
-        'Footer',
-        parent=styles['Normal'],
-        fontSize=8,
-        textColor=colors.HexColor('#95a5a6'),
-        alignment=TA_CENTER
-    )
-    elements.append(Paragraph("HESAKA Web - Sistema de Gestión", footer_style))
-    
+    elements.extend(pie_pagina_hesaka())
+
     doc.build(elements)
     buffer.seek(0)
     return buffer

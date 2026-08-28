@@ -93,6 +93,7 @@ export default function CategoriasPage() {
         onSuccess: () => {
             qc.invalidateQueries(['categorias'])
             qc.invalidateQueries(['productos'])
+            qc.invalidateQueries(['productos-optimizado'])
             setModal(null)
         }
     })
@@ -102,6 +103,7 @@ export default function CategoriasPage() {
         onSuccess: () => {
             qc.invalidateQueries(['categorias'])
             qc.invalidateQueries(['productos'])
+            qc.invalidateQueries(['productos-optimizado'])
             setModal(null)
         }
     })
@@ -111,6 +113,7 @@ export default function CategoriasPage() {
         onSuccess: () => {
             qc.invalidateQueries(['categorias'])
             qc.invalidateQueries(['productos'])
+            qc.invalidateQueries(['productos-optimizado'])
         }
     })
 

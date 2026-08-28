@@ -97,6 +97,7 @@ export default function VendedoresPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['vendedores-optimizado'] })
             queryClient.invalidateQueries({ queryKey: ['vendedores'] })
+            queryClient.invalidateQueries({ queryKey: ['ventas-vendedores-filtro'] })
             setModal(null)
         },
     })
@@ -106,6 +107,7 @@ export default function VendedoresPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['vendedores-optimizado'] })
             queryClient.invalidateQueries({ queryKey: ['vendedores'] })
+            queryClient.invalidateQueries({ queryKey: ['ventas-vendedores-filtro'] })
             setModal(null)
         },
     })
@@ -115,6 +117,7 @@ export default function VendedoresPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['vendedores-optimizado'] })
             queryClient.invalidateQueries({ queryKey: ['vendedores'] })
+            queryClient.invalidateQueries({ queryKey: ['ventas-vendedores-filtro'] })
         },
     })
 

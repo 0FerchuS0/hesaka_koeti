@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, noload
 
 from app.config import settings
 from app.models.models import CanalVenta, ConfiguracionEmpresa
@@ -69,10 +69,14 @@ def sincronizar_canal_principal(session: Session, config: ConfiguracionEmpresa, 
 
 
 def obtener_canal_principal(session: Session) -> Optional[CanalVenta]:
+    # Solo se usa canal.nombre en el caller (config-general/estado, pegado en casi
+    # toda pantalla) -- sin noload, CanalVenta arrastra sus colecciones de ventas y
+    # presupuestos (lazy='selectin'), que a su vez cascadean su propia red completa.
     config = session.query(ConfiguracionEmpresa).first()
     if config and (config.nombre or "").strip():
         canal = (
             session.query(CanalVenta)
+            .options(noload('*'))
             .filter(CanalVenta.nombre.ilike(config.nombre.strip()))
             .first()
         )
@@ -81,6 +85,7 @@ def obtener_canal_principal(session: Session) -> Optional[CanalVenta]:
 
     return (
         session.query(CanalVenta)
+        .options(noload('*'))
         .filter(CanalVenta.activo == True)
         .order_by(CanalVenta.id.asc())
         .first()

@@ -12,7 +12,7 @@ import { confirmarFechaAtrasada } from '../utils/confirmarFechaAtrasada'
 import { requestAndOpenPdf } from '../utils/fileDownloads'
 import { invalidateJornadaLiveData, useFinancialJornadaStatus } from '../hooks/useFinancialJornada'
 import { getWhatsappTemplateByCode, useActualizarWhatsappTemplate, useWhatsappTemplatesCatalog } from '../hooks/useWhatsappTemplates'
-import { parseBackendDateTime, toDateTimeLocalValue as toBusinessDateTimeLocalValue } from '../utils/formatters'
+import { normalizarTelefonoWhatsapp, parseBackendDateTime, toDateTimeLocalValue as toBusinessDateTimeLocalValue } from '../utils/formatters'
 import { markModuleFreshnessSeen, shouldForceModuleRefresh } from '../utils/moduleFreshness'
 import { formatGsAmount, normalizeGsInput, parseGsInput } from '../utils/currencyInputs'
 
@@ -64,18 +64,6 @@ const getErrorText = (err, fallback) => {
         return JSON.stringify(detail)
     }
     return fallback
-}
-
-function normalizarTelefonoWhatsapp(value) {
-    let digits = String(value || '').replace(/\D/g, '')
-    if (!digits) return ''
-    if (digits.startsWith('00')) digits = digits.slice(2)
-    if (digits.startsWith('59509')) digits = `595${digits.slice(4)}`
-    if (digits.startsWith('5950')) digits = `595${digits.slice(4)}`
-    if (digits.startsWith('09') && digits.length === 10) return `595${digits.slice(1)}`
-    if (digits.startsWith('9') && digits.length === 9) return `595${digits}`
-    if (digits.startsWith('5959') && digits.length === 12) return digits
-    return digits.startsWith('595') ? digits : ''
 }
 
 function getRetiroWhatsappTemplate() {
@@ -630,7 +618,6 @@ function CorregirFechaVentaModal({ venta, onClose, onBusyChange }) {
         mutationFn: payload => api.patch(`/ventas/${venta.id}/fecha`, payload),
         onSuccess: async () => {
             await Promise.all([
-                qc.invalidateQueries(['ventas']),
                 qc.invalidateQueries(['ventas-optimizado']),
                 qc.invalidateQueries(['presupuestos']),
             ])
@@ -801,7 +788,6 @@ function GestionPagosModal({ ventaId, onClose, onBusyChange }) {
     const refrescarEnSegundoPlano = () => {
         void qc.invalidateQueries({ queryKey: ['venta', ventaId], refetchType: 'active' })
         void qc.invalidateQueries({ queryKey: ['ventas-optimizado'], refetchType: 'active' })
-        void qc.invalidateQueries({ queryKey: ['ventas'], refetchType: 'active' })
         void qc.invalidateQueries({ queryKey: ['saldo-caja'], refetchType: 'active' })
         invalidateJornadaLiveData(qc)
     }
@@ -1232,10 +1218,7 @@ function VentasRowActions({ venta, onVerDetalle, onPagar, onVerFicha, onAjustar,
     const toggleEntrega = useMutation({
         mutationFn: estado => api.patch(`/ventas/${venta.id}/estado_entrega`, { estado_entrega: estado }),
         onSuccess: async () => {
-            await Promise.all([
-                qc.invalidateQueries(['ventas']),
-                qc.invalidateQueries(['ventas-optimizado'])
-            ])
+            await qc.invalidateQueries(['ventas-optimizado'])
         }
     })
     const whatsappBusy = whatsappBusyId === venta.id
@@ -1514,7 +1497,6 @@ export default function VentasPage() {
         mutationFn: id => api.post(`/ventas/${id}/anular`),
         onSuccess: async () => {
             await Promise.all([
-                qc.invalidateQueries(['ventas']),
                 qc.invalidateQueries(['ventas-optimizado']),
                 qc.invalidateQueries(['saldo-caja'])
             ])
@@ -1833,10 +1815,7 @@ export default function VentasPage() {
                         onClose={() => setVentaAjuste(null)}
                         onBusyChange={setVentaAjusteModalBusy}
                         onSaved={async () => {
-                            await Promise.all([
-                                qc.invalidateQueries(['ventas']),
-                                qc.invalidateQueries(['ventas-optimizado'])
-                            ])
+                            await qc.invalidateQueries(['ventas-optimizado'])
                             setVentaAjuste(null)
                         }}
                     />
@@ -1856,7 +1835,6 @@ export default function VentasPage() {
                         onBusyChange={setVentaCorreccionModalBusy}
                         onSaved={async () => {
                             await Promise.all([
-                                qc.invalidateQueries(['ventas']),
                                 qc.invalidateQueries(['ventas-optimizado']),
                                 qc.invalidateQueries(['presupuestos']),
                                 qc.invalidateQueries(['presupuestos-optimizado']),

@@ -389,6 +389,106 @@ function ItemRow({ item, idx, onUpdate, onRemove }) {
     )
 }
 
+// Campo de escaneo de codigo de barras: un lector fisico USB/Bluetooth escribe el
+// codigo y presiona Enter automaticamente, como si fuera un teclado. Si el producto
+// ya esta en el carrito suma cantidad; si no, agrega una fila nueva. El campo se
+// vacia y mantiene el foco despues de cada lectura para escanear en cadena sin clicks.
+function EscanerCodigoBarra({ items, setItems }) {
+    const [valor, setValor] = useState('')
+    const [error, setError] = useState('')
+    const [mensaje, setMensaje] = useState('')
+    const inputRef = useRef(null)
+    const mensajeTimeoutRef = useRef(null)
+
+    useEffect(() => () => clearTimeout(mensajeTimeoutRef.current), [])
+
+    const mostrarMensaje = texto => {
+        setMensaje(texto)
+        clearTimeout(mensajeTimeoutRef.current)
+        mensajeTimeoutRef.current = setTimeout(() => setMensaje(''), 2500)
+    }
+
+    const agregarProductoEscaneado = prod => {
+        const existenteIdx = items.findIndex(it => String(it.producto_id) === String(prod.id))
+        if (existenteIdx !== -1) {
+            const nuevaCantidad = (Number(items[existenteIdx].cantidad) || 1) + 1
+            setItems(prev => {
+                const copia = [...prev]
+                copia[existenteIdx] = sanitizeItemFinancials({ ...copia[existenteIdx], cantidad: nuevaCantidad })
+                return copia
+            })
+            mostrarMensaje(`+1 ${prod.nombre} (cant. ${nuevaCantidad})`)
+            return
+        }
+
+        let costoUnitario = Number(prod.costo || 0)
+        if (prod.costo_variable) {
+            const ingresado = window.prompt(`Ingrese el costo para ${prod.nombre}:`, String(costoUnitario || 0))
+            costoUnitario = ingresado === null ? 0 : (parseFloat(String(ingresado).replace(',', '.')) || 0)
+        }
+        setItems(prev => [
+            ...prev,
+            sanitizeItemFinancials({
+                producto_id: prod.id,
+                busq: prod.nombre,
+                cantidad: 1,
+                precio_unitario: prod.precio_venta,
+                costo_unitario: costoUnitario,
+                costo_variable: Boolean(prod.costo_variable),
+                descuento: 0,
+                subtotal: 0,
+            }),
+        ])
+        mostrarMensaje(`✓ Agregado: ${prod.nombre}`)
+    }
+
+    const handleKeyDown = async e => {
+        if (e.key !== 'Enter') return
+        e.preventDefault()
+        const term = valor.trim()
+        if (!term) return
+        setError('')
+        try {
+            const params = new URLSearchParams({ page: '1', page_size: '5', solo_activos: 'true', buscar: term })
+            const res = await api.get(`/productos/listado-optimizado?${params.toString()}`)
+            const coincidencias = res.data?.items || []
+            const exacto = coincidencias.find(m =>
+                (m.codigo_barra && String(m.codigo_barra).trim() === term)
+                || String(m.codigo || '').trim().toUpperCase() === term.toUpperCase()
+            )
+            if (!exacto) {
+                setError(`Codigo "${term}" no encontrado`)
+                return
+            }
+            agregarProductoEscaneado(exacto)
+        } catch {
+            setError('No se pudo buscar el producto. Verifica la conexion.')
+        } finally {
+            setValor('')
+            inputRef.current?.focus()
+        }
+    }
+
+    return (
+        <div style={{ marginBottom: 10 }}>
+            <div style={{ position: 'relative', maxWidth: 320 }}>
+                <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+                <input
+                    ref={inputRef}
+                    className="form-input"
+                    style={{ paddingLeft: 30 }}
+                    placeholder="Escanear codigo de barras..."
+                    value={valor}
+                    onChange={e => { setValor(e.target.value); setError('') }}
+                    onKeyDown={handleKeyDown}
+                />
+            </div>
+            {error && <div style={{ color: 'var(--danger)', fontSize: '0.78rem', marginTop: 4 }}>{error}</div>}
+            {mensaje && <div style={{ color: 'var(--success)', fontSize: '0.78rem', marginTop: 4 }}>{mensaje}</div>}
+        </div>
+    )
+}
+
 function KitRapidoSelect({ onSeleccionar }) {
     const { data: paquetes = [] } = useQuery({
         queryKey: ['paquetes-venta-todos'],
@@ -491,7 +591,6 @@ function ConvertirVentaModal({ presupuesto, onClose, onBusyChange }) {
             await Promise.all([
                 qc.invalidateQueries({ queryKey: ['presupuestos'] }),
                 qc.invalidateQueries({ queryKey: ['ventas-optimizado'] }),
-                qc.invalidateQueries({ queryKey: ['ventas'] }),
             ]).catch(() => {})
             markFlowStep(trace, 'tablas_actualizadas', 'Presupuestos y ventas actualizados')
             await waitForNextPaint()
@@ -685,7 +784,7 @@ function AsignacionComercialModal({ presupuesto, onClose, onBusyChange }) {
         mutationFn: payload => api.patch(`/presupuestos/${presupuesto.id}/asignacion-comercial`, payload),
         onSuccess: () => {
             qc.invalidateQueries(['presupuestos'])
-            qc.invalidateQueries(['ventas'])
+            qc.invalidateQueries(['ventas-optimizado'])
             onClose()
         },
         onError: err => {
@@ -768,7 +867,6 @@ function CorregirFechaPresupuestoModal({ presupuesto, onClose, onBusyChange }) {
         onSuccess: async () => {
             await Promise.all([
                 qc.invalidateQueries({ queryKey: ['presupuestos'] }),
-                qc.invalidateQueries({ queryKey: ['ventas'] }),
                 qc.invalidateQueries({ queryKey: ['ventas-optimizado'] }),
             ])
             onClose()
@@ -1345,6 +1443,7 @@ function NuevoPresupuestoModal({ onClose, presupuesto, onBusyChange }) {
                         <button type="button" className="btn btn-secondary btn-sm" onClick={addItem}><Plus size={14} /> Agregar ítem</button>
                     </div>
                 </div>
+                <EscanerCodigoBarra items={items} setItems={setItems} />
                 <div className="table-container">
                     <table>
                         <thead>

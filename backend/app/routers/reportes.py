@@ -1,17 +1,23 @@
 import json
+import re
+from collections import defaultdict
+
 from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, case
+from sqlalchemy import func, or_, case, values, column, Integer, Float
 from datetime import datetime, date, timedelta
 from typing import Optional, List
 from pydantic import BaseModel, Field
 
 from app.database import get_session_for_tenant
 from app.models.models import Banco, CanalVenta, Categoria, Cliente, ConfiguracionCaja, ConfiguracionEmpresa, DashboardCache, MovimientoBanco, MovimientoCaja, Pago, Vendedor, Venta, Compra, Presupuesto, PresupuestoItem, CompraDetalle, Producto
+from app.models.clinica_models import ConsultaOftalmologica
 from app.utils.auth import get_current_user
 from app.middleware.tenant import get_tenant_slug
 from app.utils.excel_reporte_finanzas import generar_excel_reporte_finanzas
+from app.utils.pdf_reporte_graduaciones import generar_pdf_reporte_graduaciones
+from app.utils.excel_reporte_graduaciones import generar_excel_reporte_graduaciones
 from app.utils.pdf_reporte_ventas import generar_pdf_reporte_ventas
 from app.utils.excel_reporte_ventas import generar_excel_reporte_ventas
 from app.utils.pdf_reporte_finanzas import generar_pdf_reporte_finanzas
@@ -185,36 +191,6 @@ class ComparativaVentasDashboardOut(BaseModel):
     ano_anterior: PeriodoComparativoVentasOut
 
 
-class ComparativoMensualFilaOut(BaseModel):
-    anio: int
-    mes_numero: int
-    mes: str
-    fecha_desde: datetime
-    fecha_hasta: datetime
-    cantidad_ventas: int
-    total_ventas: float
-    total_costos: float
-    utilidad_bruta: float
-    total_comisiones: float
-    utilidad_neta: float
-    ticket_promedio: float
-    variacion_vs_mes_anterior: Optional[float] = None
-    variacion_vs_mismo_mes_ano_anterior: Optional[float] = None
-
-
-class ComparativoMensualResumenOut(BaseModel):
-    anio: int
-    filas: List[ComparativoMensualFilaOut]
-    total_ventas: float
-    total_costos: float
-    utilidad_bruta_total: float
-    total_comisiones: float
-    utilidad_neta_total: float
-    promedio_mensual: float
-    mejor_mes: Optional[str] = None
-    peor_mes: Optional[str] = None
-
-
 class ReporteComparativoMensualFilaOut(BaseModel):
     mes_anio: str
     periodo_texto: str
@@ -233,6 +209,33 @@ class ReporteComparativoMensualOut(BaseModel):
     modo: str
     fecha_referencia: datetime
     filas: List[ReporteComparativoMensualFilaOut]
+
+
+class ReporteGraduacionDemandadaFilaOut(BaseModel):
+    esfera: float
+    cilindro: float
+    adicion: Optional[float] = None
+    recetadas: int
+    vendidas_aca: int
+    receta_externa: int
+    demanda_total: int
+    tasa_conversion: Optional[float] = None
+    porcentaje_total: float
+    es_terminado: bool
+
+
+class ReporteGraduacionesDemandadasOut(BaseModel):
+    filas: List[ReporteGraduacionDemandadaFilaOut]
+    matriz_esferas: List[float]
+    matriz_cilindros: List[float]
+    matriz_valores: List[List[int]]
+    matriz_esferas_progresivo: List[float]
+    matriz_adiciones: List[float]
+    matriz_valores_progresivo: List[List[int]]
+    total_unidades_analizadas: int
+    total_excluidas_sin_graduacion: int
+    porcentaje_demanda_terminado: float
+    porcentaje_demanda_laboratorio: float
 
 
 class DashboardSerieVentasOut(BaseModel):
@@ -396,8 +399,39 @@ def _build_compra_costos_por_item_sq(session: Session):
     )
 
 
-def _build_costos_por_venta_sq(session: Session, base_sq):
-    compra_costos_sq = _build_compra_costos_por_item_sq(session)
+def _materializar_costos_compra_por_item(session: Session):
+    """Ejecuta la agregacion de CompraDetalle (toda la historia, sin filtro de fecha)
+    UNA sola vez y devuelve las filas ya resueltas. Para reportes que llaman a
+    _obtener_metricas_ventas_periodo varias veces (ej. comparativo de 13 meses),
+    pasar el resultado como `costos_rows` evita recalcular este mismo agregado
+    -- identico en cada llamada, no depende del periodo -- una vez por cada periodo."""
+    filas = (
+        session.query(
+            CompraDetalle.presupuesto_item_id,
+            func.coalesce(func.sum(CompraDetalle.subtotal), 0.0).label("costo_real_total"),
+        )
+        .filter(CompraDetalle.presupuesto_item_id.isnot(None))
+        .group_by(CompraDetalle.presupuesto_item_id)
+        .all()
+    )
+    return [(fila.presupuesto_item_id, float(fila.costo_real_total or 0.0)) for fila in filas]
+
+
+def _build_costos_por_venta_sq(session: Session, base_sq, costos_rows=None):
+    if costos_rows is not None:
+        if costos_rows:
+            compra_costos_sq = (
+                values(
+                    column("presupuesto_item_id", Integer),
+                    column("costo_real_total", Float),
+                    name="costos_materializados",
+                )
+                .data(costos_rows)
+            )
+        else:
+            compra_costos_sq = _build_compra_costos_por_item_sq(session)
+    else:
+        compra_costos_sq = _build_compra_costos_por_item_sq(session)
     return (
         session.query(
             base_sq.c.venta_id.label("venta_id"),
@@ -423,9 +457,9 @@ def _build_costos_por_venta_sq(session: Session, base_sq):
     )
 
 
-def _obtener_metricas_ventas_periodo(session: Session, fecha_desde: datetime, fecha_hasta: datetime):
+def _obtener_metricas_ventas_periodo(session: Session, fecha_desde: datetime, fecha_hasta: datetime, costos_rows=None):
     base_sq = _construir_query_base_ventas(session, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta).subquery()
-    costos_sq = _build_costos_por_venta_sq(session, base_sq)
+    costos_sq = _build_costos_por_venta_sq(session, base_sq, costos_rows=costos_rows)
 
     comisiones_banco_sq = (
         session.query(
@@ -555,83 +589,6 @@ def _obtener_comparativa_dashboard(session: Session, historical_cache: dict | No
     )
 
 
-def _porcentaje_variacion(actual: float, base: float) -> Optional[float]:
-    if base in (None, 0):
-        return None
-    return float(((actual - base) / base) * 100.0)
-
-
-def _obtener_comparativo_mensual(session: Session, anio: int) -> ComparativoMensualResumenOut:
-    nombres_meses = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
-    filas: List[ComparativoMensualFilaOut] = []
-
-    for mes_numero in range(1, 13):
-        fecha_desde = datetime(anio, mes_numero, 1, 0, 0, 0)
-        if mes_numero == 12:
-            fecha_hasta = datetime(anio + 1, 1, 1, 0, 0, 0) - timedelta(microseconds=1)
-        else:
-            fecha_hasta = datetime(anio, mes_numero + 1, 1, 0, 0, 0) - timedelta(microseconds=1)
-
-        metricas = _obtener_metricas_ventas_periodo(session, fecha_desde, fecha_hasta)
-
-        if mes_numero == 1:
-            prev_desde = datetime(anio - 1, 12, 1, 0, 0, 0)
-            prev_hasta = datetime(anio, 1, 1, 0, 0, 0) - timedelta(microseconds=1)
-        else:
-            prev_desde = datetime(anio, mes_numero - 1, 1, 0, 0, 0)
-            prev_hasta = datetime(anio, mes_numero, 1, 0, 0, 0) - timedelta(microseconds=1)
-
-        anterior_metricas = _obtener_metricas_ventas_periodo(session, prev_desde, prev_hasta)
-
-        mismo_mes_ano_anterior_desde = datetime(anio - 1, mes_numero, 1, 0, 0, 0)
-        if mes_numero == 12:
-            mismo_mes_ano_anterior_hasta = datetime(anio, 1, 1, 0, 0, 0) - timedelta(microseconds=1)
-        else:
-            mismo_mes_ano_anterior_hasta = datetime(anio - 1, mes_numero + 1, 1, 0, 0, 0) - timedelta(microseconds=1)
-
-        ano_anterior_metricas = _obtener_metricas_ventas_periodo(session, mismo_mes_ano_anterior_desde, mismo_mes_ano_anterior_hasta)
-
-        filas.append(
-            ComparativoMensualFilaOut(
-                anio=anio,
-                mes_numero=mes_numero,
-                mes=nombres_meses[mes_numero - 1],
-                fecha_desde=fecha_desde,
-                fecha_hasta=fecha_hasta,
-                cantidad_ventas=metricas['cantidad_ventas'],
-                total_ventas=metricas['total_ventas'],
-                total_costos=metricas['total_costos'],
-                utilidad_bruta=metricas['utilidad_bruta'],
-                total_comisiones=metricas['total_comisiones'],
-                utilidad_neta=metricas['utilidad_neta'],
-                ticket_promedio=metricas['ticket_promedio'],
-                variacion_vs_mes_anterior=_porcentaje_variacion(metricas['total_ventas'], anterior_metricas['total_ventas']),
-                variacion_vs_mismo_mes_ano_anterior=_porcentaje_variacion(metricas['total_ventas'], ano_anterior_metricas['total_ventas']),
-            )
-        )
-
-    total_ventas = sum(f.total_ventas for f in filas)
-    total_costos = sum(f.total_costos for f in filas)
-    utilidad_bruta_total = sum(f.utilidad_bruta for f in filas)
-    total_comisiones = sum(f.total_comisiones for f in filas)
-    utilidad_neta_total = sum(f.utilidad_neta for f in filas)
-    promedio_mensual = total_ventas / 12 if filas else 0.0
-
-    mejor_mes = max(filas, key=lambda f: f.total_ventas).mes if filas else None
-    peor_mes = min(filas, key=lambda f: f.total_ventas).mes if filas else None
-
-    return ComparativoMensualResumenOut(
-        anio=anio,
-        filas=filas,
-        total_ventas=float(total_ventas),
-        total_costos=float(total_costos),
-        utilidad_bruta_total=float(utilidad_bruta_total),
-        total_comisiones=float(total_comisiones),
-        utilidad_neta_total=float(utilidad_neta_total),
-        promedio_mensual=float(promedio_mensual),
-        mejor_mes=mejor_mes,
-        peor_mes=peor_mes,
-    )
 
 
 def _get_date_range_comparativo(fecha_referencia: datetime, months_back: int, modo: str):
@@ -683,10 +640,11 @@ def _get_date_range_comparativo(fecha_referencia: datetime, months_back: int, mo
 
 def _obtener_reporte_comparativo_mensual(session: Session, fecha_referencia: datetime, modo: str) -> ReporteComparativoMensualOut:
     filas: List[ReporteComparativoMensualFilaOut] = []
+    costos_rows = _materializar_costos_compra_por_item(session)
 
     for i in range(13):
         start_date, end_date, period_text = _get_date_range_comparativo(fecha_referencia, i, modo)
-        metricas = _obtener_metricas_ventas_periodo(session, start_date, end_date)
+        metricas = _obtener_metricas_ventas_periodo(session, start_date, end_date, costos_rows=costos_rows)
 
         filas.append(
             ReporteComparativoMensualFilaOut(
@@ -2434,6 +2392,382 @@ def exportar_reporte_trabajos_laboratorio_pdf(
             pdf_buffer,
             media_type="application/pdf",
             headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_trabajos_laboratorio", fecha_desde, fecha_hasta)}"'},
+        )
+    finally:
+        session.close()
+
+
+# --- Graduaciones más demandadas (compra de stock de cristales terminados) ---
+
+_NUM_RE = re.compile(r'^[+-]?\d+(\.\d+)?$')
+
+VENTA_ESTADOS_ANULADOS = ('ANULADA', 'ANULADO')
+
+
+def _parse_graduacion_valor(raw) -> Optional[float]:
+    """Solo acepta numero directo con signo opcional -- coma o punto como
+    separador decimal son la misma cosa (-0,25 == -0.25), se normaliza antes
+    de validar. Cualquier otra cosa (PLANO, BALANCE, placeholders tipo
+    '-- --') se considera dato invalido -- decision de negocio, no se
+    intenta salvar."""
+    if raw is None:
+        return None
+    texto = str(raw).strip().replace(',', '.')
+    if not _NUM_RE.match(texto):
+        return None
+    return float(texto)
+
+
+def _parse_cilindro_valor(raw) -> Optional[float]:
+    """El cilindro vacio/nulo es un dato VALIDO (sin astigmatismo, 0.00) --
+    muchas recetas de lectura/progresivos son esfera + adicion sin cilindro.
+    Texto basura (PLANO, BALANCE, '-- --') sigue siendo invalido: eso no es
+    'vacio', es un valor mal cargado."""
+    if raw is None:
+        return 0.0
+    texto = str(raw).strip()
+    if texto == '':
+        return 0.0
+    return _parse_graduacion_valor(raw)
+
+
+def _clasificar_tipo_lente_material(material_lente: Optional[str]) -> Optional[str]:
+    """Mismo criterio que parseRecommendationState en ClinicaPage.jsx:
+    material_lente es texto libre con tokens MONOFOCAL/BIFOCAL/MULTIFOCAL-PROGRESIVO."""
+    texto = (material_lente or '').upper()
+    if 'MULTIFOCAL' in texto or 'PROGRESIVO' in texto:
+        return 'MULTIFOCAL_PROGRESIVO'
+    if 'BIFOCAL' in texto:
+        return 'BIFOCAL'
+    if 'MONOFOCAL' in texto:
+        return 'MONOFOCAL'
+    return None
+
+
+def _transponer_a_cilindro_negativo(esfera: float, cilindro: float):
+    if cilindro > 0:
+        return esfera + cilindro, -cilindro
+    return esfera, cilindro
+
+
+def _redondear_paso(valor: float, paso: float) -> float:
+    if not paso:
+        return round(valor, 2)
+    return round(round(valor / paso) * paso, 4)
+
+
+def _rango_pasos(inicio: float, fin: float, paso: float) -> List[float]:
+    cantidad = round((fin - inicio) / paso)
+    return [round(inicio + i * paso, 4) for i in range(cantidad + 1)]
+
+
+def _meses_atras(fecha: date, meses: int) -> date:
+    mes_total = fecha.month - 1 - meses
+    anio = fecha.year + mes_total // 12
+    mes = mes_total % 12 + 1
+    dia = min(fecha.day, 28)
+    return date(anio, mes, dia)
+
+
+def _obtener_datos_reporte_graduaciones(
+    session: Session,
+    fecha_desde: date,
+    fecha_hasta: date,
+    tipo_lente: str,
+    esfera_max: float,
+    cilindro_min: float,
+    adicion_min: float,
+    adicion_max: float,
+    paso: float,
+    incluir_fuera_de_rango: bool,
+) -> ReporteGraduacionesDemandadasOut:
+    tipo_lente = (tipo_lente or 'MONOFOCAL').upper()
+    dt_desde = datetime.combine(fecha_desde, datetime.min.time())
+    dt_hasta = datetime.combine(fecha_hasta, datetime.max.time())
+
+    # Clave (esfera, cilindro, adicion). adicion=None cuando no hay adicion
+    # cargada. Progresivos/lectura terminados = adicion presente + cilindro
+    # 0 (sin astigmatismo). Si ademas hay cilindro real, es esfera+cil+add ->
+    # requiere laboratorio, nunca es candidato a stock terminado.
+    grupos: dict = defaultdict(lambda: {'cat1': 0, 'cat2': 0, 'cat3': 0})
+    total_excluidas = 0
+    total_analizadas = 0
+
+    def _registrar(esfera_raw, cilindro_raw, adicion_raw, categoria: str, tipo_lente_unidad: Optional[str]):
+        nonlocal total_excluidas, total_analizadas
+        esfera = _parse_graduacion_valor(esfera_raw)
+        cilindro = _parse_cilindro_valor(cilindro_raw)
+        if esfera is None or cilindro is None:
+            total_excluidas += 1
+            return
+        if tipo_lente != 'TODOS':
+            if tipo_lente_unidad is None:
+                # Sin dato de diseno de lente (ventas sin consulta no tienen
+                # material_lente, y adicion presente NO implica multifocal --
+                # un monofocal de cerca/lectura tambien lleva adicion). Se
+                # incluye en la vista Monofocal en vez de descartarse; solo se
+                # excluye de vistas Bifocal/Multifocal donde si hace falta
+                # evidencia real de que lo es.
+                if tipo_lente != 'MONOFOCAL':
+                    return
+            elif tipo_lente_unidad != tipo_lente:
+                return
+        total_analizadas += 1
+        adicion = _parse_graduacion_valor(adicion_raw)
+        tiene_adicion = adicion is not None and adicion != 0
+        if tiene_adicion and cilindro == 0:
+            # Progresivo/lectura terminado: esfera + adicion solamente, no se
+            # transpone (no hay cilindro que transponer).
+            esfera_norm = _redondear_paso(esfera, paso)
+            cilindro_norm = 0.0
+            adicion_norm = _redondear_paso(adicion, paso)
+        else:
+            esfera_norm, cilindro_norm = _transponer_a_cilindro_negativo(esfera, cilindro)
+            esfera_norm = _redondear_paso(esfera_norm, paso)
+            cilindro_norm = _redondear_paso(cilindro_norm, paso)
+            adicion_norm = _redondear_paso(adicion, paso) if tiene_adicion else None
+        grupos[(esfera_norm, cilindro_norm, adicion_norm)][categoria] += 1
+
+    # --- Pase 1: consultas oftalmologicas del periodo -> Cat.1 / Cat.2 ---
+    consultas = (
+        session.query(ConsultaOftalmologica)
+        .filter(ConsultaOftalmologica.fecha >= dt_desde, ConsultaOftalmologica.fecha <= dt_hasta)
+        .all()
+    )
+    ventas_cubiertas = set()
+    if consultas:
+        consulta_ids = [c.id for c in consultas]
+        presupuestos = (
+            session.query(Presupuesto)
+            .filter(
+                Presupuesto.consulta_clinica_id.in_(consulta_ids),
+                Presupuesto.consulta_clinica_tipo == 'OFTALMOLOGIA',
+            )
+            .all()
+        )
+        presupuestos_por_consulta = defaultdict(list)
+        for p in presupuestos:
+            presupuestos_por_consulta[p.consulta_clinica_id].append(p)
+
+        ventas_por_presupuesto = defaultdict(list)
+        presupuesto_ids = [p.id for p in presupuestos]
+        if presupuesto_ids:
+            ventas_validas = (
+                session.query(Venta)
+                .filter(
+                    Venta.presupuesto_id.in_(presupuesto_ids),
+                    Venta.estado.notin_(VENTA_ESTADOS_ANULADOS),
+                )
+                .all()
+            )
+            for v in ventas_validas:
+                ventas_por_presupuesto[v.presupuesto_id].append(v)
+
+        for consulta in consultas:
+            tipo_material = _clasificar_tipo_lente_material(consulta.material_lente)
+            tiene_venta = False
+            for p in presupuestos_por_consulta.get(consulta.id, []):
+                for v in ventas_por_presupuesto.get(p.id, []):
+                    tiene_venta = True
+                    ventas_cubiertas.add(v.id)
+            categoria = 'cat1' if tiene_venta else 'cat2'
+            _registrar(consulta.ref_od_esfera, consulta.ref_od_cilindro, consulta.ref_od_adicion, categoria, tipo_material)
+            _registrar(consulta.ref_oi_esfera, consulta.ref_oi_cilindro, consulta.ref_oi_adicion, categoria, tipo_material)
+
+    # --- Pase 2: ventas del periodo no cubiertas por el pase 1 -> Cat.3 ---
+    ventas_periodo = (
+        session.query(Venta)
+        .filter(
+            Venta.fecha >= dt_desde,
+            Venta.fecha <= dt_hasta,
+            Venta.estado.notin_(VENTA_ESTADOS_ANULADOS),
+        )
+        .all()
+    )
+    ventas_pendientes = [v for v in ventas_periodo if v.id not in ventas_cubiertas]
+    presupuesto_ids_pendientes = [v.presupuesto_id for v in ventas_pendientes if v.presupuesto_id]
+    presupuestos_map = {}
+    if presupuesto_ids_pendientes:
+        for p in session.query(Presupuesto).filter(Presupuesto.id.in_(presupuesto_ids_pendientes)).all():
+            presupuestos_map[p.id] = p
+
+    for venta in ventas_pendientes:
+        presupuesto = presupuestos_map.get(venta.presupuesto_id) if venta.presupuesto_id else None
+        if presupuesto is None:
+            total_excluidas += 2  # sin presupuesto -> sin graduacion disponible (OD + OI)
+            continue
+        # Presupuesto no tiene campo de diseno de lente -> tipo desconocido
+        # (ver _registrar: se incluye en la vista Monofocal, no se descarta).
+        _registrar(presupuesto.graduacion_od_esfera, presupuesto.graduacion_od_cilindro, presupuesto.graduacion_od_adicion, 'cat3', None)
+        _registrar(presupuesto.graduacion_oi_esfera, presupuesto.graduacion_oi_cilindro, presupuesto.graduacion_oi_adicion, 'cat3', None)
+
+    # --- Filas del ranking ---
+    demanda_total_general = sum(g['cat1'] + g['cat2'] + g['cat3'] for g in grupos.values())
+    filas: List[ReporteGraduacionDemandadaFilaOut] = []
+    for (esfera, cilindro, adicion), cont in grupos.items():
+        recetadas = cont['cat1'] + cont['cat2']
+        vendidas_aca = cont['cat1']
+        receta_externa = cont['cat3']
+        demanda_total = recetadas + receta_externa
+        if adicion is not None and cilindro != 0:
+            # Esfera + cilindro + adicion: requiere laboratorio siempre,
+            # nunca es candidato a cristal terminado.
+            es_terminado = False
+        elif adicion is not None:
+            es_terminado = (-esfera_max <= esfera <= esfera_max) and (adicion_min <= adicion <= adicion_max)
+        else:
+            es_terminado = (-esfera_max <= esfera <= esfera_max) and (cilindro_min <= cilindro <= 0)
+        if not incluir_fuera_de_rango and not es_terminado:
+            continue
+        filas.append(ReporteGraduacionDemandadaFilaOut(
+            esfera=esfera,
+            cilindro=cilindro,
+            adicion=adicion,
+            recetadas=recetadas,
+            vendidas_aca=vendidas_aca,
+            receta_externa=receta_externa,
+            demanda_total=demanda_total,
+            tasa_conversion=(vendidas_aca / recetadas) if recetadas else None,
+            porcentaje_total=(demanda_total / demanda_total_general * 100) if demanda_total_general else 0.0,
+            es_terminado=es_terminado,
+        ))
+    filas.sort(key=lambda f: f.demanda_total, reverse=True)
+
+    demanda_terminado = sum(f.demanda_total for f in filas if f.es_terminado)
+    porcentaje_terminado = (demanda_terminado / demanda_total_general * 100) if demanda_total_general else 0.0
+
+    # --- Matriz principal esfera x cilindro (agrega todas las adiciones) ---
+    matriz_ec: dict = defaultdict(lambda: {'cat1': 0, 'cat2': 0, 'cat3': 0})
+    # --- Matriz secundaria esfera x adicion (solo progresivos/lectura terminados: cilindro=0) ---
+    matriz_ea: dict = defaultdict(lambda: {'cat1': 0, 'cat2': 0, 'cat3': 0})
+    for (esfera, cilindro, adicion), cont in grupos.items():
+        for k in ('cat1', 'cat2', 'cat3'):
+            matriz_ec[(esfera, cilindro)][k] += cont[k]
+        if adicion is not None and cilindro == 0:
+            for k in ('cat1', 'cat2', 'cat3'):
+                matriz_ea[(esfera, adicion)][k] += cont[k]
+
+    matriz_esferas = _rango_pasos(-esfera_max, esfera_max, paso)
+    matriz_cilindros = _rango_pasos(cilindro_min, 0, paso)
+    matriz_valores = []
+    for esfera in matriz_esferas:
+        fila_matriz = []
+        for cilindro in matriz_cilindros:
+            cont = matriz_ec.get((esfera, cilindro))
+            fila_matriz.append((cont['cat1'] + cont['cat2'] + cont['cat3']) if cont else 0)
+        matriz_valores.append(fila_matriz)
+
+    matriz_esferas_progresivo = _rango_pasos(-esfera_max, esfera_max, paso)
+    matriz_adiciones = _rango_pasos(adicion_min, adicion_max, paso)
+    matriz_valores_progresivo = []
+    for esfera in matriz_esferas_progresivo:
+        fila_matriz = []
+        for adicion in matriz_adiciones:
+            cont = matriz_ea.get((esfera, adicion))
+            fila_matriz.append((cont['cat1'] + cont['cat2'] + cont['cat3']) if cont else 0)
+        matriz_valores_progresivo.append(fila_matriz)
+
+    return ReporteGraduacionesDemandadasOut(
+        filas=filas,
+        matriz_esferas=matriz_esferas,
+        matriz_cilindros=matriz_cilindros,
+        matriz_valores=matriz_valores,
+        matriz_esferas_progresivo=matriz_esferas_progresivo,
+        matriz_adiciones=matriz_adiciones,
+        matriz_valores_progresivo=matriz_valores_progresivo,
+        total_unidades_analizadas=total_analizadas,
+        total_excluidas_sin_graduacion=total_excluidas,
+        porcentaje_demanda_terminado=round(porcentaje_terminado, 2),
+        porcentaje_demanda_laboratorio=round(100 - porcentaje_terminado, 2) if demanda_total_general else 0.0,
+    )
+
+
+@router.get("/graduaciones-demandadas", response_model=ReporteGraduacionesDemandadasOut)
+def obtener_reporte_graduaciones_demandadas(
+    fecha_desde: Optional[date] = Query(None),
+    fecha_hasta: Optional[date] = Query(None),
+    tipo_lente: str = Query("MONOFOCAL"),
+    esfera_max: float = Query(6.0),
+    cilindro_min: float = Query(-2.0),
+    adicion_min: float = Query(0.75),
+    adicion_max: float = Query(3.5),
+    paso: float = Query(0.25),
+    incluir_fuera_de_rango: bool = Query(True),
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        hoy = fecha_actual_negocio(session)
+        fecha_hasta = fecha_hasta or hoy
+        fecha_desde = fecha_desde or _meses_atras(fecha_hasta, 6)
+        return _obtener_datos_reporte_graduaciones(
+            session, fecha_desde, fecha_hasta, tipo_lente, esfera_max, cilindro_min, adicion_min, adicion_max, paso, incluir_fuera_de_rango
+        )
+    finally:
+        session.close()
+
+
+@router.get("/graduaciones-demandadas/pdf")
+def exportar_reporte_graduaciones_pdf(
+    fecha_desde: Optional[date] = Query(None),
+    fecha_hasta: Optional[date] = Query(None),
+    tipo_lente: str = Query("MONOFOCAL"),
+    esfera_max: float = Query(6.0),
+    cilindro_min: float = Query(-2.0),
+    adicion_min: float = Query(0.75),
+    adicion_max: float = Query(3.5),
+    paso: float = Query(0.25),
+    incluir_fuera_de_rango: bool = Query(True),
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        hoy = fecha_actual_negocio(session)
+        fecha_hasta = fecha_hasta or hoy
+        fecha_desde = fecha_desde or _meses_atras(fecha_hasta, 6)
+        datos = _obtener_datos_reporte_graduaciones(
+            session, fecha_desde, fecha_hasta, tipo_lente, esfera_max, cilindro_min, adicion_min, adicion_max, paso, incluir_fuera_de_rango
+        )
+        config = session.query(ConfiguracionEmpresa).first()
+        pdf_buffer = generar_pdf_reporte_graduaciones(datos, config, fecha_desde, fecha_hasta, tipo_lente)
+        return StreamingResponse(
+            pdf_buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{_build_report_filename("reporte_graduaciones_demandadas", fecha_desde, fecha_hasta)}"'},
+        )
+    finally:
+        session.close()
+
+
+@router.get("/graduaciones-demandadas/excel")
+def exportar_reporte_graduaciones_excel(
+    fecha_desde: Optional[date] = Query(None),
+    fecha_hasta: Optional[date] = Query(None),
+    tipo_lente: str = Query("MONOFOCAL"),
+    esfera_max: float = Query(6.0),
+    cilindro_min: float = Query(-2.0),
+    adicion_min: float = Query(0.75),
+    adicion_max: float = Query(3.5),
+    paso: float = Query(0.25),
+    incluir_fuera_de_rango: bool = Query(True),
+    tenant_slug: str = Depends(get_tenant_slug),
+    current_user=Depends(get_current_user),
+):
+    session = get_session_for_tenant(tenant_slug)
+    try:
+        hoy = fecha_actual_negocio(session)
+        fecha_hasta = fecha_hasta or hoy
+        fecha_desde = fecha_desde or _meses_atras(fecha_hasta, 6)
+        datos = _obtener_datos_reporte_graduaciones(
+            session, fecha_desde, fecha_hasta, tipo_lente, esfera_max, cilindro_min, adicion_min, adicion_max, paso, incluir_fuera_de_rango
+        )
+        excel_buffer = generar_excel_reporte_graduaciones(datos, fecha_desde, fecha_hasta, tipo_lente)
+        return StreamingResponse(
+            excel_buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{_build_report_filename("reporte_graduaciones_demandadas", fecha_desde, fecha_hasta, "xlsx")}"'},
         )
     finally:
         session.close()

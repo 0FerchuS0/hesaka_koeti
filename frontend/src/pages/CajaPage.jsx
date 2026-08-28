@@ -42,6 +42,9 @@ function TransferenciaInternaModal({ onClose }) {
             qc.invalidateQueries({ queryKey: ['bancos'] })
             qc.invalidateQueries({ queryKey: ['saldo-caja'] })
             qc.invalidateQueries({ queryKey: ['movimientos-caja'] })
+            // Sin esto, el detalle de movimientos del banco de origen/destino
+            // no muestra la transferencia recien hecha hasta otro refresco.
+            qc.invalidateQueries({ queryKey: ['movimientos-banco'] })
             qc.invalidateQueries({ queryKey: ['reportes-finanzas'] })
             invalidateJornadaLiveData(qc)
             onClose()

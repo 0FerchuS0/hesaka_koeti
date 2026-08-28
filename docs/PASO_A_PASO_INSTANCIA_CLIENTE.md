@@ -88,6 +88,28 @@ Guardar estos datos del PostgreSQL nuevo:
 - `PGPASSWORD`
 - `PGDATABASE`
 
+### Agregar un Volume para el logo y archivos subidos
+
+El filesystem del contenedor de Railway es efimero: se borra en cada redeploy
+o reinicio. Si no se configura un Volume, el logo del cliente (y cualquier
+otro archivo subido) desaparece la primera vez que se vuelve a desplegar el
+servicio.
+
+Pasos:
+
+1. En el proyecto del cliente, click derecho sobre el servicio del backend
+   (`hesaka-koeti`) → **Attach Volume**
+2. Mount path: `/data/media`
+3. En la pestaña **Variables** del mismo servicio, agregar:
+   - `MEDIA_ROOT=/data/media`
+4. Railway va a redeployar automaticamente al guardar la variable
+5. Volver a subir el logo del cliente despues de este paso (si ya se habia
+   subido antes de crear el Volume, ese archivo se perdio y hay que
+   resubirlo)
+
+Sin este paso, el logo "funciona una o dos veces y despues se rompe" en
+realidad se rompe en cada redeploy, no despues de N usos.
+
 ---
 
 ## 4. Configurar el backend del cliente
@@ -179,6 +201,7 @@ Antes de mostrar al cliente:
 - no existen datos de otra óptica
 - login administrador funciona
 - frontend y backend están conectados
+- Volume de Railway conectado y `MEDIA_ROOT` configurado (logo sobrevive un redeploy)
 - backup inicial realizado
 
 ---

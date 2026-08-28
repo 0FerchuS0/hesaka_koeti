@@ -7,6 +7,8 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.utils.pdf_branding import pie_pagina_hesaka
+
 
 def _fmt_gs(value):
     return f"Gs. {int(value or 0):,}".replace(",", ".")
@@ -114,6 +116,7 @@ def generar_pdf_reporte_compras(resumen, compras_data, config, fecha_desde: date
         ("ALIGN", (4, 1), (-1, -1), "CENTER"),
     ]))
     story.append(detalle_table)
+    story.extend(pie_pagina_hesaka())
 
     doc.build(story)
     buffer.seek(0)

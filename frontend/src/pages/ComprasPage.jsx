@@ -11,7 +11,7 @@ import { exportReportBlob } from '../utils/reportExports'
 import { hasActionAccess } from '../utils/roles'
 import { invalidateJornadaLiveData, useFinancialJornadaStatus } from '../hooks/useFinancialJornada'
 import { getWhatsappTemplateByCode, useActualizarWhatsappTemplate, useWhatsappTemplatesCatalog } from '../hooks/useWhatsappTemplates'
-import { parseBackendDateTime, toDateInputValue } from '../utils/formatters'
+import { normalizarTelefonoWhatsapp, parseBackendDateTime, toDateInputValue } from '../utils/formatters'
 import { formatGsAmount, normalizeGsInput, parseGsInput } from '../utils/currencyInputs'
 import { completeTrackedFlow, failTrackedFlow, markFlowStep, startTrackedFlow, waitForNextPaint } from '../utils/performanceMonitor'
 
@@ -60,36 +60,6 @@ const COMPRA_FLOW_OPTIONS = [
     },
 ]
 
-function normalizarTelefonoWhatsapp(value) {
-    let digits = String(value || '').replace(/\D/g, '')
-    if (!digits) return ''
-
-    if (digits.startsWith('00')) {
-        digits = digits.slice(2)
-    }
-
-    if (digits.startsWith('59509')) {
-        digits = `595${digits.slice(4)}`
-    }
-
-    if (digits.startsWith('5950')) {
-        digits = `595${digits.slice(4)}`
-    }
-
-    if (digits.startsWith('09') && digits.length === 10) {
-        return `595${digits.slice(1)}`
-    }
-
-    if (digits.startsWith('9') && digits.length === 9) {
-        return `595${digits}`
-    }
-
-    if (digits.startsWith('5959') && digits.length === 12) {
-        return digits
-    }
-
-    return digits.startsWith('595') ? digits : ''
-}
 
 function getRetiroWhatsappTemplate() {
     if (typeof window === 'undefined') return DEFAULT_RETIRO_WHATSAPP_TEMPLATE
@@ -789,7 +759,29 @@ function CompraFormModal({ compraId = null, onClose, onWhatsappReady = null, ini
             }
             await queryClient.invalidateQueries({ queryKey: ['compras'] })
             await queryClient.invalidateQueries({ queryKey: ['compras-optimizado'] })
+            if (!editando && ventasSeleccionadas.length) {
+                const ventasProcesadas = new Set(ventasSeleccionadas.map(venta => venta.venta_id))
+                // Remove completed client orders immediately instead of leaving stale rows in the selector.
+                queryClient.setQueriesData({ queryKey: ['compras-ventas-pendientes'] }, current => (
+                    Array.isArray(current) ? current.filter(venta => !ventasProcesadas.has(venta.venta_id)) : current
+                ))
+            }
+            await queryClient.invalidateQueries({ queryKey: ['compras-ventas-pendientes'] })
             if (editando) await queryClient.invalidateQueries({ queryKey: ['compra-detalle', compraId] })
+            // Cuentas por Pagar usa sus propias claves de cache (cxp-*) y no las
+            // invalida esta pantalla -- sin esto, corregir el nro. de factura (o
+            // cualquier otro dato) de una compra deja el numero viejo visible ahi
+            // hasta que otra accion no relacionada refresque esa pagina.
+            // refetchType 'active': solo si esa pantalla esta abierta ahora mismo,
+            // para no gastar un fetch de mas si nadie la esta viendo.
+            queryClient.invalidateQueries({ queryKey: ['cxp-resumen'], refetchType: 'active' })
+            queryClient.invalidateQueries({ queryKey: ['cxp-contados-pendientes'], refetchType: 'active' })
+            if (proveedor) {
+                queryClient.invalidateQueries({
+                    queryKey: ['cxp-detalle-proveedor', parseInt(proveedor, 10)],
+                    refetchType: 'active',
+                })
+            }
             onClose()
             const whatsappContext = response?.data?.whatsapp_retiro
             if (!editando && estadoEntrega === 'RECIBIDO' && whatsappContext?.cliente_telefono) {
@@ -1394,6 +1386,11 @@ export default function ComprasPage() {
             queryClient.invalidateQueries({ queryKey: ['saldo-caja'] })
             queryClient.invalidateQueries({ queryKey: ['movimientos-caja'] })
             queryClient.invalidateQueries({ queryKey: ['bancos'] })
+            // Mismo motivo que en la mutation de crear/editar: si la compra borrada
+            // tenia saldo pendiente a credito, Cuentas por Pagar seguia mostrando
+            // esa deuda porque esta pantalla no invalidaba sus claves cxp-*.
+            queryClient.invalidateQueries({ queryKey: ['cxp-resumen'], refetchType: 'active' })
+            queryClient.invalidateQueries({ queryKey: ['cxp-contados-pendientes'], refetchType: 'active' })
             invalidateJornadaLiveData(queryClient)
         },
         onSettled: () => {

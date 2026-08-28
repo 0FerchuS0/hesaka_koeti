@@ -8,6 +8,7 @@ from math import ceil
 import re
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import noload, selectinload
 from app.database import get_session_for_tenant
 from app.models.models import (
     Venta, Presupuesto, PresupuestoItem, Pago,
@@ -238,14 +239,25 @@ def _registrar_en_caja(
     grupo_pago_id: Optional[str] = None,
     fecha: Optional[datetime] = None,
     current_user=None,
+    jornada=None,
+    caja=None,
 ):
-    """Registra un ingreso de efectivo en caja, actualizando el saldo."""
-    jornada = require_jornada_abierta_para_fecha(session, fecha, accion="registrar un cobro", current_user=current_user)
-    caja = session.query(ConfiguracionCaja).first()
-    if not caja:
-        caja = ConfiguracionCaja(id=1, saldo_actual=0.0)
-        session.add(caja)
-        session.flush()
+    """Registra un ingreso de efectivo en caja, actualizando el saldo.
+
+    `jornada`/`caja` son opcionales: si el caller ya los resolvio (ej. un
+    loop que registra varios cobros con la MISMA fecha, como cobro-multiple),
+    se los puede pasar ya resueltos para no repetir la validacion de jornada
+    ni el SELECT de caja en cada iteracion -- ambos dan siempre el mismo
+    resultado dentro de un mismo lote porque comparten fecha.
+    """
+    if jornada is None:
+        jornada = require_jornada_abierta_para_fecha(session, fecha, accion="registrar un cobro", current_user=current_user)
+    if caja is None:
+        caja = session.query(ConfiguracionCaja).first()
+        if not caja:
+            caja = ConfiguracionCaja(id=1, saldo_actual=0.0)
+            session.add(caja)
+            session.flush()
     saldo_ant = caja.saldo_actual
     caja.saldo_actual += monto
     mov = MovimientoCaja(
@@ -375,10 +387,18 @@ def _procesar_pago(session, pago: Pago, venta_codigo: str, current_user=None):
             _registrar_comision_tarjeta(session, pago.banco_id, pago.monto, venta_codigo, pago.id, fecha=pago.fecha, current_user=current_user)
 
 
-def _revertir_pago(session, pago: Pago, venta_codigo: str):
-    """Deshace todos los movimientos financieros asociados a un pago."""
+def _revertir_pago(session, pago: Pago, venta_codigo: str, jornada=None):
+    """Deshace todos los movimientos financieros asociados a un pago.
+
+    `jornada`: opcional, para cuando el caller ya la resolvio (ej. un loop
+    que revierte varios pagos de una misma venta/grupo). Esta validacion
+    siempre mira la jornada de HOY (no la fecha original de cada pago), asi
+    que da el mismo resultado sin importar cuantos pagos se esten revirtiendo
+    ni de que fecha sea cada uno -- repetirla por pago es redundante.
+    """
     from app.models.models import GastoOperativo
-    require_jornada_abierta(session)
+    if jornada is None:
+        jornada = require_jornada_abierta(session)
 
     # Revertir movimientos banco vinculados a este pago
     movs_banco = session.query(MovimientoBanco).filter(
@@ -549,6 +569,50 @@ def _clonar_presupuesto_para_correccion(
 
 # ─── Presupuestos ──────────────────────────────────────────────────────────────
 
+def _opciones_presupuesto_completo():
+    """Carga exactamente lo que _build_presupuesto_out necesita (items.producto_rel,
+    cliente, referidor, vendedor, canal) sin arrastrar el resto de relaciones de
+    Presupuesto (grupo_rel, venta_rel) ni la propia red lazy='selectin' de Cliente/
+    Producto (ventas, categorias, comisiones...) -- sin estos noload('*'), cargar un
+    Presupuesto dispara esa cascada entera aunque solo se necesiten 5 nombres."""
+    return (
+        noload('*'),
+        selectinload(Presupuesto.items).options(
+            noload('*'),
+            selectinload(PresupuestoItem.producto_rel).options(noload('*')),
+        ),
+        selectinload(Presupuesto.cliente_rel).options(noload('*')),
+        selectinload(Presupuesto.referidor_rel).options(noload('*')),
+        selectinload(Presupuesto.vendedor_rel).options(noload('*')),
+        selectinload(Presupuesto.canal_venta_rel).options(noload('*')),
+    )
+
+
+def _opciones_ajuste_venta_acotadas():
+    """Carga lo que _serializar_ajuste necesita (venta.cliente_rel) sin arrastrar el
+    resto de la red de Venta/Cliente."""
+    return (
+        noload('*'),
+        selectinload(AjusteVenta.venta_rel).options(
+            noload('*'),
+            selectinload(Venta.cliente_rel).options(noload('*')),
+        ),
+    )
+
+
+def _opciones_correccion_venta_acotadas():
+    """Carga lo que _serializar_correccion_venta necesita (venta_origen.cliente_rel,
+    presupuesto_nuevo) sin arrastrar el resto de esa red."""
+    return (
+        noload('*'),
+        selectinload(CorreccionVentaCerrada.venta_origen_rel).options(
+            noload('*'),
+            selectinload(Venta.cliente_rel).options(noload('*')),
+        ),
+        selectinload(CorreccionVentaCerrada.presupuesto_nuevo_rel).options(noload('*')),
+    )
+
+
 def _build_presupuesto_out(p):
     """Construye PresupuestoOut con todos los campos calculados: cliente_nombre, referidor_nombre, producto_nombre por ítem."""
     items = []
@@ -620,7 +684,7 @@ def listar_presupuestos(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        q = session.query(Presupuesto)
+        q = session.query(Presupuesto).options(*_opciones_presupuesto_completo())
         if cliente_id:
             q = q.filter(Presupuesto.cliente_id == cliente_id)
         if estado:
@@ -773,7 +837,18 @@ def convertir_presupuesto_a_venta(
 
     session = get_session_for_tenant(tenant_slug)
     try:
-        pre = session.query(Presupuesto).filter(Presupuesto.id == pre_id).first()
+        pre = (
+            session.query(Presupuesto)
+            .options(
+                noload('*'),
+                selectinload(Presupuesto.items).options(
+                    noload('*'),
+                    selectinload(PresupuestoItem.producto_rel).options(noload('*')),
+                ),
+            )
+            .filter(Presupuesto.id == pre_id)
+            .first()
+        )
         if not pre:
             raise HTTPException(status_code=404, detail="Presupuesto no encontrado.")
         if pre.estado == "VENDIDO":
@@ -831,7 +906,17 @@ def convertir_presupuesto_a_venta(
             _procesar_pago(session, pago, codigo, current_user=current_user)
 
         session.commit()
-        session.refresh(venta)
+        venta = (
+            session.query(Venta)
+            .options(
+                noload('*'),
+                selectinload(Venta.cliente_rel).options(noload('*')),
+                selectinload(Venta.vendedor_rel).options(noload('*')),
+                selectinload(Venta.canal_venta_rel).options(noload('*')),
+            )
+            .filter(Venta.id == venta.id)
+            .first()
+        )
         vo = VentaOut.model_validate(venta)
         vo.cliente_nombre = venta.cliente_rel.nombre if venta.cliente_rel else None
         vo.vendedor_nombre = venta.vendedor_rel.nombre if venta.vendedor_rel else None
@@ -851,7 +936,7 @@ def convertir_presupuesto_a_venta(
 def obtener_presupuesto(pre_id: int, tenant_slug: str = Depends(get_tenant_slug), current_user=Depends(get_current_user)):
     session = get_session_for_tenant(tenant_slug)
     try:
-        p = session.query(Presupuesto).filter(Presupuesto.id == pre_id).first()
+        p = session.query(Presupuesto).options(*_opciones_presupuesto_completo()).filter(Presupuesto.id == pre_id).first()
         if not p:
             raise HTTPException(status_code=404, detail="Presupuesto no encontrado.")
         return _build_presupuesto_out(p)
@@ -883,10 +968,19 @@ def crear_presupuesto(data: PresupuestoCreate, tenant_slug: str = Depends(get_te
         session.add(presupuesto)
         session.flush()
 
+        # Snapshot del costo actual de cada producto al momento de crear el
+        # presupuesto -- antes era un SELECT por item, precargado ahora en un
+        # solo IN(...).
+        producto_ids = {item_d.producto_id for item_d in items_data if item_d.producto_id}
+        productos_por_id = {}
+        if producto_ids:
+            productos_por_id = {
+                p.id: p for p in session.query(Producto).filter(Producto.id.in_(producto_ids)).all()
+            }
+
         total = 0.0
         for item_d in items_data:
-            # Snapshot del costo actual del producto al momento de crear el presupuesto
-            prod = session.query(Producto).filter(Producto.id == item_d.producto_id).first()
+            prod = productos_por_id.get(item_d.producto_id)
             costo = prod.costo if prod and prod.costo else 0.0
 
             item_dict = item_d.model_dump()
@@ -898,7 +992,16 @@ def crear_presupuesto(data: PresupuestoCreate, tenant_slug: str = Depends(get_te
 
         presupuesto.total = total
         session.commit()
-        session.refresh(presupuesto)
+        # session.refresh() no respeta .options() de la query original: expire_on_commit
+        # (default de SQLAlchemy) marca las relaciones como expiradas, y al recargarlas
+        # usa el lazy='selectin' de clase -- vuelve a disparar la cascada completa.
+        # Se vuelve a consultar con las opciones acotadas en vez de refrescar in-place.
+        presupuesto = (
+            session.query(Presupuesto)
+            .options(*_opciones_presupuesto_completo())
+            .filter(Presupuesto.id == presupuesto.id)
+            .first()
+        )
         return _build_presupuesto_out(presupuesto)
     except HTTPException:
         session.rollback()
@@ -925,7 +1028,7 @@ def cambiar_estado_presupuesto(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        p = session.query(Presupuesto).filter(Presupuesto.id == pre_id).first()
+        p = session.query(Presupuesto).options(noload('*')).filter(Presupuesto.id == pre_id).first()
         if not p:
             raise HTTPException(status_code=404, detail="Presupuesto no encontrado.")
         p.estado = estado
@@ -939,7 +1042,15 @@ def cambiar_estado_presupuesto(
 def eliminar_presupuesto(pre_id: int, tenant_slug: str = Depends(get_tenant_slug), current_user=Depends(get_current_user)):
     session = get_session_for_tenant(tenant_slug)
     try:
-        p = session.query(Presupuesto).filter(Presupuesto.id == pre_id).first()
+        # items debe seguir cargado (aunque sin cascadear a producto_rel etc.): el
+        # cascade="all, delete-orphan" de Presupuesto.items necesita la coleccion en
+        # memoria para saber que filas de PresupuestoItem borrar junto con el padre.
+        p = (
+            session.query(Presupuesto)
+            .options(noload('*'), selectinload(Presupuesto.items).options(noload('*')))
+            .filter(Presupuesto.id == pre_id)
+            .first()
+        )
         if not p:
             raise HTTPException(status_code=404, detail="Presupuesto no encontrado.")
         if p.estado == "VENDIDO":
@@ -956,7 +1067,12 @@ def eliminar_presupuesto(pre_id: int, tenant_slug: str = Depends(get_tenant_slug
 def editar_presupuesto(pre_id: int, data: PresupuestoCreate, tenant_slug: str = Depends(get_tenant_slug), current_user=Depends(get_current_user)):
     session = get_session_for_tenant(tenant_slug)
     try:
-        p = session.query(Presupuesto).filter(Presupuesto.id == pre_id).first()
+        p = (
+            session.query(Presupuesto)
+            .options(*_opciones_presupuesto_completo())
+            .filter(Presupuesto.id == pre_id)
+            .first()
+        )
         if not p:
             raise HTTPException(status_code=404, detail="Presupuesto no encontrado.")
         if p.estado == "VENDIDO":
@@ -976,13 +1092,20 @@ def editar_presupuesto(pre_id: int, data: PresupuestoCreate, tenant_slug: str = 
         for k, v in pres_dict.items():
             setattr(p, k, v)
 
-        # Reemplazar ítems
+        # Reemplazar ítems -- costo de cada producto precargado en un solo
+        # IN(...) en vez de un SELECT por item.
+        producto_ids = {item_d.producto_id for item_d in items_data if item_d.producto_id}
+        productos_por_id = {}
+        if producto_ids:
+            productos_por_id = {
+                p2.id: p2 for p2 in session.query(Producto).filter(Producto.id.in_(producto_ids)).all()
+            }
 
         total = 0.0
         existentes = {item.id: item for item in p.items}
         enviados_ids = set()
         for item_d in items_data:
-            prod = session.query(Producto).filter(Producto.id == item_d.producto_id).first()
+            prod = productos_por_id.get(item_d.producto_id)
             costo = prod.costo if prod and prod.costo else 0.0
             item_dict = item_d.model_dump()
             item_dict["costo_unitario"] = item_dict.get("costo_unitario") if item_dict.get("costo_unitario") is not None else costo
@@ -1013,7 +1136,14 @@ def editar_presupuesto(pre_id: int, data: PresupuestoCreate, tenant_slug: str = 
 
         p.total = total
         session.commit()
-        session.refresh(p)
+        p_id = p.id
+        session.expunge(p)
+        p = (
+            session.query(Presupuesto)
+            .options(*_opciones_presupuesto_completo())
+            .filter(Presupuesto.id == p_id)
+            .first()
+        )
         return _build_presupuesto_out(p)
     except HTTPException:
         session.rollback()
@@ -1040,7 +1170,12 @@ def listar_ventas(
 ):
     session = get_session_for_tenant(tenant_slug)
     try:
-        q = session.query(Venta)
+        q = session.query(Venta).options(
+            noload('*'),
+            selectinload(Venta.cliente_rel).options(noload('*')),
+            selectinload(Venta.vendedor_rel).options(noload('*')),
+            selectinload(Venta.canal_venta_rel).options(noload('*')),
+        )
         if estado:
             q = q.filter(Venta.estado == estado)
         if cliente_id:
@@ -1141,7 +1276,25 @@ def corregir_fecha_venta(
                 presupuesto_relacionado.fecha = fecha_actualizada
 
         session.commit()
-        session.refresh(venta)
+        # expunge es imprescindible: si no, la instancia ya identity-mapeada (cargada
+        # antes del commit) ignora las options() de esta query nueva y recarga sus
+        # relaciones con el lazy='selectin' de clase -- misma cascada, confirmado con
+        # medicion real (258 queries sin expunge vs. 6 con expunge). El id se captura
+        # ANTES de expunge: despues del expunge el objeto queda detached y leer un
+        # atributo expirado (incluido el id) revienta con DetachedInstanceError.
+        venta_id = venta.id
+        session.expunge(venta)
+        venta = (
+            session.query(Venta)
+            .options(
+                noload('*'),
+                selectinload(Venta.cliente_rel).options(noload('*')),
+                selectinload(Venta.vendedor_rel).options(noload('*')),
+                selectinload(Venta.canal_venta_rel).options(noload('*')),
+            )
+            .filter(Venta.id == venta_id)
+            .first()
+        )
 
         venta_out = VentaOut.model_validate(venta)
         venta_out.cliente_nombre = venta.cliente_rel.nombre if venta.cliente_rel else None
@@ -1263,9 +1416,13 @@ def revertir_grupo_pago(
             raise HTTPException(status_code=404, detail="Grupo de pagos no encontrado.")
 
         # 1. Revertir individualmente si hubo movimientos ligados a pago.id (Caja)
+        # La jornada que valida _revertir_pago es siempre la de HOY (momento de
+        # la reversion), no la fecha original de cada pago -- se resuelve una
+        # sola vez para todo el grupo en vez de repetirla por pago.
+        jornada_reversion = require_jornada_abierta(session)
         for p in pagos:
             venta = p.venta_rel
-            _revertir_pago(session, p, venta.codigo)
+            _revertir_pago(session, p, venta.codigo, jornada=jornada_reversion)
             venta.saldo += p.monto
             venta.estado = "PENDIENTE"
             session.delete(p)
@@ -1318,7 +1475,14 @@ def corregir_fecha_presupuesto(
                 venta_relacionada.fecha = fecha_actualizada
 
         session.commit()
-        session.refresh(presupuesto)
+        presupuesto_id = presupuesto.id
+        session.expunge(presupuesto)
+        presupuesto = (
+            session.query(Presupuesto)
+            .options(*_opciones_presupuesto_completo())
+            .filter(Presupuesto.id == presupuesto_id)
+            .first()
+        )
         return _build_presupuesto_out(presupuesto)
     finally:
         session.close()
@@ -1360,7 +1524,14 @@ def actualizar_asignacion_comercial_presupuesto(
             venta.canal_venta_id = canal_venta_id
 
         session.commit()
-        session.refresh(p)
+        p_id = p.id
+        session.expunge(p)
+        p = (
+            session.query(Presupuesto)
+            .options(*_opciones_presupuesto_completo())
+            .filter(Presupuesto.id == p_id)
+            .first()
+        )
         return _build_presupuesto_out(p)
     finally:
         session.close()
@@ -1475,7 +1646,28 @@ def listar_ventas_optimizado(
 def obtener_venta(venta_id: int, tenant_slug: str = Depends(get_tenant_slug), current_user=Depends(get_current_user)):
     session = get_session_for_tenant(tenant_slug)
     try:
-        v = session.query(Venta).filter(Venta.id == venta_id).first()
+        v = (
+            session.query(Venta)
+            .options(
+                noload('*'),
+                selectinload(Venta.cliente_rel).options(noload('*')),
+                selectinload(Venta.vendedor_rel).options(noload('*')),
+                selectinload(Venta.canal_venta_rel).options(noload('*')),
+                selectinload(Venta.pagos).options(
+                    noload('*'),
+                    selectinload(Pago.banco_rel).options(noload('*')),
+                ),
+                selectinload(Venta.presupuesto_rel).options(
+                    noload('*'),
+                    selectinload(Presupuesto.items).options(
+                        noload('*'),
+                        selectinload(PresupuestoItem.producto_rel).options(noload('*')),
+                    ),
+                ),
+            )
+            .filter(Venta.id == venta_id)
+            .first()
+        )
         if not v:
             raise HTTPException(status_code=404, detail="Venta no encontrada.")
         vo = VentaOut.model_validate(v)
@@ -1593,7 +1785,17 @@ def crear_venta(data: VentaCreate, tenant_slug: str = Depends(get_tenant_slug), 
             _procesar_pago(session, pago, codigo, current_user=current_user)
 
         session.commit()
-        session.refresh(venta)
+        venta = (
+            session.query(Venta)
+            .options(
+                noload('*'),
+                selectinload(Venta.cliente_rel).options(noload('*')),
+                selectinload(Venta.vendedor_rel).options(noload('*')),
+                selectinload(Venta.canal_venta_rel).options(noload('*')),
+            )
+            .filter(Venta.id == venta.id)
+            .first()
+        )
         vo = VentaOut.model_validate(venta)
         vo.cliente_nombre = venta.cliente_rel.nombre if venta.cliente_rel else None
         vo.vendedor_nombre = venta.vendedor_rel.nombre if venta.vendedor_rel else None
@@ -1650,7 +1852,9 @@ def registrar_pago(
         venta.estado = "PAGADO" if venta.saldo == 0 else "PENDIENTE"
 
         session.commit()
-        session.refresh(pago)
+        # attribute_names acota el refresh a columnas propias -- Pago.venta_rel/banco_rel
+        # son lazy='selectin' y PagoOut no los necesita (banco_nombre no se completa aca).
+        session.refresh(pago, attribute_names=["id", "fecha", "monto", "metodo_pago", "banco_id", "nota", "grupo_pago_id"])
         return PagoOut.model_validate(pago)
     except HTTPException:
         session.rollback()
@@ -1718,10 +1922,12 @@ def anular_venta(
         if venta.estado == "ANULADA":
             raise HTTPException(status_code=400, detail="La venta ya está anulada.")
 
-        # 1. Revertir todos los pagos
+        # 1. Revertir todos los pagos -- misma razon que en anular_grupo_pago:
+        # la jornada validada es siempre la de HOY, se resuelve una sola vez.
         pagos = session.query(Pago).filter(Pago.venta_id == venta_id).all()
+        jornada_reversion = require_jornada_abierta(session)
         for pago in pagos:
-            _revertir_pago(session, pago, venta.codigo)
+            _revertir_pago(session, pago, venta.codigo, jornada=jornada_reversion)
             session.delete(pago)
 
         # 2. Eliminar comisiones
@@ -1734,9 +1940,15 @@ def anular_venta(
             items = session.query(PresupuestoItem).filter(
                 PresupuestoItem.presupuesto_id == venta.presupuesto_id
             ).all()
+            producto_ids = {item.producto_id for item in items if item.producto_id}
+            productos_por_id = {}
+            if producto_ids:
+                productos_por_id = {
+                    p.id: p for p in session.query(Producto).filter(Producto.id.in_(producto_ids)).all()
+                }
             for item in items:
                 if item.producto_id:
-                    prod = session.query(Producto).filter(Producto.id == item.producto_id).first()
+                    prod = productos_por_id.get(item.producto_id)
                     if prod and prod.stock_actual is not None and prod.controla_stock:
                         prod.stock_actual += item.cantidad
 
@@ -1948,7 +2160,18 @@ def registrar_cobro_multiple(
     try:
         grupo_id = str(uuid.uuid4())
         fecha_pago = normalizar_fecha_negocio(session, data.fecha)
-        require_jornada_abierta_para_fecha(session, fecha_pago, accion="registrar un cobro", current_user=current_user)
+        # El formulario de cobro multiple tiene una sola fecha para todo el lote
+        # (PagoMultipleCreate.fecha; los items no tienen fecha propia), asi que
+        # esta validacion da siempre el mismo resultado para cada item de abajo --
+        # se resuelve una sola vez y se reusa en el loop en vez de repetirla.
+        jornada_lote = require_jornada_abierta_para_fecha(session, fecha_pago, accion="registrar un cobro", current_user=current_user)
+        caja_lote = None
+        if data.metodo_pago == "EFECTIVO":
+            caja_lote = session.query(ConfiguracionCaja).first()
+            if not caja_lote:
+                caja_lote = ConfiguracionCaja(id=1, saldo_actual=0.0)
+                session.add(caja_lote)
+                session.flush()
         pagos_orm = []
         total_acumulado = 0.0
 
@@ -1980,7 +2203,7 @@ def registrar_cobro_multiple(
 
             # Si es EFECTIVO, registramos movimiento individual en caja (como hacía el legacy)
             if data.metodo_pago == "EFECTIVO":
-                _registrar_en_caja(session, item.monto, f"Cobro Múltiple - Venta {venta.codigo}", pago.id, fecha=fecha_pago, current_user=current_user)
+                _registrar_en_caja(session, item.monto, f"Cobro Múltiple - Venta {venta.codigo}", pago.id, fecha=fecha_pago, current_user=current_user, jornada=jornada_lote, caja=caja_lote)
 
         # Si es BANCO, registramos UN SOLO movimiento agrupado
         if data.metodo_pago in ("TRANSFERENCIA", "TARJETA"):
@@ -2090,7 +2313,12 @@ def crear_ajuste_venta(
         _actualizar_estado_venta_por_saldo(venta)
 
         session.commit()
-        session.refresh(ajuste)
+        ajuste = (
+            session.query(AjusteVenta)
+            .options(*_opciones_ajuste_venta_acotadas())
+            .filter(AjusteVenta.id == ajuste.id)
+            .first()
+        )
         return _serializar_ajuste(ajuste)
     except HTTPException:
         session.rollback()
@@ -2145,10 +2373,17 @@ def corregir_venta_cerrada(
         )
 
         if data.devolver_stock_original:
-            for item in venta.presupuesto_rel.items or []:
+            items_correccion = venta.presupuesto_rel.items or []
+            producto_ids = {item.producto_id for item in items_correccion if item.producto_id}
+            productos_por_id = {}
+            if producto_ids:
+                productos_por_id = {
+                    p.id: p for p in session.query(Producto).filter(Producto.id.in_(producto_ids)).all()
+                }
+            for item in items_correccion:
                 if not item.producto_id:
                     continue
-                producto = session.query(Producto).filter(Producto.id == item.producto_id).first()
+                producto = productos_por_id.get(item.producto_id)
                 if producto and producto.stock_actual is not None and producto.controla_stock:
                     producto.stock_actual += int(item.cantidad or 0)
 
@@ -2170,7 +2405,12 @@ def corregir_venta_cerrada(
         )
         session.add(correccion)
         session.commit()
-        session.refresh(correccion)
+        correccion = (
+            session.query(CorreccionVentaCerrada)
+            .options(*_opciones_correccion_venta_acotadas())
+            .filter(CorreccionVentaCerrada.id == correccion.id)
+            .first()
+        )
         return _serializar_correccion_venta(correccion)
     except HTTPException:
         session.rollback()
@@ -2230,7 +2470,14 @@ def editar_ajuste_venta(
         ajuste.tipo = data.tipo
 
         session.commit()
-        session.refresh(ajuste)
+        ajuste_id = ajuste.id
+        session.expunge(ajuste)
+        ajuste = (
+            session.query(AjusteVenta)
+            .options(*_opciones_ajuste_venta_acotadas())
+            .filter(AjusteVenta.id == ajuste_id)
+            .first()
+        )
         return _serializar_ajuste(ajuste)
     except HTTPException:
         session.rollback()

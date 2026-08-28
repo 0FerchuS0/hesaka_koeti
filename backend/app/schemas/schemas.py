@@ -259,6 +259,7 @@ class MarcaCreate(BaseModel):
 class ProductoOut(BaseModel):
     id: int
     codigo: str
+    codigo_barra: Optional[str] = None
     nombre: str
     codigo_fabricante: Optional[str]
     marca_id: Optional[int] = None
@@ -285,6 +286,7 @@ class ProductoOut(BaseModel):
 class ProductoListItemOut(BaseModel):
     id: int
     codigo: str
+    codigo_barra: Optional[str] = None
     nombre: str
     codigo_fabricante: Optional[str] = None
     marca_id: Optional[int] = None
@@ -311,6 +313,7 @@ class ProductoListResponseOut(BaseModel):
 
 class ProductoCreate(BaseModel):
     codigo: Optional[str] = None
+    codigo_barra: Optional[str] = None
     nombre: str
     codigo_fabricante: Optional[str] = None
     marca_id: Optional[int] = None
@@ -341,6 +344,14 @@ class ProductoCreate(BaseModel):
     @classmethod
     def normalizar_codigo_fabricante(cls, value: Optional[str]) -> Optional[str]:
         return value.strip().upper() if value else value
+
+    @field_validator("codigo_barra")
+    @classmethod
+    def normalizar_codigo_barra(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
     @field_validator("marca")
     @classmethod
@@ -1941,6 +1952,15 @@ class ClinicaPacienteCreateIn(BaseModel):
     referidor_id: Optional[int] = None
     antecedentes_oculares: Optional[str] = None
     notas: Optional[str] = None
+    # Si el usuario confirmo que este paciente ES un cliente existente (candidato
+    # sugerido en la pantalla de creacion), se vincula desde el arranque.
+    cliente_id: Optional[int] = None
+
+
+class ClinicaConvertirClienteIn(BaseModel):
+    # Si se manda, vincula el paciente a este cliente ya existente en vez de
+    # crear uno nuevo (usado cuando el usuario confirma un candidato sugerido).
+    cliente_id: Optional[int] = None
 
 
 class ClinicaPacienteUpdateIn(BaseModel):
@@ -1969,8 +1989,19 @@ class ClinicaConsultaHistorialOut(BaseModel):
     material_lente: Optional[str] = None
     marca_recomendada: Optional[str] = None
     fecha_control: Optional[date] = None
+    observaciones: Optional[str] = None
     anamnesis_id: Optional[int] = None
     anamnesis_resumen: Optional[str] = None
+    # Graduacion (solo se completa para tipo=OFTALMOLOGIA) - usada en el panel
+    # de historial dentro de la ventana de consulta nueva.
+    ref_od_esfera: Optional[str] = None
+    ref_od_cilindro: Optional[str] = None
+    ref_od_eje: Optional[str] = None
+    ref_od_adicion: Optional[str] = None
+    ref_oi_esfera: Optional[str] = None
+    ref_oi_cilindro: Optional[str] = None
+    ref_oi_eje: Optional[str] = None
+    ref_oi_adicion: Optional[str] = None
 
 
 class ClinicaRecetaMedicamentoDetalleHistorialOut(BaseModel):

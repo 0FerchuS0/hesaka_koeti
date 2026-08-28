@@ -85,6 +85,7 @@ export default function CanalesVentaPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['canales-venta-optimizado'] })
             queryClient.invalidateQueries({ queryKey: ['canales-venta'] })
+            queryClient.invalidateQueries({ queryKey: ['ventas-canales-filtro'] })
             setModal(null)
         },
     })
@@ -94,6 +95,7 @@ export default function CanalesVentaPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['canales-venta-optimizado'] })
             queryClient.invalidateQueries({ queryKey: ['canales-venta'] })
+            queryClient.invalidateQueries({ queryKey: ['ventas-canales-filtro'] })
             setModal(null)
         },
     })
@@ -103,6 +105,7 @@ export default function CanalesVentaPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['canales-venta-optimizado'] })
             queryClient.invalidateQueries({ queryKey: ['canales-venta'] })
+            queryClient.invalidateQueries({ queryKey: ['ventas-canales-filtro'] })
         },
     })
 

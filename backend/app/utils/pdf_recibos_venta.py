@@ -9,6 +9,7 @@ from reportlab.platypus import Paragraph
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_RIGHT
 from app.utils.media_storage import resolve_logo_disk_path
+from app.utils.pdf_branding import dibujar_pie_pagina_hesaka
 
 def fmt_gs(monto):
     try:
@@ -111,7 +112,8 @@ def generar_recibo_pago_individual(pago, venta, cliente, config) -> io.BytesIO:
     c.setFont("Helvetica-Oblique", 8)
     c.setFillColorRGB(0.5, 0.5, 0.5)
     c.drawCentredString(width/2, 1.5*cm, "Gracias por su preferencia")
-    
+    dibujar_pie_pagina_hesaka(c, width)
+
     c.save()
     buffer.seek(0)
     return buffer
@@ -288,7 +290,8 @@ def generar_recibo_venta_consolidado(venta, cliente, pagos, config) -> io.BytesI
     c.setFont("Helvetica-Oblique", 8)
     c.setFillColorRGB(0.5, 0.5, 0.5)
     c.drawCentredString(width / 2, 1.5 * cm, "Gracias por su preferencia")
-    
+    dibujar_pie_pagina_hesaka(c, width)
+
     c.save()
     buffer.seek(0)
     return buffer
@@ -709,6 +712,7 @@ def generar_recibos_ventas_concatenado(ventas_data, config) -> io.BytesIO:
     c.setFont("Helvetica-Oblique", 8)
     c.setFillColorRGB(0.5, 0.5, 0.5)
     c.drawCentredString(width / 2, 1.5 * cm, "Gracias por su preferencia")
+    dibujar_pie_pagina_hesaka(c, width)
 
     c.save()
     buffer.seek(0)
@@ -826,12 +830,13 @@ def generar_recibo_cobro_multiple(grupo_pagos, config, total, metodopago, nota) 
     c.setFont("Helvetica-Bold", 12)
     c.drawRightString(width - margin_x - 4*cm, y_row, "Total Pagado:")
     c.drawRightString(width - margin_x, y_row, "{:,.0f} Gs.".format(total).replace(",", "."))
-    
+
     # --- Footer ---
     c.setFont("Helvetica-Oblique", 8)
     c.setFillColorRGB(0.5, 0.5, 0.5)
     c.drawCentredString(width / 2, 1.5 * cm, "Gracias por su preferencia")
-    
+    dibujar_pie_pagina_hesaka(c, width)
+
     c.save()
     buffer.seek(0)
     return buffer
@@ -996,7 +1001,8 @@ def generar_recibo_cobro_multiple_detallado(grupo_pagos, config, total, metodopa
     c.setFont("Helvetica-Oblique", 8)
     c.setFillColorRGB(0.5, 0.5, 0.5)
     c.drawCentredString(width / 2, 1.5 * cm, "Gracias por su preferencia")
-    
+    dibujar_pie_pagina_hesaka(c, width)
+
     c.save()
     buffer.seek(0)
     return buffer

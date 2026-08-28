@@ -12,7 +12,7 @@ import {
 } from 'recharts'
 import Modal from '../components/Modal'
 import { getWhatsappTemplateByCode, useWhatsappTemplatesCatalog } from '../hooks/useWhatsappTemplates'
-import { formatCurrentBusinessDate, parseBackendDateTime, todayBusinessInputValue } from '../utils/formatters'
+import { formatCurrentBusinessDate, normalizarTelefonoWhatsapp, parseBackendDateTime, todayBusinessInputValue } from '../utils/formatters'
 
 const DEFAULT_DASHBOARD_RECORDATORIO_TEMPLATE = 'Hola {paciente}, te escribimos de {empresa}. Te recordamos tu turno para el {proxima_consulta} a las {hora_turno}. Te esperamos. Si no podras asistir, por favor avisanos para reprogramar.'
 const DEFAULT_CUMPLEANOS_TEMPLATE = 'Hola {cliente}, te escribimos de {empresa}. Queremos desearte un muy feliz cumpleaños. Que tengas un excelente dia.'
@@ -83,41 +83,6 @@ function fmtTime(value) {
     const date = parseBackendDateTime(value)
     if (!date || Number.isNaN(date.getTime())) return 'sin hora'
     return date.toLocaleTimeString('es-PY', { hour: '2-digit', minute: '2-digit' })
-}
-
-function normalizarTelefonoWhatsapp(value) {
-    let digits = String(value || '').replace(/\D/g, '')
-    if (!digits) return ''
-
-    if (digits.startsWith('00')) {
-        digits = digits.slice(2)
-    }
-
-    if (digits.startsWith('59509')) {
-        digits = `595${digits.slice(4)}`
-    }
-
-    if (digits.startsWith('5950')) {
-        digits = `595${digits.slice(4)}`
-    }
-
-    if (digits.startsWith('09') && digits.length === 10) {
-        return `595${digits.slice(1)}`
-    }
-
-    if (digits.startsWith('0') && digits.length >= 7 && digits.length <= 11) {
-        return `595${digits.slice(1)}`
-    }
-
-    if (digits.startsWith('9') && digits.length >= 8 && digits.length <= 10) {
-        return `595${digits}`
-    }
-
-    if (digits.startsWith('5959') && digits.length === 12) {
-        return digits
-    }
-
-    return digits.startsWith('595') && digits.length >= 10 ? digits : ''
 }
 
 function buildReminderWhatsappLink(item, empresa = 'HESAKA', template = DEFAULT_DASHBOARD_RECORDATORIO_TEMPLATE) {
@@ -272,6 +237,10 @@ export default function Dashboard() {
         queryKey: ['dashboard-resumen'],
         queryFn: () => api.get('/reportes/dashboard/resumen').then(response => response.data),
         retry: false,
+        // Ninguna mutacion de Ventas/Compras/Gastos/Clinica invalida esta key
+        // (invalidar desde 4 modulos distintos seria fragil). En su lugar, se
+        // refresca siempre al volver al Dashboard para no mostrar datos viejos.
+        refetchOnMount: 'always',
     })
     const reminderSummaryQuery = useQuery({
         queryKey: ['clinica', 'agenda-recordatorios-resumen'],
@@ -497,8 +466,8 @@ export default function Dashboard() {
                         <AreaChart data={dashboard?.serie_ventas || []} margin={{ top: 5, right: 0, left: 0, bottom: 0 }}>
                             <defs>
                                 <linearGradient id="gradVentas" x1="0" y1="0" x2="0" y2="1">
-                                    <stop offset="5%" stopColor="#1a56db" stopOpacity={0.3} />
-                                    <stop offset="95%" stopColor="#1a56db" stopOpacity={0} />
+                                    <stop offset="5%" stopColor="#7c4dff" stopOpacity={0.3} />
+                                    <stop offset="95%" stopColor="#7c4dff" stopOpacity={0} />
                                 </linearGradient>
                             </defs>
                             <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
@@ -508,7 +477,7 @@ export default function Dashboard() {
                                 contentStyle={{ background: '#1a1d27', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 8, color: '#f0f4ff' }}
                                 formatter={value => [fmt(value), 'Ventas']}
                             />
-                            <Area type="monotone" dataKey="ventas" stroke="#3b82f6" strokeWidth={2} fill="url(#gradVentas)" />
+                            <Area type="monotone" dataKey="ventas" stroke="#a78bfa" strokeWidth={2} fill="url(#gradVentas)" />
                         </AreaChart>
                     </ResponsiveContainer>
                 </div>

@@ -243,6 +243,9 @@ export default function ProveedoresPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['proveedores'] })
             queryClient.invalidateQueries({ queryKey: ['proveedores-optimizado'] })
+            // Sin esto, la ficha del proveedor sigue mostrando los datos viejos
+            // despues de editarlo hasta que algo mas refresque esa cache.
+            queryClient.invalidateQueries({ queryKey: ['proveedor-ficha'] })
             setModal(null)
         },
     })

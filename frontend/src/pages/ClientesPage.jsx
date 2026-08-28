@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api } from '../context/AuthContext'
+import { api, useAuth } from '../context/AuthContext'
+import { hasActionAccess } from '../utils/roles'
 import { parseBackendDateTime } from '../utils/formatters'
 import Modal from '../components/Modal'
 import DetalleVentaContent from '../components/DetalleVentaContent'
-import { Users, Plus, Search, Edit2, Phone, User, Eye } from 'lucide-react'
+import { Users, Plus, Search, Edit2, Phone, User, Eye, Stethoscope } from 'lucide-react'
 import { exportReportBlob } from '../utils/reportExports'
 import { completeTrackedFlow, failTrackedFlow, markFlowStep, startTrackedFlow, waitForNextPaint } from '../utils/performanceMonitor'
 
@@ -155,12 +156,23 @@ function ClienteForm({ initial = {}, onSave, onCancel, loading }) {
 }
 
 function ClienteFichaModal({ clienteId, onClose }) {
+    const { user } = useAuth()
+    const queryClient = useQueryClient()
     const [exportandoPdf, setExportandoPdf] = useState(false)
     const [ventaDetalleId, setVentaDetalleId] = useState(null)
     const { data, isLoading, isError, error } = useQuery({
         queryKey: ['cliente-ficha', clienteId],
         queryFn: () => api.get(`/clientes/${clienteId}/ficha`).then(r => r.data),
         retry: false,
+    })
+
+    const crearPacienteMutation = useMutation({
+        mutationFn: () => api.post(`/clinica/pacientes/desde-cliente/${clienteId}`),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['cliente-ficha', clienteId] })
+            queryClient.invalidateQueries({ queryKey: ['clinica', 'pacientes'] })
+        },
+        onError: err => window.alert(err?.response?.data?.detail || 'No se pudo crear la ficha clinica.'),
     })
 
     if (isLoading) {
@@ -171,7 +183,7 @@ function ClienteFichaModal({ clienteId, onClose }) {
         return <div style={{ color: 'var(--danger)', fontSize: '0.9rem' }}>{error?.response?.data?.detail || 'No se pudo cargar la ficha del cliente.'}</div>
     }
 
-    const { cliente, deuda_total, movimientos, ventas_pendientes, ultima_graduacion, proximo_control, proximo_control_origen, historial_armazones = [] } = data
+    const { cliente, deuda_total, movimientos, ventas_pendientes, ultima_graduacion, proximo_control, proximo_control_origen, historial_armazones = [], paciente_id: pacienteId } = data
 
     const exportarPdf = async () => {
         try {
@@ -325,6 +337,18 @@ function ClienteFichaModal({ clienteId, onClose }) {
             </div>
 
             <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
+                {!pacienteId && hasActionAccess(user, 'clinica.pacientes_crear', 'clinica') && (
+                    <button
+                        type="button"
+                        className="btn btn-secondary"
+                        onClick={() => crearPacienteMutation.mutate()}
+                        disabled={crearPacienteMutation.isPending}
+                        title="Crea una ficha clinica ya vinculada a este cliente, para no duplicarlo al convertirla despues."
+                    >
+                        <Stethoscope size={16} style={{ marginRight: 6 }} />
+                        {crearPacienteMutation.isPending ? 'Creando...' : 'Crear ficha clinica'}
+                    </button>
+                )}
                 <button type="button" className="btn btn-primary" onClick={exportarPdf} disabled={exportandoPdf}>
                     {exportandoPdf ? 'Generando PDF...' : 'PDF'}
                 </button>
@@ -576,7 +600,7 @@ export default function ClientesPage() {
                                             <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
                                                 <div style={{
                                                     width: 32, height: 32, borderRadius: '50%',
-                                                    background: 'linear-gradient(135deg, var(--primary), #7c3aed)',
+                                                    background: 'linear-gradient(135deg, var(--primary), var(--primary-light))',
                                                     display: 'flex', alignItems: 'center', justifyContent: 'center',
                                                     fontSize: '0.75rem', fontWeight: 700, color: 'white', flexShrink: 0
                                                 }}>

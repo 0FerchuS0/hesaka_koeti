@@ -4,7 +4,7 @@ import { CalendarDays, MessageCircle, Search, Gift, Phone } from 'lucide-react'
 import { api } from '../context/AuthContext'
 import Modal from '../components/Modal'
 import { getWhatsappTemplateByCode, useActualizarWhatsappTemplate, useWhatsappTemplatesCatalog } from '../hooks/useWhatsappTemplates'
-import { todayBusinessInputValue } from '../utils/formatters'
+import { normalizarTelefonoWhatsapp, todayBusinessInputValue } from '../utils/formatters'
 
 const TEMPLATE_KEY = 'hesaka-cumpleanos-whatsapp-template'
 const DEFAULT_TEMPLATE = 'Hola {cliente}, te escribimos de {empresa}. Queremos desearte un muy feliz cumpleaños. Que tengas un excelente dia.'
@@ -17,19 +17,6 @@ function todayInputValue() {
 function fmt(fecha) {
     if (!fecha) return '-'
     return new Date(`${String(fecha).slice(0, 10)}T00:00:00`).toLocaleDateString('es-PY')
-}
-
-function normalizarTelefonoWhatsapp(value) {
-    let digits = String(value || '').replace(/\D/g, '')
-    if (!digits) return ''
-    if (digits.startsWith('00')) digits = digits.slice(2)
-    if (digits.startsWith('59509')) digits = `595${digits.slice(4)}`
-    if (digits.startsWith('5950')) digits = `595${digits.slice(4)}`
-    if (digits.startsWith('09') && digits.length === 10) return `595${digits.slice(1)}`
-    if (digits.startsWith('0') && digits.length >= 7 && digits.length <= 11) return `595${digits.slice(1)}`
-    if (digits.startsWith('9') && digits.length >= 8 && digits.length <= 10) return `595${digits}`
-    if (digits.startsWith('5959') && digits.length === 12) return digits
-    return digits.startsWith('595') && digits.length >= 10 ? digits : ''
 }
 
 function getTemplate() {

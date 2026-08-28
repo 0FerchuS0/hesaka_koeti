@@ -6,6 +6,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.utils.pdf_branding import pie_pagina_hesaka
+
 
 EMPRESA_SUBTITULO_FALLBACK = ""
 
@@ -98,6 +100,8 @@ def generar_pdf_indicaciones_clinica(empresa_nombre: str, paciente_nombre: str, 
             if _has_value(detalle.get("duracion_tratamiento")):
                 story.append(Paragraph(f"Duracion: {_texto(detalle.get('duracion_tratamiento'))}", normal))
             story.append(Spacer(1, 0.18 * cm))
+
+    story.extend(pie_pagina_hesaka())
 
     doc.build(story)
     pdf = buffer.getvalue()

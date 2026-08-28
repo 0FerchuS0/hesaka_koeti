@@ -8,6 +8,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.utils.pdf_branding import pie_pagina_hesaka
+
 
 def _gs(value: float) -> str:
     amount = f"{int(round(abs(value or 0))):,}".replace(",", ".")
@@ -194,6 +196,8 @@ def generar_pdf_rendicion_jornada(
             ("FONTSIZE", (0, 0), (-1, -1), 8),
         ]))
         elements.append(post_table)
+
+    elements.extend(pie_pagina_hesaka())
 
     doc.build(elements)
     buffer.seek(0)

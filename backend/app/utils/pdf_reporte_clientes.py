@@ -6,6 +6,8 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.utils.pdf_branding import pie_pagina_hesaka
+
 
 def generar_pdf_reporte_clientes(clientes, config, buscar=None, referidor_nombre=None):
     buffer = io.BytesIO()
@@ -71,6 +73,7 @@ def generar_pdf_reporte_clientes(clientes, config, buscar=None, referidor_nombre
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
     story.append(table)
+    story.extend(pie_pagina_hesaka())
 
     doc.build(story)
     buffer.seek(0)
